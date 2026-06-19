@@ -439,7 +439,80 @@ def get_accurate_data(query, chat_id=None):
             return result
         return f"Gagal: {str(data)[:200]}"
 
-    # 6. Cari produk / item
+    # 6. Produk terlaris hari ini
+    elif any(w in q for w in ["produk terlaris", "paling laku", "terlaris", "terbanyak terjual", "produk hari ini"]):
+        def hitung_produk_terlaris(chat_id, host, today_str):
+            try:
+                h = host if host.startswith("http") else f"https://{host}"
+                # Ambil semua invoice hari ini
+                r = requests.get(
+                    f"{h}/accurate/api/sales-invoice/list.do",
+                    headers=accurate_headers(),
+                    params={
+                        "fields": "id,number,statusName",
+                        "sp.pageSize": 200,
+                        "sp.page": 1,
+                        "filter.transDate.op": "BETWEEN",
+                        "filter.transDate.val[0]": today_str,
+                        "filter.transDate.val[1]": today_str,
+                    },
+                    timeout=15
+                )
+                invoices = r.json().get("d", [])
+                if not invoices:
+                    send_message(chat_id, "Tidak ada invoice hari ini.")
+                    return
+
+                # Ambil detail tiap invoice secara paralel, kumpulkan item
+                product_qty = {}
+                product_total = {}
+
+                def get_items(inv):
+                    try:
+                        r2 = requests.get(
+                            f"{h}/accurate/api/sales-invoice/detail.do",
+                            headers=accurate_headers(),
+                            params={"id": inv["id"]},
+                            timeout=10
+                        )
+                        detail = r2.json().get("d", {})
+                        for item in detail.get("detailItem", []):
+                            name = item.get("itemName") or item.get("item", {}).get("name") or "-"
+                            qty = float(item.get("quantity") or item.get("qty") or 0)
+                            amount = float(item.get("amount") or item.get("totalAmount") or 0)
+                            if name and name != "-":
+                                product_qty[name] = product_qty.get(name, 0) + qty
+                                product_total[name] = product_total.get(name, 0) + amount
+                    except Exception as e:
+                        print(f"[ITEM DETAIL ERROR] {e}")
+
+                with ThreadPoolExecutor(max_workers=10) as executor:
+                    futures = [executor.submit(get_items, inv) for inv in invoices]
+                    for f in as_completed(futures):
+                        f.result()
+
+                if not product_qty:
+                    send_message(chat_id, "Data item produk tidak tersedia dari invoice hari ini.")
+                    return
+
+                top = sorted(product_qty.items(), key=lambda x: x[1], reverse=True)[:10]
+                result = f"🏆 Produk Terlaris Hari Ini ({today_str}):\n\n"
+                for i, (name, qty) in enumerate(top, 1):
+                    total = product_total.get(name, 0)
+                    result += f"{i}. {name}\n"
+                    result += f"   Qty: {qty:,.0f} | Nilai: Rp {total:,.0f}\n"
+                send_message(chat_id, result)
+
+            except Exception as e:
+                send_message(chat_id, f"❌ Gagal ambil produk terlaris: {str(e)[:100]}")
+                print(f"[PRODUK TERLARIS ERROR] {e}")
+
+        t = threading.Thread(target=hitung_produk_terlaris, args=(chat_id, host, today_str))
+        t.daemon = True
+        t.start()
+        return "⏳ Sedang menghitung produk terlaris hari ini... Tunggu sebentar ya!"
+
+    # 7. Cari produk / item
     elif any(w in q for w in ["harga beli", "harga jual", "modal", "hpp", "harga produk", "stok",
                                "produk", "item", "barang", "vinyl", "stiker", "banner", "kertas",
                                "tinta", "quantac", "bahan", "material", "cek harga", "harga"]):
