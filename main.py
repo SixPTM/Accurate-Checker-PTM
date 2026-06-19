@@ -536,7 +536,7 @@ def get_accurate_data(query, chat_id=None):
                 timeout=15
             )
             data = r.json()
-            print(f"[ITEM] {r.status_code} {r.text[:500]}")
+            print(f"[ITEM] {r.status_code} {r.text[:800]}")
             if data.get("s") and data.get("d"):
                 items = data["d"]
                 result = f"Produk '{keyword}':\n\n"
