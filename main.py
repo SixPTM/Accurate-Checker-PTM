@@ -264,23 +264,51 @@ def get_accurate_data(query):
         return "Gagal ambil data debug."
 
     # Invoice belum lunas / piutang
-    if any(w in q for w in ["belum lunas", "belum bayar", "piutang", "outstanding", "jatuh tempo", "unpaid"]):
-        data = get_invoices(host, page_size=50, status="OPEN")
-        if data and data.get("s"):
-            invoices = data.get("d", [])
-            sp = data.get("sp", {})
-            total_all = sp.get("rowCount", len(invoices))
-            if not invoices:
-                return "Tidak ada invoice belum lunas."
-            result = f"Invoice Belum Lunas (menampilkan {len(invoices)} dari {total_all}):\n\n"
-            for inv in invoices[:15]:
-                nama = extract_customer_name(inv)
-                sisa = extract_outstanding(inv)
-                result += f"- {inv.get('number','-')} | {nama}\n"
-                result += f"  Sisa: Rp {sisa:,.0f} | Tempo: {inv.get('dueDate','-')}\n"
-                result += f"  Bukti: {'Ada' if inv.get('hasAttachment') else 'Tidak ada'}\n\n"
-            return result
-        return f"Gagal: {str(data)[:200]}"
+    if any(w in q for w in ["belum lunas", "belum bayar", "piutang", "outstanding", "jatuh tempo", "unpaid", "belum bayar"]):
+        # Deteksi periode dari query
+        date_from = None
+        date_to = None
+        label_period = "Semua Periode"
+
+        if "juni" in q or "june" in q:
+            date_from = "01/06/2026"
+            date_to = "30/06/2026"
+            label_period = "Juni 2026"
+        elif "mei" in q or "may" in q:
+            date_from = "01/05/2026"
+            date_to = "31/05/2026"
+            label_period = "Mei 2026"
+        elif "bulan ini" in q:
+            date_from = month_start
+            date_to = today_str
+            label_period = "Bulan Ini"
+        elif "hari ini" in q:
+            date_from = today_str
+            date_to = today_str
+            label_period = "Hari Ini"
+
+        invoices = get_all_invoices_paged(host, date_from=date_from, date_to=date_to, status="OPEN")
+
+        # Filter manual status belum lunas dari hasil
+        belum = [i for i in invoices if "belum" in (i.get("statusName") or "").lower()]
+        if not belum and invoices:
+            belum = invoices  # kalau status filter sudah handle di API
+
+        if not belum:
+            return f"Tidak ada invoice belum lunas untuk periode {label_period}."
+
+        total_sisa = sum(extract_outstanding(i) for i in belum)
+        result = f"Invoice Belum Lunas - {label_period}:\n"
+        result += f"Total: {len(belum)} invoice | Sisa: Rp {total_sisa:,.0f}\n\n"
+        for inv in belum[:15]:
+            nama = extract_customer_name(inv)
+            sisa = extract_outstanding(inv)
+            result += f"- {inv.get('number','-')} | {nama}\n"
+            result += f"  Sisa: Rp {sisa:,.0f} | Tempo: {inv.get('dueDate','-')}\n"
+            result += f"  Bukti: {'Ada' if inv.get('hasAttachment') else 'Tidak ada'}\n\n"
+        if len(belum) > 15:
+            result += f"...dan {len(belum)-15} invoice lainnya.\n"
+        return result
 
     # Penjualan hari ini
     elif any(w in q for w in ["omset hari ini", "penjualan hari ini", "transaksi hari ini", "invoice hari ini"]):
