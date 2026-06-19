@@ -21,8 +21,9 @@ conversation_history = {}
 SYSTEM_PROMPT = """Kamu adalah asisten keuangan untuk perusahaan Print Master yang membantu tim admin mengecek invoice, hutang piutang, dan kinerja admin melalui Accurate Online.
 Kamu berbicara dalam Bahasa Indonesia yang ramah dan profesional.
 Format angka dalam Rupiah (contoh: Rp 1.500.000).
-Status invoice: OPEN=Belum bayar, PARTIAL=Sebagian, PAID=Lunas, VOID=Batal.
-Jawab singkat, padat, gunakan emoji."""
+Status invoice: statusName Lunas=sudah bayar, Belum Lunas=belum bayar.
+Jawab singkat, padat, gunakan emoji.
+Jika data tersedia, analisa dan tampilkan dengan jelas. Jika tidak ada nominal, tetap tampilkan info yang ada seperti jumlah invoice dan status."""
 
 
 def send_message(chat_id, text):
@@ -63,31 +64,32 @@ def get_token_info():
             headers=accurate_headers(),
             timeout=15
         )
-        print(f"[TOKEN INFO] {r.status_code} {r.text[:500]}")
         return r.json()
     except Exception as e:
-        print(f"[TOKEN INFO ERROR] {e}")
+        print(f"[TOKEN ERROR] {e}")
         return None
 
 
-def get_invoices(host, keyword=None, status=None, today_only=False):
+def get_invoices(host, page_size=50, status=None, date_from=None, date_to=None, keyword=None):
     try:
-        today = (datetime.datetime.utcnow() + datetime.timedelta(hours=7)).strftime("%d/%m/%Y")
-        params = {
-            "fields": "number,customer,transDate,dueDate,totalAmount,remainingAmount,statusName,hasAttachment",
-            "sp.pageSize": 50,
-            "sp.page": 1
-        }
-        if keyword:
-            params["filter.keywords"] = keyword
-        if status:
-            params["filter.status"] = status
-        if today_only:
-            params["filter.transDate.op"] = "EQUAL"
-            params["filter.transDate.val"] = today
-
         if not host.startswith("http"):
             host = f"https://{host}"
+
+        params = {
+            "fields": "number,transDate,dueDate,statusName,customerName,grandTotal,remainingAmount,hasAttachment",
+            "sp.pageSize": page_size,
+            "sp.page": 1,
+            "sp.sort": "transDate",
+            "sp.sortOrder": "DESC"
+        }
+        if status:
+            params["filter.status"] = status
+        if date_from:
+            params["filter.transDate.op"] = "BETWEEN"
+            params["filter.transDate.val[0]"] = date_from
+            params["filter.transDate.val[1]"] = date_to or date_from
+        if keyword:
+            params["filter.keywords"] = keyword
 
         r = requests.get(
             f"{host}/accurate/api/sales-invoice/list.do",
@@ -96,8 +98,14 @@ def get_invoices(host, keyword=None, status=None, today_only=False):
             timeout=15,
             allow_redirects=True
         )
-        print(f"[INVOICE] {r.status_code} {r.text[:500]}")
-        return r.json()
+        print(f"[INVOICE] {r.status_code} {r.text[:800]}")
+        data = r.json()
+        
+        # Jika field tidak ada, coba tanpa fields filter
+        if data.get("s") and data.get("d"):
+            sample = data["d"][0] if data["d"] else {}
+            print(f"[FIELDS AVAILABLE] {list(sample.keys())}")
+        return data
     except Exception as e:
         print(f"[INVOICE ERROR] {e}")
         return None
@@ -106,76 +114,133 @@ def get_invoices(host, keyword=None, status=None, today_only=False):
 def get_accurate_data(query):
     token_info = get_token_info()
     if not token_info or not token_info.get("s"):
-        err = token_info.get("d", "Koneksi gagal") if token_info else "Koneksi gagal"
-        return f"Token Error: {err}"
+        return "Gagal koneksi ke Accurate."
 
     d = token_info.get("d", {})
     host = d.get("database", d.get("data usaha", {})).get("host", "")
     if not host:
-        return f"Host tidak ditemukan: {str(token_info)[:200]}"
+        return "Host tidak ditemukan."
 
-    print(f"[HOST] {host}")
-
+    now = datetime.datetime.utcnow() + datetime.timedelta(hours=7)
+    today_str = now.strftime("%d/%m/%Y")
+    month_start = now.replace(day=1).strftime("%d/%m/%Y")
     q = query.lower()
 
-    if any(w in q for w in ["belum lunas", "belum bayar", "outstanding", "jatuh tempo", "unpaid"]):
-        data = get_invoices(host, status="OPEN")
+    # Cek invoice belum lunas / piutang
+    if any(w in q for w in ["belum lunas", "belum bayar", "piutang", "outstanding", "jatuh tempo", "unpaid"]):
+        data = get_invoices(host, page_size=50, status="OPEN")
         if data and data.get("s"):
             invoices = data.get("d", [])
+            sp = data.get("sp", {})
+            total_all = sp.get("rowCount", len(invoices))
             if not invoices:
                 return "Tidak ada invoice belum lunas."
-            result = f"Invoice Belum Lunas ({len(invoices)}):\n\n"
-            for inv in invoices[:10]:
-                result += f"- {inv.get('number','-')} | {inv.get('customer.name', inv.get('customerName','-'))}\n"
-                result += f"  Sisa: Rp {inv.get('remainingAmount',0):,.0f}\n"
-                result += f"  Jatuh tempo: {inv.get('dueDate','-')}\n"
-                result += f"  Bukti bayar: {'Ada' if inv.get('hasAttachment') else 'Tidak ada'}\n\n"
+            result = f"Invoice Belum Lunas (menampilkan {len(invoices)} dari {total_all}):\n\n"
+            for inv in invoices[:15]:
+                nama = inv.get("customerName") or inv.get("customer", {}).get("name", "-") if isinstance(inv.get("customer"), dict) else "-"
+                sisa = inv.get("remainingAmount") or inv.get("grandTotal") or 0
+                result += f"- {inv.get('number','-')} | {nama}\n"
+                result += f"  Sisa: Rp {sisa:,.0f} | Tempo: {inv.get('dueDate','-')}\n"
+                result += f"  Bukti: {'Ada' if inv.get('hasAttachment') else 'Tidak ada'}\n\n"
             return result
-        return f"Gagal ambil data: {str(data)[:200]}"
+        return f"Gagal: {str(data)[:200]}"
 
-    elif any(w in q for w in ["rekap", "semua", "daftar", "list", "total", "omset", "hari ini", "transaksi", "penjualan"]):
-        today_only = any(w in q for w in ["hari ini", "omset", "penjualan", "transaksi"])
-        data = get_invoices(host, today_only=today_only)
+    # Omset / penjualan hari ini
+    elif any(w in q for w in ["omset hari ini", "penjualan hari ini", "transaksi hari ini", "invoice hari ini"]):
+        data = get_invoices(host, page_size=100, date_from=today_str, date_to=today_str)
         if data and data.get("s"):
             invoices = data.get("d", [])
-            o = sum(1 for i in invoices if i.get("statusName") in ["Belum Lunas", "Open", "OPEN", "Belum Dibayar"])
-            p = sum(1 for i in invoices if i.get("statusName") in ["Lunas", "Paid", "PAID"])
-            pt = sum(1 for i in invoices if i.get("statusName") in ["Sebagian", "Partial", "PARTIAL"])
-            total_nilai = sum((inv.get("totalAmount") or inv.get("grandTotal") or 0) for inv in invoices)
-            label = "Hari Ini" if today_only else "Semua"
-            result = f"Rekap Invoice {label} - Print Master:\n\n"
-            result += f"Total invoice: {len(invoices)}\n"
-            result += f"Lunas: {p} | Sebagian: {pt} | Belum: {o}\n"
-            if total_nilai > 0:
-                result += f"Total nilai: Rp {total_nilai:,.0f}\n"
-            # Tampilkan sample data untuk debug
+            total = sum((inv.get("grandTotal") or 0) for inv in invoices)
+            lunas = sum(1 for i in invoices if "lunas" in (i.get("statusName") or "").lower())
+            belum = sum(1 for i in invoices if "belum" in (i.get("statusName") or "").lower())
+            result = f"Penjualan Hari Ini ({today_str}):\n\n"
+            result += f"Jumlah invoice: {len(invoices)}\n"
+            result += f"Lunas: {lunas} | Belum: {belum}\n"
+            if total > 0:
+                result += f"Total nilai: Rp {total:,.0f}\n"
             if invoices:
-                sample = invoices[0]
-                result += f"\nSample field: {list(sample.keys())}"
+                result += "\nDetail:\n"
+                for inv in invoices[:10]:
+                    nama = inv.get("customerName", "-")
+                    result += f"- {inv.get('number','-')} | {nama} | {inv.get('statusName','-')}\n"
             return result
-        return f"Gagal ambil data: {str(data)[:200]}"
+        return f"Gagal: {str(data)[:200]}"
 
+    # Omset / penjualan bulan ini
+    elif any(w in q for w in ["omset", "penjualan", "bulan ini", "bulan juni", "juni"]):
+        if "juni" in q or "june" in q:
+            date_from = "01/06/2026"
+            date_to = "30/06/2026"
+            label = "Juni 2026"
+        else:
+            date_from = month_start
+            date_to = today_str
+            label = "Bulan Ini"
+        data = get_invoices(host, page_size=100, date_from=date_from, date_to=date_to)
+        if data and data.get("s"):
+            invoices = data.get("d", [])
+            sp = data.get("sp", {})
+            total_val = sum((inv.get("grandTotal") or 0) for inv in invoices)
+            
+            # Hitung per customer
+            customer_count = {}
+            for inv in invoices:
+                nama = inv.get("customerName") or "-"
+                customer_count[nama] = customer_count.get(nama, 0) + 1
+            
+            top_customers = sorted(customer_count.items(), key=lambda x: x[1], reverse=True)[:5]
+            
+            result = f"Rekap Penjualan {label}:\n\n"
+            result += f"Total invoice: {len(invoices)} (dari {sp.get('rowCount', '?')} total)\n"
+            if total_val > 0:
+                result += f"Total nilai: Rp {total_val:,.0f}\n"
+            
+            if top_customers and top_customers[0][0] != "-":
+                result += f"\nTop Customer Paling Sering Order:\n"
+                for i, (nama, count) in enumerate(top_customers, 1):
+                    result += f"{i}. {nama} - {count} invoice\n"
+            return result
+        return f"Gagal: {str(data)[:200]}"
+
+    # Rekap semua
+    elif any(w in q for w in ["rekap", "semua", "daftar", "list", "total"]):
+        data = get_invoices(host, page_size=50)
+        if data and data.get("s"):
+            invoices = data.get("d", [])
+            sp = data.get("sp", {})
+            o = sum(1 for i in invoices if "belum" in (i.get("statusName") or "").lower())
+            p = sum(1 for i in invoices if "lunas" in (i.get("statusName") or "").lower() and "belum" not in (i.get("statusName") or "").lower())
+            total_val = sum((inv.get("grandTotal") or 0) for inv in invoices)
+            result = f"Rekap Invoice Print Master (20 terbaru dari {sp.get('rowCount','?')} total):\n\n"
+            result += f"Lunas: {p} | Belum Lunas: {o}\n"
+            if total_val > 0:
+                result += f"Total nilai: Rp {total_val:,.0f}\n"
+            return result
+        return f"Gagal: {str(data)[:200]}"
+
+    # Cari invoice spesifik
     else:
-        data = get_invoices(host, keyword=query)
+        data = get_invoices(host, keyword=query, page_size=10)
         if data and data.get("s"):
             invoices = data.get("d", [])
             if not invoices:
-                return f"Tidak ada invoice: {query}"
+                return f"Tidak ada invoice ditemukan untuk: {query}"
             result = f"Hasil pencarian '{query}':\n\n"
-            sm = {"OPEN": "Belum Lunas", "PAID": "Lunas", "PARTIAL": "Sebagian", "VOID": "Batal"}
             for inv in invoices[:5]:
-                result += f"- {inv.get('number','-')} | {inv.get('customerName','-')}\n"
-                result += f"  Total: Rp {inv.get('grandTotal',0):,.0f} | {sm.get(inv.get('status',''),'-')}\n"
-                result += f"  Jatuh tempo: {inv.get('dueDate','-')}\n\n"
+                nama = inv.get("customerName", "-")
+                total = inv.get("grandTotal") or 0
+                result += f"- {inv.get('number','-')} | {nama}\n"
+                result += f"  Total: Rp {total:,.0f} | {inv.get('statusName','-')}\n"
+                result += f"  Tanggal: {inv.get('transDate','-')}\n\n"
             return result
-        return f"Gagal cari invoice: {str(data)[:200]}"
+        return f"Tidak ditemukan: {query}"
 
 
 def ask_claude(chat_id, user_message, accurate_data=None):
     if chat_id not in conversation_history:
         conversation_history[chat_id] = []
 
-    content = f"Data Accurate:\n{accurate_data}\n\nPertanyaan: {user_message}" if accurate_data else user_message
+    content = f"Data dari Accurate Online:\n{accurate_data}\n\nPertanyaan user: {user_message}" if accurate_data else user_message
     conversation_history[chat_id].append({"role": "user", "content": content})
     if len(conversation_history[chat_id]) > 20:
         conversation_history[chat_id] = conversation_history[chat_id][-20:]
@@ -206,7 +271,16 @@ def webhook():
     user_name = message["from"].get("first_name", "")
 
     if user_text == "/start":
-        send_message(chat_id, f"Halo {user_name}! Saya Accurate Checker Bot Print Master.\n\nContoh pertanyaan:\n- Cek invoice belum lunas\n- Rekap semua invoice\n- Cari invoice PT Maju")
+        send_message(chat_id,
+            f"Halo {user_name}! Saya Accurate Checker Bot Print Master.\n\n"
+            "Yang bisa saya bantu:\n"
+            "- Cek invoice belum lunas\n"
+            "- Omset / penjualan hari ini\n"
+            "- Rekap penjualan bulan Juni\n"
+            "- Customer paling sering order bulan ini\n"
+            "- Cari invoice per customer\n"
+            "- Rekap semua invoice"
+        )
         return "ok", 200
 
     if user_text == "/reset":
