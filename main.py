@@ -70,17 +70,21 @@ def get_token_info():
         return None
 
 
-def get_invoices(host, keyword=None, status=None):
+def get_invoices(host, keyword=None, status=None, today_only=False):
     try:
+        today = (datetime.datetime.utcnow() + datetime.timedelta(hours=7)).strftime("%d/%m/%Y")
         params = {
-            "fields": "number,customerName,transDate,dueDate,grandTotal,remainingAmount,statusName,hasAttachment",
-            "sp.pageSize": 20,
+            "fields": "number,customer,transDate,dueDate,totalAmount,remainingAmount,statusName,hasAttachment",
+            "sp.pageSize": 50,
             "sp.page": 1
         }
         if keyword:
             params["filter.keywords"] = keyword
         if status:
             params["filter.status"] = status
+        if today_only:
+            params["filter.transDate.op"] = "EQUAL"
+            params["filter.transDate.val"] = today
 
         if not host.startswith("http"):
             host = f"https://{host}"
@@ -129,20 +133,25 @@ def get_accurate_data(query):
             return result
         return f"Gagal ambil data: {str(data)[:200]}"
 
-    elif any(w in q for w in ["rekap", "semua", "daftar", "list", "total", "omset", "hari ini", "transaksi"]):
-        data = get_invoices(host)
+    elif any(w in q for w in ["rekap", "semua", "daftar", "list", "total", "omset", "hari ini", "transaksi", "penjualan"]):
+        today_only = any(w in q for w in ["hari ini", "omset", "penjualan", "transaksi"])
+        data = get_invoices(host, today_only=today_only)
         if data and data.get("s"):
             invoices = data.get("d", [])
-            o = sum(1 for i in invoices if i.get("statusName") in ["Belum Lunas", "Open", "OPEN"] or i.get("status") == "OPEN")
-            p = sum(1 for i in invoices if i.get("statusName") in ["Lunas", "Paid", "PAID"] or i.get("status") == "PAID")
-            pt = sum(1 for i in invoices if i.get("statusName") in ["Sebagian", "Partial", "PARTIAL"] or i.get("status") == "PARTIAL")
-            total_nilai = sum(inv.get("grandTotal", 0) or 0 for inv in invoices)
-            result = f"Rekap Invoice Print Master:\n\n"
+            o = sum(1 for i in invoices if i.get("statusName") in ["Belum Lunas", "Open", "OPEN", "Belum Dibayar"])
+            p = sum(1 for i in invoices if i.get("statusName") in ["Lunas", "Paid", "PAID"])
+            pt = sum(1 for i in invoices if i.get("statusName") in ["Sebagian", "Partial", "PARTIAL"])
+            total_nilai = sum((inv.get("totalAmount") or inv.get("grandTotal") or 0) for inv in invoices)
+            label = "Hari Ini" if today_only else "Semua"
+            result = f"Rekap Invoice {label} - Print Master:\n\n"
             result += f"Total invoice: {len(invoices)}\n"
-            result += f"Lunas: {p}\nSebagian: {pt}\nBelum Lunas: {o}\n"
+            result += f"Lunas: {p} | Sebagian: {pt} | Belum: {o}\n"
             if total_nilai > 0:
                 result += f"Total nilai: Rp {total_nilai:,.0f}\n"
-            result += f"\nStatus yang ditemukan: {set(i.get('statusName','?') for i in invoices[:5])}"
+            # Tampilkan sample data untuk debug
+            if invoices:
+                sample = invoices[0]
+                result += f"\nSample field: {list(sample.keys())}"
             return result
         return f"Gagal ambil data: {str(data)[:200]}"
 
