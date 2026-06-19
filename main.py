@@ -1,5 +1,8 @@
 import os
 import json
+import hmac
+import hashlib
+import time
 import requests
 from flask import Flask, request
 
@@ -8,6 +11,7 @@ app = Flask(__name__)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 ACCURATE_API_TOKEN = os.environ.get("ACCURATE_API_TOKEN")
+ACCURATE_SIGNATURE_SECRET = os.environ.get("ACCURATE_SIGNATURE_SECRET")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 ACCURATE_BASE_URL = "https://account.accurate.id/api"
@@ -29,6 +33,29 @@ Untuk status invoice:
 Selalu jawab singkat, padat, dan mudah dimengerti. Gunakan emoji yang relevan untuk memperjelas informasi."""
 
 
+def generate_signature(timestamp):
+    """Generate X-Api-Signature untuk Accurate API"""
+    message = f"{ACCURATE_API_TOKEN}{timestamp}"
+    signature = hmac.new(
+        ACCURATE_SIGNATURE_SECRET.encode("utf-8"),
+        message.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+    return signature
+
+
+def get_accurate_headers():
+    """Headers dengan signature untuk Accurate API"""
+    timestamp = str(int(time.time() * 1000))
+    signature = generate_signature(timestamp)
+    return {
+        "Authorization": f"Bearer {ACCURATE_API_TOKEN}",
+        "X-Api-Signature": signature,
+        "X-Api-Timestamp": timestamp,
+        "Content-Type": "application/json"
+    }
+
+
 def send_message(chat_id, text):
     url = f"{TELEGRAM_API}/sendMessage"
     payload = {
@@ -39,34 +66,23 @@ def send_message(chat_id, text):
     requests.post(url, json=payload)
 
 
-def get_accurate_headers():
-    return {
-        "Authorization": f"Bearer {ACCURATE_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
-
-
 def get_db_info():
-    """Ambil database list dan return db_id + host"""
+    """Ambil database list"""
     try:
         response = requests.get(
             f"{ACCURATE_BASE_URL}/db-list.do?fields=id,alias,host",
             headers=get_accurate_headers(),
             timeout=10
         )
-        print(f"DB List response status: {response.status_code}")
+        print(f"DB List status: {response.status_code}")
         print(f"DB List response: {response.text[:500]}")
         
         data = response.json()
         
-        # Handle berbagai format response
-        if isinstance(data, list) and len(data) > 0:
-            return data[0]
-        elif isinstance(data, dict):
-            if "d" in data and isinstance(data["d"], list) and len(data["d"]) > 0:
-                return data["d"][0]
-            elif "id" in data:
-                return data
+        if isinstance(data, dict) and "d" in data:
+            db_list = data["d"]
+            if isinstance(db_list, list) and len(db_list) > 0:
+                return db_list[0]
         return None
     except Exception as e:
         print(f"Error get database: {e}")
@@ -82,11 +98,10 @@ def open_db(db_id):
             json={"id": db_id},
             timeout=10
         )
-        print(f"Open DB response status: {response.status_code}")
+        print(f"Open DB status: {response.status_code}")
         print(f"Open DB response: {response.text[:500]}")
         
-        data = response.json()
-        return data
+        return response.json()
     except Exception as e:
         print(f"Error open database: {e}")
         return None
@@ -105,16 +120,16 @@ def get_invoices(host, session_id, keyword=None, status=None):
         if status:
             params["filter.status"] = status
 
+        headers = get_accurate_headers()
+        headers["X-Session-ID"] = session_id
+
         response = requests.get(
             f"https://{host}/api/customer-invoice/list.do",
-            headers={
-                "Authorization": f"Bearer {ACCURATE_API_TOKEN}",
-                "X-Session-ID": session_id
-            },
+            headers=headers,
             params=params,
             timeout=10
         )
-        print(f"Invoice response status: {response.status_code}")
+        print(f"Invoice status: {response.status_code}")
         print(f"Invoice response: {response.text[:500]}")
         return response.json()
     except Exception as e:
@@ -124,33 +139,26 @@ def get_invoices(host, session_id, keyword=None, status=None):
 
 def get_accurate_data(query):
     """Fungsi utama ambil data dari Accurate"""
-    # Step 1: Get database info
     db_info = get_db_info()
     if not db_info:
         return "❌ Tidak bisa ambil daftar database Accurate."
-    
-    print(f"DB Info: {db_info}")
-    
+
     db_id = db_info.get("id")
     if not db_id:
-        return "❌ Tidak bisa menemukan ID database Accurate."
+        return "❌ Tidak bisa menemukan ID database."
 
-    # Step 2: Open database
     session_data = open_db(db_id)
     if not session_data:
         return "❌ Tidak bisa membuka database Accurate."
 
-    print(f"Session data: {session_data}")
-
     session_id = session_data.get("session")
     host = session_data.get("host")
-    
+
     if not session_id or not host:
         return f"❌ Session tidak valid. Response: {str(session_data)[:200]}"
 
     query_lower = query.lower()
 
-    # Step 3: Query invoice berdasarkan pertanyaan user
     if any(word in query_lower for word in ["belum lunas", "belum bayar", "outstanding", "jatuh tempo", "unpaid"]):
         data = get_invoices(host, session_id, status="OPEN")
         if data and "d" in data:
@@ -165,7 +173,7 @@ def get_accurate_data(query):
                 result += f"  📅 Jatuh tempo: {inv.get('dueDate', '-')}\n"
                 result += f"  📎 Bukti bayar: {'Ada ✅' if inv.get('hasAttachment') else 'Tidak ada ❌'}\n\n"
             return result
-        return f"❌ Gagal mengambil data invoice. Response: {str(data)[:200]}"
+        return f"❌ Gagal mengambil data. Response: {str(data)[:200]}"
 
     elif any(word in query_lower for word in ["rekap", "semua", "daftar", "list", "total"]):
         data = get_invoices(host, session_id)
@@ -235,7 +243,6 @@ def ask_claude(chat_id, user_message, accurate_data=None):
 
     data = response.json()
     reply = data["content"][0]["text"]
-
     conversation_history[chat_id].append({"role": "assistant", "content": reply})
     return reply
 
