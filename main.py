@@ -73,7 +73,7 @@ def get_token_info():
 def get_invoices(host, keyword=None, status=None):
     try:
         params = {
-            "fields": "number,customerName,transactionDate,dueDate,grandTotal,remainingAmount,status,statusName,hasAttachment,toBeCollected",
+            "fields": "number,customer.name,transDate,dueDate,grandTotal,remainingAmount,statusName,hasAttachment",
             "sp.pageSize": 20,
             "sp.page": 1
         }
@@ -122,22 +122,28 @@ def get_accurate_data(query):
                 return "Tidak ada invoice belum lunas."
             result = f"Invoice Belum Lunas ({len(invoices)}):\n\n"
             for inv in invoices[:10]:
-                result += f"- {inv.get('number','-')} | {inv.get('customerName','-')}\n"
+                result += f"- {inv.get('number','-')} | {inv.get('customer.name', inv.get('customerName','-'))}\n"
                 result += f"  Sisa: Rp {inv.get('remainingAmount',0):,.0f}\n"
                 result += f"  Jatuh tempo: {inv.get('dueDate','-')}\n"
                 result += f"  Bukti bayar: {'Ada' if inv.get('hasAttachment') else 'Tidak ada'}\n\n"
             return result
         return f"Gagal ambil data: {str(data)[:200]}"
 
-    elif any(w in q for w in ["rekap", "semua", "daftar", "list", "total", "omset", "hari ini"]):
+    elif any(w in q for w in ["rekap", "semua", "daftar", "list", "total", "omset", "hari ini", "transaksi"]):
         data = get_invoices(host)
         if data and data.get("s"):
             invoices = data.get("d", [])
-            o = sum(1 for i in invoices if i.get("status") == "OPEN")
-            p = sum(1 for i in invoices if i.get("status") == "PAID")
-            pt = sum(1 for i in invoices if i.get("status") == "PARTIAL")
-            return (f"Rekap Invoice Print Master:\n\n"
-                    f"Lunas: {p}\nSebagian: {pt}\nBelum: {o}\nTotal: {len(invoices)}")
+            o = sum(1 for i in invoices if i.get("statusName") in ["Belum Lunas", "Open", "OPEN"] or i.get("status") == "OPEN")
+            p = sum(1 for i in invoices if i.get("statusName") in ["Lunas", "Paid", "PAID"] or i.get("status") == "PAID")
+            pt = sum(1 for i in invoices if i.get("statusName") in ["Sebagian", "Partial", "PARTIAL"] or i.get("status") == "PARTIAL")
+            total_nilai = sum(inv.get("grandTotal", 0) or 0 for inv in invoices)
+            result = f"Rekap Invoice Print Master:\n\n"
+            result += f"Total invoice: {len(invoices)}\n"
+            result += f"Lunas: {p}\nSebagian: {pt}\nBelum Lunas: {o}\n"
+            if total_nilai > 0:
+                result += f"Total nilai: Rp {total_nilai:,.0f}\n"
+            result += f"\nStatus yang ditemukan: {set(i.get('statusName','?') for i in invoices[:5])}"
+            return result
         return f"Gagal ambil data: {str(data)[:200]}"
 
     else:
