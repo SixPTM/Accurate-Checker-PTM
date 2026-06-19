@@ -73,7 +73,7 @@ def get_token_info():
 def get_invoices(host, keyword=None, status=None):
     try:
         params = {
-            "fields": "number,customerName,transactionDate,dueDate,grandTotal,remainingAmount,statusName,status,hasAttachment",
+            "fields": "number,customerName,transactionDate,dueDate,grandTotal,remainingAmount,status,statusName,hasAttachment,toBeCollected",
             "sp.pageSize": 20,
             "sp.page": 1
         }
