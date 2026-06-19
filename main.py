@@ -1,8 +1,5 @@
 import os
 import json
-import hmac
-import hashlib
-import time
 import requests
 from flask import Flask, request
 
@@ -11,7 +8,6 @@ app = Flask(__name__)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 ACCURATE_API_TOKEN = os.environ.get("ACCURATE_API_TOKEN")
-ACCURATE_SIGNATURE_SECRET = os.environ.get("ACCURATE_SIGNATURE_SECRET")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 ACCURATE_BASE_URL = "https://account.accurate.id/api"
@@ -33,82 +29,49 @@ Untuk status invoice:
 Selalu jawab singkat, padat, dan mudah dimengerti. Gunakan emoji yang relevan untuk memperjelas informasi."""
 
 
-def generate_signature(timestamp):
-    """Generate X-Api-Signature untuk Accurate API"""
-    message = f"{ACCURATE_API_TOKEN}{timestamp}"
-    signature = hmac.new(
-        ACCURATE_SIGNATURE_SECRET.encode("utf-8"),
-        message.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
-    return signature
+def send_message(chat_id, text):
+    url = f"{TELEGRAM_API}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    requests.post(url, json=payload)
 
 
-def get_accurate_headers():
-    """Headers dengan signature untuk Accurate API"""
-    timestamp = str(int(time.time() * 1000))
-    signature = generate_signature(timestamp)
+def accurate_headers():
     return {
         "Authorization": f"Bearer {ACCURATE_API_TOKEN}",
-        "X-Api-Signature": signature,
-        "X-Api-Timestamp": timestamp,
         "Content-Type": "application/json"
     }
 
 
-def send_message(chat_id, text):
-    url = f"{TELEGRAM_API}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
-    requests.post(url, json=payload)
-
-
-def get_db_info():
-    """Ambil database list"""
+def get_db_list():
     try:
-        response = requests.get(
+        r = requests.get(
             f"{ACCURATE_BASE_URL}/db-list.do?fields=id,alias,host",
-            headers=get_accurate_headers(),
-            timeout=10
+            headers=accurate_headers(),
+            timeout=15
         )
-        print(f"DB List status: {response.status_code}")
-        print(f"DB List response: {response.text[:500]}")
-        
-        data = response.json()
-        
-        if isinstance(data, dict) and "d" in data:
-            db_list = data["d"]
-            if isinstance(db_list, list) and len(db_list) > 0:
-                return db_list[0]
-        return None
+        print(f"[DB LIST] status={r.status_code} body={r.text[:300]}")
+        return r.json()
     except Exception as e:
-        print(f"Error get database: {e}")
+        print(f"[DB LIST ERROR] {e}")
         return None
 
 
 def open_db(db_id):
-    """Buka database dan dapat session"""
     try:
-        response = requests.post(
+        r = requests.post(
             f"{ACCURATE_BASE_URL}/open-db.do",
-            headers=get_accurate_headers(),
-            json={"id": db_id},
-            timeout=10
+            headers=accurate_headers(),
+            data={"id": db_id},
+            timeout=15
         )
-        print(f"Open DB status: {response.status_code}")
-        print(f"Open DB response: {response.text[:500]}")
-        
-        return response.json()
+        print(f"[OPEN DB] status={r.status_code} body={r.text[:300]}")
+        return r.json()
     except Exception as e:
-        print(f"Error open database: {e}")
+        print(f"[OPEN DB ERROR] {e}")
         return None
 
 
 def get_invoices(host, session_id, keyword=None, status=None):
-    """Ambil daftar invoice"""
     try:
         params = {
             "fields": "number,customerName,dueDate,grandTotal,remainingAmount,status,hasAttachment",
@@ -120,48 +83,55 @@ def get_invoices(host, session_id, keyword=None, status=None):
         if status:
             params["filter.status"] = status
 
-        headers = get_accurate_headers()
+        headers = accurate_headers()
         headers["X-Session-ID"] = session_id
 
-        response = requests.get(
+        r = requests.get(
             f"https://{host}/api/customer-invoice/list.do",
             headers=headers,
             params=params,
-            timeout=10
+            timeout=15
         )
-        print(f"Invoice status: {response.status_code}")
-        print(f"Invoice response: {response.text[:500]}")
-        return response.json()
+        print(f"[INVOICE] status={r.status_code} body={r.text[:300]}")
+        return r.json()
     except Exception as e:
-        print(f"Error get invoices: {e}")
+        print(f"[INVOICE ERROR] {e}")
         return None
 
 
 def get_accurate_data(query):
-    """Fungsi utama ambil data dari Accurate"""
-    db_info = get_db_info()
-    if not db_info:
-        return "❌ Tidak bisa ambil daftar database Accurate."
+    # Step 1: Get DB list
+    db_data = get_db_list()
+    if not db_data:
+        return "❌ Gagal koneksi ke Accurate API."
+    
+    if not db_data.get("s"):
+        return f"❌ Accurate error: {db_data.get('d', 'Unknown error')}"
 
-    db_id = db_info.get("id")
-    if not db_id:
-        return "❌ Tidak bisa menemukan ID database."
+    db_list = db_data.get("d", [])
+    if not db_list:
+        return "❌ Tidak ada database ditemukan."
 
+    db = db_list[0]
+    db_id = db.get("id")
+
+    # Step 2: Open DB
     session_data = open_db(db_id)
-    if not session_data:
-        return "❌ Tidak bisa membuka database Accurate."
+    if not session_data or not session_data.get("s"):
+        return f"❌ Gagal buka database: {str(session_data)[:200]}"
 
     session_id = session_data.get("session")
     host = session_data.get("host")
 
     if not session_id or not host:
-        return f"❌ Session tidak valid. Response: {str(session_data)[:200]}"
+        return f"❌ Session tidak valid: {str(session_data)[:200]}"
 
+    # Step 3: Query invoice
     query_lower = query.lower()
 
-    if any(word in query_lower for word in ["belum lunas", "belum bayar", "outstanding", "jatuh tempo", "unpaid"]):
+    if any(w in query_lower for w in ["belum lunas", "belum bayar", "outstanding", "jatuh tempo", "unpaid"]):
         data = get_invoices(host, session_id, status="OPEN")
-        if data and "d" in data:
+        if data and data.get("s") and "d" in data:
             invoices = data["d"]
             if not invoices:
                 return "✅ Tidak ada invoice yang belum lunas saat ini."
@@ -173,11 +143,11 @@ def get_accurate_data(query):
                 result += f"  📅 Jatuh tempo: {inv.get('dueDate', '-')}\n"
                 result += f"  📎 Bukti bayar: {'Ada ✅' if inv.get('hasAttachment') else 'Tidak ada ❌'}\n\n"
             return result
-        return f"❌ Gagal mengambil data. Response: {str(data)[:200]}"
+        return f"❌ Gagal ambil invoice: {str(data)[:200]}"
 
-    elif any(word in query_lower for word in ["rekap", "semua", "daftar", "list", "total"]):
+    elif any(w in query_lower for w in ["rekap", "semua", "daftar", "list", "total", "omset"]):
         data = get_invoices(host, session_id)
-        if data and "d" in data:
+        if data and data.get("s") and "d" in data:
             invoices = data["d"]
             if not invoices:
                 return "📋 Tidak ada invoice ditemukan."
@@ -190,14 +160,14 @@ def get_accurate_data(query):
             result += f"❌ Belum lunas: {total_open} invoice\n"
             result += f"📋 Total: {len(invoices)} invoice\n"
             return result
-        return f"❌ Gagal mengambil data. Response: {str(data)[:200]}"
+        return f"❌ Gagal ambil data: {str(data)[:200]}"
 
     else:
         data = get_invoices(host, session_id, keyword=query)
-        if data and "d" in data:
+        if data and data.get("s") and "d" in data:
             invoices = data["d"]
             if not invoices:
-                return f"🔍 Tidak ditemukan invoice dengan kata kunci: *{query}*"
+                return f"🔍 Tidak ditemukan invoice: *{query}*"
             result = f"🔍 *Hasil pencarian '{query}':*\n\n"
             for inv in invoices[:5]:
                 status_map = {"OPEN": "❌ Belum Lunas", "PAID": "✅ Lunas", "PARTIAL": "⚠️ Sebagian", "VOID": "🚫 Batal"}
@@ -210,7 +180,7 @@ def get_accurate_data(query):
                 result += f"  📌 Status: {status}\n"
                 result += f"  📎 Bukti bayar: {'Ada ✅' if inv.get('hasAttachment') else 'Tidak ada ❌'}\n\n"
             return result
-        return f"❌ Gagal mencari invoice. Response: {str(data)[:200]}"
+        return f"❌ Gagal cari invoice: {str(data)[:200]}"
 
 
 def ask_claude(chat_id, user_message, accurate_data=None):
@@ -222,11 +192,10 @@ def ask_claude(chat_id, user_message, accurate_data=None):
         content = f"Data dari Accurate Online:\n{accurate_data}\n\nPertanyaan user: {user_message}"
 
     conversation_history[chat_id].append({"role": "user", "content": content})
-
     if len(conversation_history[chat_id]) > 20:
         conversation_history[chat_id] = conversation_history[chat_id][-20:]
 
-    response = requests.post(
+    r = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={
             "x-api-key": ANTHROPIC_API_KEY,
@@ -240,9 +209,7 @@ def ask_claude(chat_id, user_message, accurate_data=None):
             "messages": conversation_history[chat_id]
         }
     )
-
-    data = response.json()
-    reply = data["content"][0]["text"]
+    reply = r.json()["content"][0]["text"]
     conversation_history[chat_id].append({"role": "assistant", "content": reply})
     return reply
 
@@ -250,7 +217,6 @@ def ask_claude(chat_id, user_message, accurate_data=None):
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.json
-
     if "message" not in data:
         return "ok", 200
 
@@ -285,10 +251,7 @@ def webhook():
         send_message(chat_id, "✅ Percakapan direset!")
         return "ok", 200
 
-    requests.post(f"{TELEGRAM_API}/sendChatAction", json={
-        "chat_id": chat_id,
-        "action": "typing"
-    })
+    requests.post(f"{TELEGRAM_API}/sendChatAction", json={"chat_id": chat_id, "action": "typing"})
 
     try:
         accurate_data = get_accurate_data(user_text)
@@ -296,7 +259,7 @@ def webhook():
         send_message(chat_id, reply)
     except Exception as e:
         send_message(chat_id, f"⚠️ Error: {str(e)[:100]}")
-        print(f"Error: {e}")
+        print(f"[MAIN ERROR] {e}")
 
     return "ok", 200
 
