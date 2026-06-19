@@ -86,7 +86,7 @@ def get_invoices(host, keyword=None, status=None):
             host = f"https://{host}"
 
         r = requests.get(
-            f"{host}/api/customer-invoice/list.do",
+            f"{host}/accurate/api/sales-invoice/list.do",
             headers=accurate_headers(),
             params=params,
             timeout=15,
