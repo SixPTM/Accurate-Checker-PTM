@@ -515,12 +515,14 @@ def get_accurate_data(query, chat_id=None):
     # 7. Cari produk / item
     elif any(w in q for w in ["harga beli", "harga jual", "modal", "hpp", "harga produk", "stok",
                                "produk", "item", "barang", "vinyl", "stiker", "banner", "kertas",
-                               "tinta", "quantac", "bahan", "material", "cek harga", "harga"]):
+                               "tinta", "quantac", "bahan", "material", "cek harga", "harga",
+                               "sku", "kode produk", "daftar produk", "list produk", "ada berapa"]):
         keyword = query
         for w in ["berapa", "harga", "beli", "jual", "modal", "hpp", "produk", "item", "barang",
-                  "stok", "cek", "info", "ok", "tolong", "nya", "itu", "harganya"]:
+                  "stok", "cek", "info", "ok", "tolong", "nya", "itu", "harganya", "sku",
+                  "kode", "daftar", "list", "ada", "semua", "di", "accurate", "untuk"]:
             keyword = keyword.replace(w, " ").strip()
-        keyword = " ".join(keyword.split()) or query  # hapus spasi dobel
+        keyword = " ".join(keyword.split()) or query
         try:
             if not host.startswith("http"):
                 host = f"https://{host}"
@@ -528,8 +530,8 @@ def get_accurate_data(query, chat_id=None):
                 f"{host}/accurate/api/item/list.do",
                 headers=accurate_headers(),
                 params={
-                    "fields": "id,no,name,unitPrice,purchasePrice,availableStock,unit,description",
-                    "sp.pageSize": 10,
+                    "fields": "id,no,name,unitPrice,purchasePrice,availableStock,unit,buyPrice,lastPurchasePrice,sellingPrice",
+                    "sp.pageSize": 50,
                     "sp.page": 1,
                     "filter.keywords": keyword
                 },
@@ -539,12 +541,15 @@ def get_accurate_data(query, chat_id=None):
             print(f"[ITEM] {r.status_code} {r.text[:800]}")
             if data.get("s") and data.get("d"):
                 items = data["d"]
-                result = f"Produk '{keyword}':\n\n"
-                for item in items[:5]:
+                sp = data.get("sp", {})
+                total = sp.get("rowCount", len(items))
+                result = f"Produk '{keyword}' ({len(items)} dari {total} SKU):\n\n"
+                for item in items[:20]:
                     result += f"📦 {item.get('name', '-')}\n"
                     result += f"   Kode: {item.get('no', '-')}\n"
-                    beli = item.get("purchasePrice") or 0
-                    jual = item.get("unitPrice") or 0
+                    beli = (item.get("purchasePrice") or item.get("buyPrice") or
+                            item.get("lastPurchasePrice") or 0)
+                    jual = (item.get("unitPrice") or item.get("sellingPrice") or 0)
                     stok = item.get("availableStock")
                     if beli:
                         result += f"   Harga Beli: Rp {float(beli):,.0f}\n"
@@ -553,9 +558,11 @@ def get_accurate_data(query, chat_id=None):
                     if stok is not None:
                         result += f"   Stok: {stok} {item.get('unit','')}\n"
                     result += "\n"
+                if total > 20:
+                    result += f"...dan {total-20} SKU lainnya. Coba keyword lebih spesifik.\n"
                 return result
             else:
-                return f"Produk '{keyword}' tidak ditemukan.\nCoba ketik nama produk lebih spesifik."
+                return f"Produk '{keyword}' tidak ditemukan.\nCoba keyword lebih spesifik."
         except Exception as e:
             print(f"[ITEM ERROR] {e}")
             return f"Gagal cek produk: {str(e)[:100]}"
