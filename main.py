@@ -20,12 +20,17 @@ ACCURATE_BASE_URL = "https://account.accurate.id/api"
 
 conversation_history = {}
 
-SYSTEM_PROMPT = """Kamu adalah asisten keuangan untuk perusahaan Print Master yang membantu tim admin mengecek invoice, hutang piutang, dan kinerja admin melalui Accurate Online.
+SYSTEM_PROMPT = """Kamu adalah asisten keuangan dan operasional untuk perusahaan Print Master yang membantu tim admin mengecek invoice, hutang piutang, kinerja admin, dan data produk melalui Accurate Online.
 Kamu berbicara dalam Bahasa Indonesia yang ramah dan profesional.
 Format angka dalam Rupiah (contoh: Rp 1.500.000).
 Status invoice: statusName Lunas=sudah bayar, Belum Lunas=belum bayar.
 Jawab singkat, padat, gunakan emoji.
-Jika data tersedia, analisa dan tampilkan dengan jelas. Jika tidak ada nominal, tetap tampilkan info yang ada seperti jumlah invoice dan status."""
+Kamu BISA membantu:
+- Cek invoice dan status pembayaran
+- Rekap penjualan dan piutang
+- Harga beli, harga jual, dan stok produk dari Accurate Online
+- Customer yang sering order
+Jika data tersedia, analisa dan tampilkan dengan jelas. Jika tidak ada nominal, tetap tampilkan info yang ada."""
 
 
 def send_message(chat_id, text):
@@ -435,11 +440,14 @@ def get_accurate_data(query, chat_id=None):
         return f"Gagal: {str(data)[:200]}"
 
     # 6. Cari produk / item
-    elif any(w in q for w in ["harga beli", "modal", "hpp", "harga produk", "stok", "produk", "item", "barang"]):
+    elif any(w in q for w in ["harga beli", "harga jual", "modal", "hpp", "harga produk", "stok",
+                               "produk", "item", "barang", "vinyl", "stiker", "banner", "kertas",
+                               "tinta", "quantac", "bahan", "material", "cek harga", "harga"]):
         keyword = query
-        for w in ["berapa", "harga", "beli", "modal", "hpp", "produk", "item", "barang", "stok", "cek", "info", "ok"]:
-            keyword = keyword.replace(w, "").strip()
-        keyword = keyword.strip() or query
+        for w in ["berapa", "harga", "beli", "jual", "modal", "hpp", "produk", "item", "barang",
+                  "stok", "cek", "info", "ok", "tolong", "nya", "itu", "harganya"]:
+            keyword = keyword.replace(w, " ").strip()
+        keyword = " ".join(keyword.split()) or query  # hapus spasi dobel
         try:
             if not host.startswith("http"):
                 host = f"https://{host}"
