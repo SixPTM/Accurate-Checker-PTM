@@ -73,7 +73,7 @@ def get_token_info():
 def get_invoices(host, keyword=None, status=None):
     try:
         params = {
-            "fields": "number,customerName,dueDate,grandTotal,remainingAmount,status,hasAttachment",
+            "fields": "number,customerName,transactionDate,dueDate,grandTotal,remainingAmount,statusName,status,hasAttachment",
             "sp.pageSize": 20,
             "sp.page": 1
         }
@@ -129,7 +129,7 @@ def get_accurate_data(query):
             return result
         return f"Gagal ambil data: {str(data)[:200]}"
 
-    elif any(w in q for w in ["rekap", "semua", "daftar", "list", "total", "omset"]):
+    elif any(w in q for w in ["rekap", "semua", "daftar", "list", "total", "omset", "hari ini"]):
         data = get_invoices(host)
         if data and data.get("s"):
             invoices = data.get("d", [])
