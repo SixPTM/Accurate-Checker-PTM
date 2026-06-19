@@ -507,6 +507,54 @@ def get_accurate_data(query, chat_id=None):
             return result
         return f"Gagal: {str(data)[:200]}"
 
+    # Cari produk / item (harga beli, harga jual, stok)
+    elif any(w in q for w in ["harga beli", "modal", "hpp", "harga produk", "stok", "produk", "item", "barang"]):
+        keyword = query
+        # Hapus kata kunci umum agar pencarian lebih akurat
+        for w in ["berapa", "harga", "beli", "modal", "hpp", "produk", "item", "barang", "stok", "cek", "info"]:
+            keyword = keyword.replace(w, "").strip()
+        keyword = keyword.strip() or query
+
+        try:
+            if not host.startswith("http"):
+                host = f"https://{host}"
+            r = requests.get(
+                f"{host}/accurate/api/item/list.do",
+                headers=accurate_headers(),
+                params={
+                    "fields": "id,no,name,unitPrice,purchasePrice,availableStock,unit,description",
+                    "sp.pageSize": 10,
+                    "sp.page": 1,
+                    "filter.keywords": keyword
+                },
+                timeout=15
+            )
+            data = r.json()
+            print(f"[ITEM] {r.status_code} {r.text[:500]}")
+
+            if data.get("s") and data.get("d"):
+                items = data["d"]
+                result = f"Produk '{keyword}':\n\n"
+                for item in items[:5]:
+                    result += f"📦 {item.get('name', '-')}\n"
+                    result += f"   Kode: {item.get('no', '-')}\n"
+                    beli = item.get("purchasePrice") or item.get("hpp") or 0
+                    jual = item.get("unitPrice") or 0
+                    stok = item.get("availableStock")
+                    if beli:
+                        result += f"   Harga Beli: Rp {float(beli):,.0f}\n"
+                    if jual:
+                        result += f"   Harga Jual: Rp {float(jual):,.0f}\n"
+                    if stok is not None:
+                        result += f"   Stok: {stok} {item.get('unit','')}\n"
+                    result += "\n"
+                return result
+            else:
+                return f"Produk '{keyword}' tidak ditemukan di Accurate.\nCoba ketik nama produk lebih spesifik."
+        except Exception as e:
+            print(f"[ITEM ERROR] {e}")
+            return f"Gagal cek produk: {str(e)[:100]}"
+
     # Cari invoice spesifik
     else:
         data = get_invoices(host, keyword=query, page_size=10)
