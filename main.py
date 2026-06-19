@@ -105,7 +105,8 @@ def get_accurate_data(query):
         err = token_info.get("d", "Koneksi gagal") if token_info else "Koneksi gagal"
         return f"Token Error: {err}"
 
-    host = token_info.get("d", {}).get("data usaha", {}).get("host", "")
+    d = token_info.get("d", {})
+    host = d.get("database", d.get("data usaha", {})).get("host", "")
     if not host:
         return f"Host tidak ditemukan: {str(token_info)[:200]}"
 
