@@ -93,19 +93,19 @@ def extract_customer_name(inv):
 
 
 def extract_grand_total(inv):
-    """Ambil total invoice - field yang benar: totalAmount"""
-    for field in ["totalAmount", "grandTotal", "salesAmount", "subTotal", "amount"]:
+    """Ambil total invoice - field yang benar dari debug: totalAmount"""
+    for field in ["totalAmount", "dppAmount", "salesAmount", "subTotal"]:
         val = inv.get(field)
-        if val:
+        if val is not None and val != 0:
             return float(val)
     return 0.0
 
 
 def extract_outstanding(inv):
-    """Ambil sisa hutang - field yang benar: outstanding"""
-    for field in ["outstanding", "remainingAmount", "grandTotal"]:
+    """Ambil sisa piutang - field yang benar dari debug: outstanding"""
+    for field in ["outstanding", "totalAmount", "dppAmount"]:
         val = inv.get(field)
-        if val:
+        if val is not None and val != 0:
             return float(val)
     return 0.0
 
@@ -115,14 +115,15 @@ def get_invoices(host, page_size=50, status=None, date_from=None, date_to=None, 
         if not host.startswith("http"):
             host = f"https://{host}"
 
-        # Field yang benar berdasarkan hasil debug
+        # Field berdasarkan hasil debug detail invoice Accurate Online
         fields = ",".join([
             "id", "number", "transDate", "transDateView",
-            "dueDate", "dueDateView", "statusName",
-            "retailWpName", "customer", "customerId",
-            "totalAmount", "salesAmount", "subTotal",
-            "outstanding", "hasAttachment",
-            "masterSalesmanName", "branchName", "description"
+            "dueDate", "dueDateView", "statusName", "status",
+            "retailWpName", "customerId",
+            "totalAmount", "subTotal", "salesAmount",
+            "outstanding", "dppAmount",
+            "attachmentExist", "masterSalesmanName",
+            "branchName", "lastPaymentDate", "lastPaymentDateView"
         ])
 
         params = {
@@ -173,10 +174,11 @@ def get_all_invoices_paged(host, date_from=None, date_to=None, status=None):
 
         fields = ",".join([
             "id", "number", "transDate", "transDateView",
-            "dueDate", "statusName",
-            "retailWpName", "customer", "customerId",
-            "totalAmount", "salesAmount", "outstanding",
-            "hasAttachment", "masterSalesmanName"
+            "dueDate", "statusName", "status",
+            "retailWpName", "customerId",
+            "totalAmount", "subTotal", "salesAmount",
+            "outstanding", "dppAmount",
+            "attachmentExist", "masterSalesmanName"
         ])
 
         params = {
@@ -483,6 +485,49 @@ def webhook():
 @app.route("/", methods=["GET"])
 def index():
     return "Accurate Checker Bot OK", 200
+
+
+@app.route("/debug-invoice", methods=["GET"])
+def debug_invoice():
+    """Endpoint untuk lihat semua field invoice dari Accurate Online."""
+    try:
+        token_info = get_token_info()
+        if not token_info or not token_info.get("s"):
+            return {"error": "Gagal koneksi Accurate"}, 500
+        d = token_info.get("d", {})
+        host = d.get("database", d.get("data usaha", {})).get("host", "")
+        if not host.startswith("http"):
+            host = f"https://{host}"
+
+        # Ambil 1 invoice list dulu
+        r1 = requests.get(
+            f"{host}/accurate/api/sales-invoice/list.do",
+            headers=accurate_headers(),
+            params={"sp.pageSize": 1, "sp.page": 1},
+            timeout=15
+        )
+        list_data = r1.json()
+        inv_id = list_data.get("d", [{}])[0].get("id") if list_data.get("d") else None
+
+        if not inv_id:
+            return {"error": "Tidak ada invoice"}, 404
+
+        # Ambil detail invoice
+        r2 = requests.get(
+            f"{host}/accurate/api/sales-invoice/detail.do",
+            headers=accurate_headers(),
+            params={"id": inv_id},
+            timeout=15
+        )
+        detail = r2.json().get("d", {})
+
+        # Tampilkan semua field beserta nilainya
+        return {
+            "invoice_id": inv_id,
+            "all_fields": detail
+        }
+    except Exception as e:
+        return {"error": str(e)}, 500
 
 
 if __name__ == "__main__":
