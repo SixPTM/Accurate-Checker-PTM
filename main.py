@@ -72,32 +72,31 @@ def get_token_info():
 
 def extract_customer_name(inv):
     """Ambil nama customer dari berbagai kemungkinan struktur field Accurate Online."""
-    # Coba customerName langsung
     name = inv.get("customerName")
-    if name and name != "-" and name.strip():
-        return name
-    # Coba nested customer.name
+    if name and str(name).strip() and name != "-":
+        return str(name).strip()
     customer = inv.get("customer")
     if isinstance(customer, dict):
         name = customer.get("name") or customer.get("customerName")
-        if name and name.strip():
-            return name
-    # Coba field lain
-    name = inv.get("customer") if isinstance(inv.get("customer"), str) else None
-    if name and name.strip():
-        return name
+        if name and str(name).strip():
+            return str(name).strip()
+    if isinstance(customer, str) and customer.strip():
+        return customer.strip()
+    # Coba field alternatif lain
+    for field in ["custName", "buyerName", "toName", "name"]:
+        val = inv.get(field)
+        if val and str(val).strip():
+            return str(val).strip()
     return "-"
 
 
 def extract_grand_total(inv):
     """Ambil grandTotal dari berbagai kemungkinan nama field."""
-    return (
-        inv.get("grandTotal") or
-        inv.get("total") or
-        inv.get("totalAmount") or
-        inv.get("amount") or
-        0
-    )
+    for field in ["grandTotal", "total", "totalAmount", "amount", "grandTotalOrigCurr"]:
+        val = inv.get(field)
+        if val:
+            return val
+    return 0
 
 
 def get_invoices(host, page_size=50, status=None, date_from=None, date_to=None, keyword=None):
@@ -105,8 +104,15 @@ def get_invoices(host, page_size=50, status=None, date_from=None, date_to=None, 
         if not host.startswith("http"):
             host = f"https://{host}"
 
+        # Coba berbagai kemungkinan nama field customer di Accurate Online
+        fields = ",".join([
+            "id", "number", "transDate", "dueDate", "statusName",
+            "customerName", "custName", "customer.name", "customer",
+            "grandTotal", "totalAmount", "remainingAmount", "hasAttachment"
+        ])
+
         params = {
-            # Hapus fields filter agar semua field dikembalikan oleh API
+            "fields": fields,
             "sp.pageSize": page_size,
             "sp.page": 1,
             "sp.sort": "transDate",
@@ -128,10 +134,9 @@ def get_invoices(host, page_size=50, status=None, date_from=None, date_to=None, 
             timeout=15,
             allow_redirects=True
         )
-        print(f"[INVOICE] {r.status_code} {r.text[:800]}")
+        print(f"[INVOICE] {r.status_code} {r.text[:1000]}")
         data = r.json()
 
-        # Debug: print semua field dari invoice pertama
         if data.get("s") and data.get("d"):
             sample = data["d"][0] if data["d"] else {}
             print(f"[FIELDS AVAILABLE] {list(sample.keys())}")
@@ -139,6 +144,26 @@ def get_invoices(host, page_size=50, status=None, date_from=None, date_to=None, 
         return data
     except Exception as e:
         print(f"[INVOICE ERROR] {e}")
+        return None
+
+
+def get_invoice_detail(host, invoice_id):
+    """Ambil detail satu invoice untuk cek field yang tersedia."""
+    try:
+        if not host.startswith("http"):
+            host = f"https://{host}"
+        r = requests.get(
+            f"{host}/accurate/api/sales-invoice/detail.do",
+            headers=accurate_headers(),
+            params={"id": invoice_id},
+            timeout=15
+        )
+        data = r.json()
+        print(f"[DETAIL FIELDS] {list(data.get('d', {}).keys())}")
+        print(f"[DETAIL SAMPLE] {str(data.get('d', {}))[:500]}")
+        return data
+    except Exception as e:
+        print(f"[DETAIL ERROR] {e}")
         return None
 
 
@@ -156,6 +181,16 @@ def get_accurate_data(query):
     today_str = now.strftime("%d/%m/%Y")
     month_start = now.replace(day=1).strftime("%d/%m/%Y")
     q = query.lower()
+
+    # DEBUG: cek field detail invoice pertama
+    if "debug" in q or "field" in q:
+        data = get_invoices(host, page_size=1)
+        if data and data.get("s") and data.get("d"):
+            inv_id = data["d"][0].get("id")
+            detail = get_invoice_detail(host, inv_id)
+            d_data = detail.get("d", {}) if detail else {}
+            return f"Fields tersedia di detail invoice:\n{list(d_data.keys())}\n\nSample:\n{str(d_data)[:800]}"
+        return "Gagal ambil data debug."
 
     # Cek invoice belum lunas / piutang
     if any(w in q for w in ["belum lunas", "belum bayar", "piutang", "outstanding", "jatuh tempo", "unpaid"]):
@@ -213,7 +248,6 @@ def get_accurate_data(query):
             sp = data.get("sp", {})
             total_val = sum(extract_grand_total(inv) for inv in invoices)
 
-            # Hitung per customer
             customer_count = {}
             customer_total = {}
             for inv in invoices:
@@ -237,7 +271,7 @@ def get_accurate_data(query):
                         result += f" (Rp {total_cust:,.0f})"
                     result += "\n"
             else:
-                result += "\n⚠️ Nama customer tidak terbaca dari API. Cek log Railway untuk debug field."
+                result += "\n⚠️ Nama customer belum terbaca. Kirim pesan 'debug field' untuk cek.\n"
             return result
         return f"Gagal: {str(data)[:200]}"
 
