@@ -91,8 +91,10 @@ def extract_customer_name(inv):
 
 
 def extract_grand_total(inv):
-    """Ambil total invoice - field yang benar dari debug: totalAmount"""
-    for field in ["totalAmount", "dppAmount", "salesAmount", "subTotal"]:
+    """Ambil total invoice - prioritas dari detail enrich."""
+    if inv.get("_totalAmount"):
+        return float(inv["_totalAmount"])
+    for field in ["totalAmount", "subTotal", "salesAmount"]:
         val = inv.get(field)
         if val is not None and val != 0:
             return float(val)
@@ -100,16 +102,19 @@ def extract_grand_total(inv):
 
 
 def extract_outstanding(inv):
-    """Ambil sisa piutang - field yang benar dari debug: outstanding"""
-    for field in ["outstanding", "totalAmount", "dppAmount"]:
-        val = inv.get(field)
-        if val is not None and val != 0:
-            return float(val)
+    """Ambil sisa piutang - prioritas dari detail enrich (field outstanding)."""
+    # Dari detail enrich — paling akurat
+    if "_outstanding" in inv:
+        return float(inv["_outstanding"])
+    # Dari list endpoint
+    val = inv.get("outstanding")
+    if val is not None and val != 0:
+        return float(val)
     return 0.0
 
 
 def fetch_customer_name(host, inv):
-    """Ambil nama customer dari detail endpoint untuk satu invoice."""
+    """Ambil nama customer dan outstanding dari detail endpoint untuk satu invoice."""
     try:
         if not host.startswith("http"):
             host = f"https://{host}"
@@ -120,17 +125,31 @@ def fetch_customer_name(host, inv):
             timeout=10
         )
         detail = r.json().get("d", {})
+
+        # Ambil nama customer
+        customer = detail.get("customer")
         name = (
             detail.get("retailWpName") or
             detail.get("customerName") or
             detail.get("toName") or
-            (detail.get("customer") or {}).get("name") if isinstance(detail.get("customer"), dict) else None or
+            (customer.get("name") if isinstance(customer, dict) else None) or
             "-"
         )
         inv["_customerName"] = str(name).strip() if name else "-"
+
+        # Ambil outstanding (sisa piutang) dari detail
+        outstanding = detail.get("outstanding")
+        inv["_outstanding"] = float(outstanding) if outstanding is not None else 0.0
+
+        # Ambil totalAmount dari detail
+        total = detail.get("totalAmount") or detail.get("subTotal") or 0
+        inv["_totalAmount"] = float(total)
+
     except Exception as e:
         print(f"[ENRICH ERROR] id={inv.get('id')} {e}")
         inv["_customerName"] = "-"
+        inv["_outstanding"] = 0.0
+        inv["_totalAmount"] = 0.0
     return inv
 
 
@@ -334,11 +353,13 @@ def get_accurate_data(query):
         sp = data.get("sp", {})
         total_invoice = sp.get("rowCount", len(invoices))
 
+        # Enrich dengan customer name + outstanding dari detail (paralel)
+        invoices = enrich_with_customer_names(host, invoices, max_workers=10)
+
         # Filter manual: hanya yang belum lunas
         belum = [i for i in invoices if "belum" in (i.get("statusName") or "").lower()]
-        # Jika API sudah filter via status=OPEN, semua sudah belum lunas
         if not belum:
-            belum = invoices
+            belum = invoices  # API sudah filter OPEN
 
         if not belum:
             return f"Tidak ada invoice belum lunas untuk periode {label_period}."
