@@ -3,6 +3,7 @@ import hmac
 import hashlib
 import base64
 import datetime
+import threading
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request
@@ -294,7 +295,7 @@ def get_invoice_detail(host, invoice_id):
         return None
 
 
-def get_accurate_data(query):
+def get_accurate_data(query, chat_id=None):
     token_info = get_token_info()
     if not token_info or not token_info.get("s"):
         return "Gagal koneksi ke Accurate."
@@ -343,77 +344,81 @@ def get_accurate_data(query):
             date_to = today_str
             label_period = "Hari Ini"
 
-        # Pagination semua halaman, hanya ambil totalAmount (tanpa enrich detail)
-        # Ini cepat karena tidak hit detail endpoint
-        total_nilai = 0.0
-        total_invoice = 0
-        sample_invoices = []
-        page = 1
-
-        if not host.startswith("http"):
-            host = f"https://{host}"
-
-        while True:
+        # Jalankan di background, langsung balas dulu
+        def hitung_piutang(chat_id, host, date_from, date_to, label_period):
             try:
-                params = {
-                    "fields": "id,number,transDate,dueDate,statusName,totalAmount,subTotal,retailWpName",
-                    "sp.pageSize": 200,
-                    "sp.page": page,
-                    "sp.sort": "transDate",
-                    "sp.sortOrder": "DESC",
-                    "filter.status": "OPEN"
-                }
-                if date_from:
-                    params["filter.transDate.op"] = "BETWEEN"
-                    params["filter.transDate.val[0]"] = date_from
-                    params["filter.transDate.val[1]"] = date_to or date_from
+                total_nilai = 0.0
+                total_invoice = 0
+                sample_invoices = []
+                page = 1
+                h = host if host.startswith("http") else f"https://{host}"
 
-                r = requests.get(
-                    f"{host}/accurate/api/sales-invoice/list.do",
-                    headers=accurate_headers(),
-                    params=params,
-                    timeout=20
-                )
-                data = r.json()
-                if not data.get("s"):
-                    break
+                while True:
+                    params = {
+                        "fields": "id,number,transDate,dueDate,statusName,totalAmount,subTotal,retailWpName",
+                        "sp.pageSize": 200,
+                        "sp.page": page,
+                        "sp.sort": "transDate",
+                        "sp.sortOrder": "DESC",
+                        "filter.status": "OPEN"
+                    }
+                    if date_from:
+                        params["filter.transDate.op"] = "BETWEEN"
+                        params["filter.transDate.val[0]"] = date_from
+                        params["filter.transDate.val[1]"] = date_to or date_from
 
-                page_invoices = data.get("d", [])
-                sp = data.get("sp", {})
+                    r = requests.get(
+                        f"{h}/accurate/api/sales-invoice/list.do",
+                        headers=accurate_headers(),
+                        params=params,
+                        timeout=30
+                    )
+                    data = r.json()
+                    if not data.get("s"):
+                        break
 
-                if page == 1:
-                    total_invoice = sp.get("rowCount", 0)
-                    sample_invoices = page_invoices[:10]
+                    page_invoices = data.get("d", [])
+                    sp = data.get("sp", {})
 
-                for inv in page_invoices:
-                    val = inv.get("totalAmount") or inv.get("subTotal") or 0
-                    total_nilai += float(val)
+                    if page == 1:
+                        total_invoice = sp.get("rowCount", 0)
+                        sample_invoices = page_invoices[:5]
 
-                total_pages = sp.get("pageCount", 1)
-                print(f"[PIUTANG PAGE] {page}/{total_pages} - total so far: Rp {total_nilai:,.0f}")
+                    for inv in page_invoices:
+                        val = inv.get("totalAmount") or inv.get("subTotal") or 0
+                        total_nilai += float(val)
 
-                if page >= total_pages:
-                    break
-                page += 1
+                    total_pages = sp.get("pageCount", 1)
+                    print(f"[BG PIUTANG] {page}/{total_pages} Rp {total_nilai:,.0f}")
+
+                    if page >= total_pages:
+                        break
+                    page += 1
+
+                # Kirim hasil ke Telegram
+                result = f"✅ Selesai dihitung!\n\n"
+                result += f"Piutang Belum Lunas - {label_period}:\n"
+                result += f"Total invoice: {total_invoice}\n"
+                result += f"Total nilai: Rp {total_nilai:,.0f}\n"
+                result += f"\n⚠️ Nilai adalah total invoice (bukan sisa). Jika ada partial payment, angka bisa sedikit lebih besar dari saldo di Accurate.\n"
+                if sample_invoices:
+                    result += f"\nContoh invoice terbaru:\n"
+                    for inv in sample_invoices:
+                        nama = inv.get("retailWpName") or "-"
+                        total = float(inv.get("totalAmount") or inv.get("subTotal") or 0)
+                        result += f"- {inv.get('number','-')} | {nama} | Rp {total:,.0f}\n"
+                send_message(chat_id, result)
 
             except Exception as e:
-                print(f"[PIUTANG PAGE ERROR] {e}")
-                break
+                send_message(chat_id, f"❌ Gagal hitung piutang: {str(e)[:100]}")
+                print(f"[BG PIUTANG ERROR] {e}")
 
-        if total_invoice == 0:
-            return f"Tidak ada invoice belum lunas untuk periode {label_period}."
+        # Jalankan background thread
+        t = threading.Thread(target=hitung_piutang, args=(chat_id, host, date_from, date_to, label_period))
+        t.daemon = True
+        t.start()
 
-        result = f"Piutang Belum Lunas - {label_period}:\n"
-        result += f"Total invoice: {total_invoice}\n"
-        result += f"Total nilai: Rp {total_nilai:,.0f}\n"
-        result += f"\n⚠️ Catatan: Nilai adalah total invoice (bukan sisa). Jika ada partial payment, angka bisa lebih besar dari saldo di Accurate.\n"
-        if sample_invoices:
-            result += f"\nContoh invoice terbaru:\n"
-            for inv in sample_invoices[:5]:
-                nama = inv.get("retailWpName") or "-"
-                total = float(inv.get("totalAmount") or inv.get("subTotal") or 0)
-                result += f"- {inv.get('number','-')} | {nama} | Rp {total:,.0f} | {inv.get('dueDate','-')}\n"
-        return result
+        return f"⏳ Sedang menghitung piutang {label_period}...\nData ada 27.000+ invoice, butuh waktu 1-2 menit. Saya kirim hasilnya setelah selesai ya!"
 
     # Penjualan hari ini
     elif any(w in q for w in ["omset hari ini", "penjualan hari ini", "transaksi hari ini", "invoice hari ini"]):
@@ -575,7 +580,7 @@ def webhook():
     requests.post(f"{TELEGRAM_API}/sendChatAction", json={"chat_id": chat_id, "action": "typing"})
 
     try:
-        accurate_data = get_accurate_data(user_text)
+        accurate_data = get_accurate_data(user_text, chat_id=chat_id)
         reply = ask_claude(chat_id, user_text, accurate_data)
         send_message(chat_id, reply)
     except Exception as e:
