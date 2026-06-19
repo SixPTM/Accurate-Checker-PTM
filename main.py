@@ -264,7 +264,7 @@ def get_accurate_data(query):
         return "Gagal ambil data debug."
 
     # Invoice belum lunas / piutang
-    if any(w in q for w in ["belum lunas", "belum bayar", "piutang", "outstanding", "jatuh tempo", "unpaid", "belum bayar"]):
+    if any(w in q for w in ["belum lunas", "belum bayar", "piutang", "outstanding", "jatuh tempo", "unpaid"]):
         # Deteksi periode dari query
         date_from = None
         date_to = None
@@ -287,46 +287,53 @@ def get_accurate_data(query):
             date_to = today_str
             label_period = "Hari Ini"
 
-        invoices = get_all_invoices_paged(host, date_from=date_from, date_to=date_to, status="OPEN")
+        # Ambil halaman 1 saja untuk summary cepat (tidak timeout)
+        data = get_invoices(host, page_size=100, status="OPEN",
+                            date_from=date_from, date_to=date_to)
+        if not data or not data.get("s"):
+            return f"Gagal ambil data piutang: {str(data)[:200]}"
 
-        # Filter manual status belum lunas dari hasil
-        belum = [i for i in invoices if "belum" in (i.get("statusName") or "").lower()]
-        if not belum and invoices:
-            belum = invoices  # kalau status filter sudah handle di API
+        invoices = data.get("d", [])
+        sp = data.get("sp", {})
+        total_invoice = sp.get("rowCount", len(invoices))
 
-        if not belum:
+        if not invoices:
             return f"Tidak ada invoice belum lunas untuk periode {label_period}."
 
-        total_sisa = sum(extract_outstanding(i) for i in belum)
-        result = f"Invoice Belum Lunas - {label_period}:\n"
-        result += f"Total: {len(belum)} invoice | Sisa: Rp {total_sisa:,.0f}\n\n"
-        for inv in belum[:15]:
+        total_sisa = sum(extract_outstanding(i) for i in invoices)
+
+        result = f"Piutang Belum Lunas - {label_period}:\n"
+        result += f"Total invoice: {total_invoice}\n"
+        result += f"Total nilai (dari {len(invoices)} sample): Rp {total_sisa:,.0f}\n\n"
+        result += f"Detail 15 terbaru:\n"
+        for inv in invoices[:15]:
             nama = extract_customer_name(inv)
             sisa = extract_outstanding(inv)
             result += f"- {inv.get('number','-')} | {nama}\n"
-            result += f"  Sisa: Rp {sisa:,.0f} | Tempo: {inv.get('dueDate','-')}\n"
-            result += f"  Bukti: {'Ada' if inv.get('hasAttachment') else 'Tidak ada'}\n\n"
-        if len(belum) > 15:
-            result += f"...dan {len(belum)-15} invoice lainnya.\n"
+            result += f"  Sisa: Rp {sisa:,.0f} | Tempo: {inv.get('dueDate','-')}\n\n"
         return result
 
     # Penjualan hari ini
     elif any(w in q for w in ["omset hari ini", "penjualan hari ini", "transaksi hari ini", "invoice hari ini"]):
-        invoices = get_all_invoices_paged(host, date_from=today_str, date_to=today_str)
-        total = sum(extract_grand_total(inv) for inv in invoices)
-        lunas = sum(1 for i in invoices if "lunas" in (i.get("statusName") or "").lower() and "belum" not in (i.get("statusName") or "").lower())
-        belum = sum(1 for i in invoices if "belum" in (i.get("statusName") or "").lower())
-        result = f"Penjualan Hari Ini ({today_str}):\n\n"
-        result += f"Jumlah invoice: {len(invoices)}\n"
-        result += f"Lunas: {lunas} | Belum: {belum}\n"
-        if total > 0:
-            result += f"Total nilai: Rp {total:,.0f}\n"
-        if invoices:
-            result += "\nDetail:\n"
-            for inv in invoices[:10]:
-                nama = extract_customer_name(inv)
-                result += f"- {inv.get('number','-')} | {nama} | {inv.get('statusName','-')}\n"
-        return result
+        data = get_invoices(host, page_size=100, date_from=today_str, date_to=today_str)
+        if data and data.get("s"):
+            invoices = data.get("d", [])
+            sp = data.get("sp", {})
+            total = sum(extract_grand_total(inv) for inv in invoices)
+            lunas = sum(1 for i in invoices if "lunas" in (i.get("statusName") or "").lower() and "belum" not in (i.get("statusName") or "").lower())
+            belum = sum(1 for i in invoices if "belum" in (i.get("statusName") or "").lower())
+            result = f"Penjualan Hari Ini ({today_str}):\n\n"
+            result += f"Jumlah invoice: {sp.get('rowCount', len(invoices))}\n"
+            result += f"Lunas: {lunas} | Belum: {belum}\n"
+            if total > 0:
+                result += f"Total nilai: Rp {total:,.0f}\n"
+            if invoices:
+                result += "\nDetail:\n"
+                for inv in invoices[:10]:
+                    nama = extract_customer_name(inv)
+                    result += f"- {inv.get('number','-')} | {nama} | {inv.get('statusName','-')}\n"
+            return result
+        return f"Gagal: {str(data)[:200]}"
 
     # Penjualan bulan ini / Juni / customer sering order
     elif any(w in q for w in ["omset", "penjualan", "bulan ini", "bulan juni", "juni", "customer", "sering order"]):
@@ -339,35 +346,40 @@ def get_accurate_data(query):
             date_to = today_str
             label = "Bulan Ini"
 
-        # Pakai pagination untuk ambil SEMUA invoice
-        invoices = get_all_invoices_paged(host, date_from=date_from, date_to=date_to)
-        total_val = sum(extract_grand_total(inv) for inv in invoices)
+        # Ambil page 1 saja — cukup untuk top customer & summary (hindari timeout)
+        data = get_invoices(host, page_size=100, date_from=date_from, date_to=date_to)
+        if data and data.get("s"):
+            invoices = data.get("d", [])
+            sp = data.get("sp", {})
+            total_all = sp.get("rowCount", len(invoices))
+            total_val = sum(extract_grand_total(inv) for inv in invoices)
 
-        customer_count = {}
-        customer_total = {}
-        for inv in invoices:
-            nama = extract_customer_name(inv)
-            customer_count[nama] = customer_count.get(nama, 0) + 1
-            customer_total[nama] = customer_total.get(nama, 0) + extract_grand_total(inv)
+            customer_count = {}
+            customer_total = {}
+            for inv in invoices:
+                nama = extract_customer_name(inv)
+                customer_count[nama] = customer_count.get(nama, 0) + 1
+                customer_total[nama] = customer_total.get(nama, 0) + extract_grand_total(inv)
 
-        top_customers = sorted(customer_count.items(), key=lambda x: x[1], reverse=True)[:5]
+            top_customers = sorted(customer_count.items(), key=lambda x: x[1], reverse=True)[:5]
 
-        result = f"Rekap Penjualan {label}:\n\n"
-        result += f"Total invoice: {len(invoices)}\n"
-        if total_val > 0:
-            result += f"Total nilai: Rp {total_val:,.0f}\n"
+            result = f"Rekap Penjualan {label}:\n\n"
+            result += f"Total invoice: {total_all}\n"
+            if total_val > 0:
+                result += f"Nilai (100 sample): Rp {total_val:,.0f}\n"
 
-        if top_customers and top_customers[0][0] != "-":
-            result += f"\nTop Customer Paling Sering Order:\n"
-            for i, (nama, count) in enumerate(top_customers, 1):
-                total_cust = customer_total.get(nama, 0)
-                result += f"{i}. {nama} - {count} invoice"
-                if total_cust > 0:
-                    result += f" (Rp {total_cust:,.0f})"
-                result += "\n"
-        else:
-            result += "\n⚠️ Nama customer belum terbaca. Kirim 'debug field' untuk cek.\n"
-        return result
+            if top_customers and top_customers[0][0] != "-":
+                result += f"\nTop Customer Paling Sering Order:\n"
+                for i, (nama, count) in enumerate(top_customers, 1):
+                    total_cust = customer_total.get(nama, 0)
+                    result += f"{i}. {nama} - {count} invoice"
+                    if total_cust > 0:
+                        result += f" (Rp {total_cust:,.0f})"
+                    result += "\n"
+            else:
+                result += "\n⚠️ Nama customer belum terbaca. Kirim 'debug field' untuk cek.\n"
+            return result
+        return f"Gagal ambil data: {str(data)[:200]}"
 
     # Rekap semua
     elif any(w in q for w in ["rekap", "semua", "daftar", "list", "total"]):
