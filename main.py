@@ -420,25 +420,53 @@ def get_accurate_data(query, chat_id=None):
 
         return f"⏳ Sedang menghitung piutang {label_period}...\nData ada 27.000+ invoice, butuh waktu 1-2 menit. Saya kirim hasilnya setelah selesai ya!"
 
+    # Belum lunas hari ini (follow-up dari penjualan hari ini)
+    elif any(w in q for w in ["belum lunas hari ini", "belum bayar hari ini", "invoice belum hari ini"]) or \
+         (any(w in q for w in ["belum lunas", "belum bayar"]) and any(w in q for w in ["hari ini", "tadi", "sekarang", "siapa", "nama"])):
+        data = get_invoices(host, page_size=100, date_from=today_str, date_to=today_str, status="OPEN")
+        if data and data.get("s"):
+            invoices = data.get("d", [])
+            sp = data.get("sp", {})
+            total_belum = sp.get("rowCount", len(invoices))
+            # Enrich nama customer
+            invoices = enrich_with_customer_names(host, invoices, max_workers=10)
+            total_nilai = sum(extract_grand_total(i) for i in invoices)
+            result = f"Invoice Belum Lunas Hari Ini ({today_str}):\n"
+            result += f"Total: {total_belum} invoice | Nilai: Rp {total_nilai:,.0f}\n\n"
+            for inv in invoices[:20]:
+                nama = extract_customer_name(inv)
+                total = extract_grand_total(inv)
+                result += f"- {inv.get('number','-')} | {nama} | Rp {total:,.0f}\n"
+                result += f"  Tempo: {inv.get('dueDate','-')}\n"
+            return result
+        return f"Gagal: {str(data)[:200]}"
+
     # Penjualan hari ini
     elif any(w in q for w in ["omset hari ini", "penjualan hari ini", "transaksi hari ini", "invoice hari ini"]):
         data = get_invoices(host, page_size=100, date_from=today_str, date_to=today_str)
         if data and data.get("s"):
             invoices = data.get("d", [])
             sp = data.get("sp", {})
+            total_all = sp.get("rowCount", len(invoices))
+            # Enrich nama customer (paralel, cepat)
+            invoices = enrich_with_customer_names(host, invoices, max_workers=10)
             total = sum(extract_grand_total(inv) for inv in invoices)
-            lunas = sum(1 for i in invoices if "lunas" in (i.get("statusName") or "").lower() and "belum" not in (i.get("statusName") or "").lower())
-            belum = sum(1 for i in invoices if "belum" in (i.get("statusName") or "").lower())
+            lunas_list = [i for i in invoices if "lunas" in (i.get("statusName") or "").lower() and "belum" not in (i.get("statusName") or "").lower()]
+            belum_list = [i for i in invoices if "belum" in (i.get("statusName") or "").lower()]
             result = f"Penjualan Hari Ini ({today_str}):\n\n"
-            result += f"Jumlah invoice: {sp.get('rowCount', len(invoices))}\n"
-            result += f"Lunas: {lunas} | Belum: {belum}\n"
+            result += f"Total invoice: {total_all} | Lunas: {len(lunas_list)} | Belum: {len(belum_list)}\n"
             if total > 0:
                 result += f"Total nilai: Rp {total:,.0f}\n"
-            if invoices:
-                result += "\nDetail:\n"
-                for inv in invoices[:10]:
+            if belum_list:
+                result += f"\nInvoice Belum Lunas:\n"
+                for inv in belum_list[:10]:
                     nama = extract_customer_name(inv)
-                    result += f"- {inv.get('number','-')} | {nama} | {inv.get('statusName','-')}\n"
+                    result += f"- {inv.get('number','-')} | {nama} | Rp {extract_grand_total(inv):,.0f}\n"
+            if lunas_list:
+                result += f"\nInvoice Lunas (10 terbaru):\n"
+                for inv in lunas_list[:10]:
+                    nama = extract_customer_name(inv)
+                    result += f"- {inv.get('number','-')} | {nama} | Rp {extract_grand_total(inv):,.0f}\n"
             return result
         return f"Gagal: {str(data)[:200]}"
 
