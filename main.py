@@ -343,42 +343,76 @@ def get_accurate_data(query):
             date_to = today_str
             label_period = "Hari Ini"
 
-        # Ambil halaman 1 saja untuk summary cepat (tidak timeout)
-        data = get_invoices(host, page_size=100, status="OPEN",
-                            date_from=date_from, date_to=date_to)
-        if not data or not data.get("s"):
-            return f"Gagal ambil data piutang: {str(data)[:200]}"
+        # Pagination semua halaman, hanya ambil totalAmount (tanpa enrich detail)
+        # Ini cepat karena tidak hit detail endpoint
+        total_nilai = 0.0
+        total_invoice = 0
+        sample_invoices = []
+        page = 1
 
-        invoices = data.get("d", [])
-        sp = data.get("sp", {})
-        total_invoice = sp.get("rowCount", len(invoices))
+        if not host.startswith("http"):
+            host = f"https://{host}"
 
-        # Enrich dengan customer name + outstanding dari detail (paralel)
-        invoices = enrich_with_customer_names(host, invoices, max_workers=10)
+        while True:
+            try:
+                params = {
+                    "fields": "id,number,transDate,dueDate,statusName,totalAmount,subTotal,retailWpName",
+                    "sp.pageSize": 200,
+                    "sp.page": page,
+                    "sp.sort": "transDate",
+                    "sp.sortOrder": "DESC",
+                    "filter.status": "OPEN"
+                }
+                if date_from:
+                    params["filter.transDate.op"] = "BETWEEN"
+                    params["filter.transDate.val[0]"] = date_from
+                    params["filter.transDate.val[1]"] = date_to or date_from
 
-        # Filter manual: hanya yang belum lunas
-        belum = [i for i in invoices if "belum" in (i.get("statusName") or "").lower()]
-        if not belum:
-            belum = invoices  # API sudah filter OPEN
+                r = requests.get(
+                    f"{host}/accurate/api/sales-invoice/list.do",
+                    headers=accurate_headers(),
+                    params=params,
+                    timeout=20
+                )
+                data = r.json()
+                if not data.get("s"):
+                    break
 
-        if not belum:
+                page_invoices = data.get("d", [])
+                sp = data.get("sp", {})
+
+                if page == 1:
+                    total_invoice = sp.get("rowCount", 0)
+                    sample_invoices = page_invoices[:10]
+
+                for inv in page_invoices:
+                    val = inv.get("totalAmount") or inv.get("subTotal") or 0
+                    total_nilai += float(val)
+
+                total_pages = sp.get("pageCount", 1)
+                print(f"[PIUTANG PAGE] {page}/{total_pages} - total so far: Rp {total_nilai:,.0f}")
+
+                if page >= total_pages:
+                    break
+                page += 1
+
+            except Exception as e:
+                print(f"[PIUTANG PAGE ERROR] {e}")
+                break
+
+        if total_invoice == 0:
             return f"Tidak ada invoice belum lunas untuk periode {label_period}."
 
-        total_sisa = sum(extract_outstanding(i) for i in belum)
-        total_nominal = sum(extract_grand_total(i) for i in belum)
-
         result = f"Piutang Belum Lunas - {label_period}:\n"
-        result += f"Total invoice belum lunas: {total_invoice}\n"
-        if total_sisa > 0:
-            result += f"Total sisa tagihan: Rp {total_sisa:,.0f}\n"
-        elif total_nominal > 0:
-            result += f"Total nilai invoice: Rp {total_nominal:,.0f}\n"
-        result += f"\nDetail {min(len(belum),15)} terbaru:\n"
-        for inv in belum[:15]:
-            nama = extract_customer_name(inv)
-            sisa = extract_outstanding(inv) or extract_grand_total(inv)
-            result += f"- {inv.get('number','-')} | {nama}\n"
-            result += f"  Tagihan: Rp {sisa:,.0f} | Tempo: {inv.get('dueDate','-')}\n\n"
+        result += f"Total invoice: {total_invoice}\n"
+        result += f"Total nilai: Rp {total_nilai:,.0f}\n"
+        result += f"\n⚠️ Catatan: Nilai adalah total invoice (bukan sisa). Jika ada partial payment, angka bisa lebih besar dari saldo di Accurate.\n"
+        if sample_invoices:
+            result += f"\nContoh invoice terbaru:\n"
+            for inv in sample_invoices[:5]:
+                nama = inv.get("retailWpName") or "-"
+                total = float(inv.get("totalAmount") or inv.get("subTotal") or 0)
+                result += f"- {inv.get('number','-')} | {nama} | Rp {total:,.0f} | {inv.get('dueDate','-')}\n"
         return result
 
     # Penjualan hari ini
