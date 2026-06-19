@@ -4,6 +4,7 @@ import hashlib
 import base64
 import datetime
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request
 
 app = Flask(__name__)
@@ -71,12 +72,14 @@ def get_token_info():
 
 
 def extract_customer_name(inv):
-    """Ambil nama customer - field yang benar: retailWpName atau customer.name"""
-    # Field utama yang ditemukan dari debug
-    name = inv.get("retailWpName")
-    if name and str(name).strip():
-        return str(name).strip()
-    # Fallback: customer object
+    """Ambil nama customer - coba semua kemungkinan field."""
+    # Field hasil enrich dari detail endpoint
+    if inv.get("_customerName") and inv["_customerName"] != "-":
+        return inv["_customerName"]
+    for field in ["retailWpName", "customerName", "toName"]:
+        val = inv.get(field)
+        if val and str(val).strip() and str(val).strip() != "-":
+            return str(val).strip()
     customer = inv.get("customer")
     if isinstance(customer, dict):
         name = customer.get("name") or customer.get("customerName")
@@ -84,11 +87,6 @@ def extract_customer_name(inv):
             return str(name).strip()
     if isinstance(customer, str) and customer.strip():
         return customer.strip()
-    # Fallback lain
-    for field in ["customerName", "custName", "toName"]:
-        val = inv.get(field)
-        if val and str(val).strip():
-            return str(val).strip()
     return "-"
 
 
@@ -110,20 +108,57 @@ def extract_outstanding(inv):
     return 0.0
 
 
+def fetch_customer_name(host, inv):
+    """Ambil nama customer dari detail endpoint untuk satu invoice."""
+    try:
+        if not host.startswith("http"):
+            host = f"https://{host}"
+        r = requests.get(
+            f"{host}/accurate/api/sales-invoice/detail.do",
+            headers=accurate_headers(),
+            params={"id": inv["id"]},
+            timeout=10
+        )
+        detail = r.json().get("d", {})
+        name = (
+            detail.get("retailWpName") or
+            detail.get("customerName") or
+            detail.get("toName") or
+            (detail.get("customer") or {}).get("name") if isinstance(detail.get("customer"), dict) else None or
+            "-"
+        )
+        inv["_customerName"] = str(name).strip() if name else "-"
+    except Exception as e:
+        print(f"[ENRICH ERROR] id={inv.get('id')} {e}")
+        inv["_customerName"] = "-"
+    return inv
+
+
+def enrich_with_customer_names(host, invoices, max_workers=10):
+    """Ambil nama customer untuk semua invoice secara paralel."""
+    print(f"[ENRICH] Fetching customer names for {len(invoices)} invoices...")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(fetch_customer_name, host, inv): inv for inv in invoices}
+        for future in as_completed(futures):
+            future.result()
+    print(f"[ENRICH] Done.")
+    return invoices
+
+
 def get_invoices(host, page_size=50, status=None, date_from=None, date_to=None, keyword=None):
     try:
         if not host.startswith("http"):
             host = f"https://{host}"
 
-        # Field berdasarkan hasil debug detail invoice Accurate Online
+        # Field yang confirmed ada di list response (berdasarkan SAMPLE INVOICE log)
         fields = ",".join([
             "id", "number", "transDate", "transDateView",
-            "dueDate", "dueDateView", "statusName", "status",
-            "retailWpName", "customerId",
-            "totalAmount", "subTotal", "salesAmount",
-            "outstanding", "dppAmount",
+            "dueDate", "dueDateView", "statusName",
+            "retailWpName", "toName",
+            "totalAmount", "subTotal", "outstanding",
             "attachmentExist", "masterSalesmanName",
-            "branchName", "lastPaymentDate", "lastPaymentDateView"
+            "branchName", "lastPaymentDate", "lastPaymentDateView",
+            "customerName", "customer"
         ])
 
         params = {
@@ -174,11 +209,11 @@ def get_all_invoices_paged(host, date_from=None, date_to=None, status=None):
 
         fields = ",".join([
             "id", "number", "transDate", "transDateView",
-            "dueDate", "statusName", "status",
-            "retailWpName", "customerId",
-            "totalAmount", "subTotal", "salesAmount",
-            "outstanding", "dppAmount",
-            "attachmentExist", "masterSalesmanName"
+            "dueDate", "statusName",
+            "retailWpName", "toName",
+            "totalAmount", "subTotal", "outstanding",
+            "attachmentExist", "masterSalesmanName",
+            "customerName", "customer"
         ])
 
         params = {
@@ -299,20 +334,30 @@ def get_accurate_data(query):
         sp = data.get("sp", {})
         total_invoice = sp.get("rowCount", len(invoices))
 
-        if not invoices:
+        # Filter manual: hanya yang belum lunas
+        belum = [i for i in invoices if "belum" in (i.get("statusName") or "").lower()]
+        # Jika API sudah filter via status=OPEN, semua sudah belum lunas
+        if not belum:
+            belum = invoices
+
+        if not belum:
             return f"Tidak ada invoice belum lunas untuk periode {label_period}."
 
-        total_sisa = sum(extract_outstanding(i) for i in invoices)
+        total_sisa = sum(extract_outstanding(i) for i in belum)
+        total_nominal = sum(extract_grand_total(i) for i in belum)
 
         result = f"Piutang Belum Lunas - {label_period}:\n"
-        result += f"Total invoice: {total_invoice}\n"
-        result += f"Total nilai (dari {len(invoices)} sample): Rp {total_sisa:,.0f}\n\n"
-        result += f"Detail 15 terbaru:\n"
-        for inv in invoices[:15]:
+        result += f"Total invoice belum lunas: {total_invoice}\n"
+        if total_sisa > 0:
+            result += f"Total sisa tagihan: Rp {total_sisa:,.0f}\n"
+        elif total_nominal > 0:
+            result += f"Total nilai invoice: Rp {total_nominal:,.0f}\n"
+        result += f"\nDetail {min(len(belum),15)} terbaru:\n"
+        for inv in belum[:15]:
             nama = extract_customer_name(inv)
-            sisa = extract_outstanding(inv)
+            sisa = extract_outstanding(inv) or extract_grand_total(inv)
             result += f"- {inv.get('number','-')} | {nama}\n"
-            result += f"  Sisa: Rp {sisa:,.0f} | Tempo: {inv.get('dueDate','-')}\n\n"
+            result += f"  Tagihan: Rp {sisa:,.0f} | Tempo: {inv.get('dueDate','-')}\n\n"
         return result
 
     # Penjualan hari ini
@@ -355,6 +400,9 @@ def get_accurate_data(query):
             sp = data.get("sp", {})
             total_all = sp.get("rowCount", len(invoices))
             total_val = sum(extract_grand_total(inv) for inv in invoices)
+
+            # Enrich dengan nama customer via detail endpoint (paralel)
+            invoices = enrich_with_customer_names(host, invoices, max_workers=10)
 
             customer_count = {}
             customer_total = {}
