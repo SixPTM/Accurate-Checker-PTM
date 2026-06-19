@@ -71,10 +71,12 @@ def get_token_info():
 
 
 def extract_customer_name(inv):
-    """Ambil nama customer dari berbagai kemungkinan struktur field Accurate Online."""
-    name = inv.get("customerName")
-    if name and str(name).strip() and name != "-":
+    """Ambil nama customer - field yang benar: retailWpName atau customer.name"""
+    # Field utama yang ditemukan dari debug
+    name = inv.get("retailWpName")
+    if name and str(name).strip():
         return str(name).strip()
+    # Fallback: customer object
     customer = inv.get("customer")
     if isinstance(customer, dict):
         name = customer.get("name") or customer.get("customerName")
@@ -82,8 +84,8 @@ def extract_customer_name(inv):
             return str(name).strip()
     if isinstance(customer, str) and customer.strip():
         return customer.strip()
-    # Coba field alternatif lain
-    for field in ["custName", "buyerName", "toName", "name"]:
+    # Fallback lain
+    for field in ["customerName", "custName", "toName"]:
         val = inv.get(field)
         if val and str(val).strip():
             return str(val).strip()
@@ -91,12 +93,21 @@ def extract_customer_name(inv):
 
 
 def extract_grand_total(inv):
-    """Ambil grandTotal dari berbagai kemungkinan nama field."""
-    for field in ["grandTotal", "total", "totalAmount", "amount", "grandTotalOrigCurr"]:
+    """Ambil total invoice - field yang benar: totalAmount"""
+    for field in ["totalAmount", "grandTotal", "salesAmount", "subTotal", "amount"]:
         val = inv.get(field)
         if val:
-            return val
-    return 0
+            return float(val)
+    return 0.0
+
+
+def extract_outstanding(inv):
+    """Ambil sisa hutang - field yang benar: outstanding"""
+    for field in ["outstanding", "remainingAmount", "grandTotal"]:
+        val = inv.get(field)
+        if val:
+            return float(val)
+    return 0.0
 
 
 def get_invoices(host, page_size=50, status=None, date_from=None, date_to=None, keyword=None):
@@ -104,11 +115,14 @@ def get_invoices(host, page_size=50, status=None, date_from=None, date_to=None, 
         if not host.startswith("http"):
             host = f"https://{host}"
 
-        # Coba berbagai kemungkinan nama field customer di Accurate Online
+        # Field yang benar berdasarkan hasil debug
         fields = ",".join([
-            "id", "number", "transDate", "dueDate", "statusName",
-            "customerName", "custName", "customer.name", "customer",
-            "grandTotal", "totalAmount", "remainingAmount", "hasAttachment"
+            "id", "number", "transDate", "transDateView",
+            "dueDate", "dueDateView", "statusName",
+            "retailWpName", "customer", "customerId",
+            "totalAmount", "salesAmount", "subTotal",
+            "outstanding", "hasAttachment",
+            "masterSalesmanName", "branchName", "description"
         ])
 
         params = {
@@ -134,7 +148,7 @@ def get_invoices(host, page_size=50, status=None, date_from=None, date_to=None, 
             timeout=15,
             allow_redirects=True
         )
-        print(f"[INVOICE] {r.status_code} {r.text[:1000]}")
+        print(f"[INVOICE] {r.status_code} {r.text[:800]}")
         data = r.json()
 
         if data.get("s") and data.get("d"):
@@ -147,8 +161,65 @@ def get_invoices(host, page_size=50, status=None, date_from=None, date_to=None, 
         return None
 
 
+def get_all_invoices_paged(host, date_from=None, date_to=None, status=None):
+    """Ambil SEMUA invoice dengan pagination untuk data lengkap."""
+    all_invoices = []
+    page = 1
+    page_size = 100
+
+    while True:
+        if not host.startswith("http"):
+            host = f"https://{host}"
+
+        fields = ",".join([
+            "id", "number", "transDate", "transDateView",
+            "dueDate", "statusName",
+            "retailWpName", "customer", "customerId",
+            "totalAmount", "salesAmount", "outstanding",
+            "hasAttachment", "masterSalesmanName"
+        ])
+
+        params = {
+            "fields": fields,
+            "sp.pageSize": page_size,
+            "sp.page": page,
+            "sp.sort": "transDate",
+            "sp.sortOrder": "DESC"
+        }
+        if status:
+            params["filter.status"] = status
+        if date_from:
+            params["filter.transDate.op"] = "BETWEEN"
+            params["filter.transDate.val[0]"] = date_from
+            params["filter.transDate.val[1]"] = date_to or date_from
+
+        try:
+            r = requests.get(
+                f"{host}/accurate/api/sales-invoice/list.do",
+                headers=accurate_headers(),
+                params=params,
+                timeout=15,
+                allow_redirects=True
+            )
+            data = r.json()
+            if not data.get("s"):
+                break
+            page_data = data.get("d", [])
+            all_invoices.extend(page_data)
+            sp = data.get("sp", {})
+            total_pages = sp.get("pageCount", 1)
+            print(f"[PAGE] {page}/{total_pages} - loaded {len(all_invoices)} invoices")
+            if page >= total_pages:
+                break
+            page += 1
+        except Exception as e:
+            print(f"[PAGE ERROR] {e}")
+            break
+
+    return all_invoices
+
+
 def get_invoice_detail(host, invoice_id):
-    """Ambil detail satu invoice untuk cek field yang tersedia."""
     try:
         if not host.startswith("http"):
             host = f"https://{host}"
@@ -182,7 +253,7 @@ def get_accurate_data(query):
     month_start = now.replace(day=1).strftime("%d/%m/%Y")
     q = query.lower()
 
-    # DEBUG: cek field detail invoice pertama
+    # DEBUG command
     if "debug" in q or "field" in q:
         data = get_invoices(host, page_size=1)
         if data and data.get("s") and data.get("d"):
@@ -192,7 +263,7 @@ def get_accurate_data(query):
             return f"Fields tersedia di detail invoice:\n{list(d_data.keys())}\n\nSample:\n{str(d_data)[:800]}"
         return "Gagal ambil data debug."
 
-    # Cek invoice belum lunas / piutang
+    # Invoice belum lunas / piutang
     if any(w in q for w in ["belum lunas", "belum bayar", "piutang", "outstanding", "jatuh tempo", "unpaid"]):
         data = get_invoices(host, page_size=50, status="OPEN")
         if data and data.get("s"):
@@ -204,35 +275,32 @@ def get_accurate_data(query):
             result = f"Invoice Belum Lunas (menampilkan {len(invoices)} dari {total_all}):\n\n"
             for inv in invoices[:15]:
                 nama = extract_customer_name(inv)
-                sisa = inv.get("remainingAmount") or extract_grand_total(inv)
+                sisa = extract_outstanding(inv)
                 result += f"- {inv.get('number','-')} | {nama}\n"
                 result += f"  Sisa: Rp {sisa:,.0f} | Tempo: {inv.get('dueDate','-')}\n"
                 result += f"  Bukti: {'Ada' if inv.get('hasAttachment') else 'Tidak ada'}\n\n"
             return result
         return f"Gagal: {str(data)[:200]}"
 
-    # Omset / penjualan hari ini
+    # Penjualan hari ini
     elif any(w in q for w in ["omset hari ini", "penjualan hari ini", "transaksi hari ini", "invoice hari ini"]):
-        data = get_invoices(host, page_size=100, date_from=today_str, date_to=today_str)
-        if data and data.get("s"):
-            invoices = data.get("d", [])
-            total = sum(extract_grand_total(inv) for inv in invoices)
-            lunas = sum(1 for i in invoices if "lunas" in (i.get("statusName") or "").lower() and "belum" not in (i.get("statusName") or "").lower())
-            belum = sum(1 for i in invoices if "belum" in (i.get("statusName") or "").lower())
-            result = f"Penjualan Hari Ini ({today_str}):\n\n"
-            result += f"Jumlah invoice: {len(invoices)}\n"
-            result += f"Lunas: {lunas} | Belum: {belum}\n"
-            if total > 0:
-                result += f"Total nilai: Rp {total:,.0f}\n"
-            if invoices:
-                result += "\nDetail:\n"
-                for inv in invoices[:10]:
-                    nama = extract_customer_name(inv)
-                    result += f"- {inv.get('number','-')} | {nama} | {inv.get('statusName','-')}\n"
-            return result
-        return f"Gagal: {str(data)[:200]}"
+        invoices = get_all_invoices_paged(host, date_from=today_str, date_to=today_str)
+        total = sum(extract_grand_total(inv) for inv in invoices)
+        lunas = sum(1 for i in invoices if "lunas" in (i.get("statusName") or "").lower() and "belum" not in (i.get("statusName") or "").lower())
+        belum = sum(1 for i in invoices if "belum" in (i.get("statusName") or "").lower())
+        result = f"Penjualan Hari Ini ({today_str}):\n\n"
+        result += f"Jumlah invoice: {len(invoices)}\n"
+        result += f"Lunas: {lunas} | Belum: {belum}\n"
+        if total > 0:
+            result += f"Total nilai: Rp {total:,.0f}\n"
+        if invoices:
+            result += "\nDetail:\n"
+            for inv in invoices[:10]:
+                nama = extract_customer_name(inv)
+                result += f"- {inv.get('number','-')} | {nama} | {inv.get('statusName','-')}\n"
+        return result
 
-    # Omset / penjualan bulan ini atau Juni
+    # Penjualan bulan ini / Juni / customer sering order
     elif any(w in q for w in ["omset", "penjualan", "bulan ini", "bulan juni", "juni", "customer", "sering order"]):
         if "juni" in q or "june" in q:
             date_from = "01/06/2026"
@@ -242,38 +310,36 @@ def get_accurate_data(query):
             date_from = month_start
             date_to = today_str
             label = "Bulan Ini"
-        data = get_invoices(host, page_size=100, date_from=date_from, date_to=date_to)
-        if data and data.get("s"):
-            invoices = data.get("d", [])
-            sp = data.get("sp", {})
-            total_val = sum(extract_grand_total(inv) for inv in invoices)
 
-            customer_count = {}
-            customer_total = {}
-            for inv in invoices:
-                nama = extract_customer_name(inv)
-                customer_count[nama] = customer_count.get(nama, 0) + 1
-                customer_total[nama] = customer_total.get(nama, 0) + extract_grand_total(inv)
+        # Pakai pagination untuk ambil SEMUA invoice
+        invoices = get_all_invoices_paged(host, date_from=date_from, date_to=date_to)
+        total_val = sum(extract_grand_total(inv) for inv in invoices)
 
-            top_customers = sorted(customer_count.items(), key=lambda x: x[1], reverse=True)[:5]
+        customer_count = {}
+        customer_total = {}
+        for inv in invoices:
+            nama = extract_customer_name(inv)
+            customer_count[nama] = customer_count.get(nama, 0) + 1
+            customer_total[nama] = customer_total.get(nama, 0) + extract_grand_total(inv)
 
-            result = f"Rekap Penjualan {label}:\n\n"
-            result += f"Total invoice: {len(invoices)} (dari {sp.get('rowCount', '?')} total)\n"
-            if total_val > 0:
-                result += f"Total nilai: Rp {total_val:,.0f}\n"
+        top_customers = sorted(customer_count.items(), key=lambda x: x[1], reverse=True)[:5]
 
-            if top_customers and top_customers[0][0] != "-":
-                result += f"\nTop Customer Paling Sering Order:\n"
-                for i, (nama, count) in enumerate(top_customers, 1):
-                    total_cust = customer_total.get(nama, 0)
-                    result += f"{i}. {nama} - {count} invoice"
-                    if total_cust > 0:
-                        result += f" (Rp {total_cust:,.0f})"
-                    result += "\n"
-            else:
-                result += "\n⚠️ Nama customer belum terbaca. Kirim pesan 'debug field' untuk cek.\n"
-            return result
-        return f"Gagal: {str(data)[:200]}"
+        result = f"Rekap Penjualan {label}:\n\n"
+        result += f"Total invoice: {len(invoices)}\n"
+        if total_val > 0:
+            result += f"Total nilai: Rp {total_val:,.0f}\n"
+
+        if top_customers and top_customers[0][0] != "-":
+            result += f"\nTop Customer Paling Sering Order:\n"
+            for i, (nama, count) in enumerate(top_customers, 1):
+                total_cust = customer_total.get(nama, 0)
+                result += f"{i}. {nama} - {count} invoice"
+                if total_cust > 0:
+                    result += f" (Rp {total_cust:,.0f})"
+                result += "\n"
+        else:
+            result += "\n⚠️ Nama customer belum terbaca. Kirim 'debug field' untuk cek.\n"
+        return result
 
     # Rekap semua
     elif any(w in q for w in ["rekap", "semua", "daftar", "list", "total"]):
