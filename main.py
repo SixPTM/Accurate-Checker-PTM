@@ -116,16 +116,19 @@ def tool_get_attachment(host, chat_id, invoice_number):
         if not inv.get("attachmentExist"):
             return json.dumps({"error": f"Invoice {invoice_number} tidak memiliki attachment/bukti bayar"})
 
-        # Coba endpoint attachment list
+        # Coba endpoint attachment list dengan parameter yang benar
         r3 = requests.get(
             f"{h}/accurate/api/attachment/list.do",
             headers=accurate_headers(),
-            params={"refId": inv_id, "refType": "SALES_INVOICE"},
+            params={"transactionId": inv_id, "transactionType": "SALES_INVOICE"},
             timeout=15
         )
         att_data = r3.json()
         print(f"[ATTACHMENT LIST] {r3.status_code} {r3.text[:500]}")
-        attachments = att_data.get("d", [])
+        
+        # Handle response - d bisa list of dicts atau list of strings
+        raw_attachments = att_data.get("d", [])
+        attachments = [a for a in raw_attachments if isinstance(a, dict)]
 
         # Fallback: cek dari detail invoice
         if not attachments:
@@ -848,7 +851,7 @@ def debug_attachment():
         r3 = requests.get(
             f"{host}/accurate/api/attachment/list.do",
             headers=accurate_headers(),
-            params={"refId": inv_id, "refType": "SALES_INVOICE"},
+            params={"transactionId": inv_id, "transactionType": "SALES_INVOICE"},
             timeout=15
         )
         return {"invoice": inv_num, "invoice_id": inv_id, "attachment_list": r3.json()}
