@@ -4,6 +4,7 @@ import hashlib
 import base64
 import datetime
 import threading
+import json
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request
@@ -20,29 +21,13 @@ ACCURATE_BASE_URL = "https://account.accurate.id/api"
 
 conversation_history = {}
 
-SYSTEM_PROMPT = """Kamu adalah asisten keuangan dan operasional untuk perusahaan Print Master yang membantu tim admin mengecek invoice, hutang piutang, kinerja admin, dan data produk melalui Accurate Online.
-Kamu berbicara dalam Bahasa Indonesia yang ramah dan profesional.
-Format angka dalam Rupiah (contoh: Rp 1.500.000).
-Status invoice: statusName Lunas=sudah bayar, Belum Lunas=belum bayar.
-Jawab singkat, padat, gunakan emoji.
-Kamu BISA membantu:
-- Cek invoice dan status pembayaran
-- Rekap penjualan dan piutang
-- Harga beli, harga jual, dan stok produk dari Accurate Online
-- Customer yang sering order
-Jika data tersedia, analisa dan tampilkan dengan jelas. Jika tidak ada nominal, tetap tampilkan info yang ada."""
-
-
-def send_message(chat_id, text):
-    requests.post(f"{TELEGRAM_API}/sendMessage", json={
-        "chat_id": chat_id, "text": text, "parse_mode": "Markdown"
-    })
-
+# ============================================================
+# ACCURATE API HELPERS
+# ============================================================
 
 def make_timestamp():
     now = datetime.datetime.utcnow() + datetime.timedelta(hours=7)
     return now.strftime("%d/%m/%Y %H:%M:%S")
-
 
 def make_signature(timestamp):
     sig = hmac.new(
@@ -51,7 +36,6 @@ def make_signature(timestamp):
         hashlib.sha256
     ).digest()
     return base64.b64encode(sig).decode("utf-8")
-
 
 def accurate_headers():
     timestamp = make_timestamp()
@@ -63,153 +47,106 @@ def accurate_headers():
         "Content-Type": "application/json"
     }
 
-
-def get_token_info():
+def get_host():
     try:
         r = requests.post(
             f"{ACCURATE_BASE_URL}/api-token.do",
             headers=accurate_headers(),
             timeout=15
         )
-        return r.json()
+        d = r.json().get("d", {})
+        host = d.get("database", d.get("data usaha", {})).get("host", "")
+        if host and not host.startswith("http"):
+            host = f"https://{host}"
+        return host
     except Exception as e:
-        print(f"[TOKEN ERROR] {e}")
+        print(f"[HOST ERROR] {e}")
         return None
 
+def send_message(chat_id, text):
+    requests.post(f"{TELEGRAM_API}/sendMessage", json={
+        "chat_id": chat_id, "text": text, "parse_mode": "Markdown"
+    })
 
-def extract_customer_name(inv):
-    if inv.get("_customerName") and inv["_customerName"] != "-":
-        return inv["_customerName"]
-    for field in ["retailWpName", "customerName", "toName"]:
-        val = inv.get(field)
-        if val and str(val).strip() and str(val).strip() != "-":
-            return str(val).strip()
-    customer = inv.get("customer")
-    if isinstance(customer, dict):
-        name = customer.get("name") or customer.get("customerName")
-        if name and str(name).strip():
-            return str(name).strip()
-    if isinstance(customer, str) and customer.strip():
-        return customer.strip()
-    return "-"
+# ============================================================
+# ACCURATE API TOOLS — dipanggil oleh Claude
+# ============================================================
 
-
-def extract_grand_total(inv):
-    if inv.get("_totalAmount"):
-        return float(inv["_totalAmount"])
-    for field in ["totalAmount", "subTotal", "salesAmount"]:
-        val = inv.get(field)
-        if val is not None and val != 0:
-            return float(val)
-    return 0.0
-
-
-def extract_outstanding(inv):
-    if "_outstanding" in inv:
-        return float(inv["_outstanding"])
-    val = inv.get("outstanding")
-    if val is not None and val != 0:
-        return float(val)
-    return 0.0
-
-
-def fetch_customer_name(host, inv):
+def tool_get_invoices(host, params):
+    """List sales invoice dengan filter bebas."""
     try:
-        if not host.startswith("http"):
-            host = f"https://{host}"
-        r = requests.get(
-            f"{host}/accurate/api/sales-invoice/detail.do",
-            headers=accurate_headers(),
-            params={"id": inv["id"]},
-            timeout=10
-        )
-        detail = r.json().get("d", {})
-        customer = detail.get("customer")
-        # customer bisa berupa dict, list, atau string
-        if isinstance(customer, dict):
-            cname = customer.get("name") or customer.get("customerName")
-        elif isinstance(customer, list) and customer:
-            cname = customer[0].get("name") if isinstance(customer[0], dict) else str(customer[0])
-        else:
-            cname = None
-        name = (
-            detail.get("retailWpName") or
-            detail.get("customerName") or
-            detail.get("toName") or
-            cname or "-"
-        )
-        inv["_customerName"] = str(name).strip() if name else "-"
-        outstanding = detail.get("outstanding")
-        inv["_outstanding"] = float(outstanding) if outstanding is not None else 0.0
-        total = detail.get("totalAmount") or detail.get("subTotal") or 0
-        inv["_totalAmount"] = float(total)
-    except Exception as e:
-        print(f"[ENRICH ERROR] id={inv.get('id')} {e}")
-        inv["_customerName"] = "-"
-        inv["_outstanding"] = 0.0
-        inv["_totalAmount"] = 0.0
-    return inv
-
-
-def enrich_with_customer_names(host, invoices, max_workers=10):
-    print(f"[ENRICH] Fetching {len(invoices)} invoices...")
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(fetch_customer_name, host, inv): inv for inv in invoices}
-        for future in as_completed(futures):
-            future.result()
-    print(f"[ENRICH] Done.")
-    return invoices
-
-
-def get_invoices(host, page_size=50, status=None, date_from=None, date_to=None, keyword=None):
-    try:
-        if not host.startswith("http"):
-            host = f"https://{host}"
-        fields = ",".join([
+        default_fields = ",".join([
             "id", "number", "transDate", "transDateView",
             "dueDate", "dueDateView", "statusName",
-            "retailWpName", "toName", "customerName",
-            "totalAmount", "subTotal", "outstanding",
-            "attachmentExist", "masterSalesmanName",
-            "branchName", "lastPaymentDate", "lastPaymentDateView"
+            "retailWpName", "totalAmount", "subTotal",
+            "outstanding", "attachmentExist", "masterSalesmanName"
         ])
-        params = {
-            "fields": fields,
-            "sp.pageSize": page_size,
+        api_params = {
+            "fields": default_fields,
+            "sp.pageSize": params.get("page_size", 50),
             "sp.page": 1,
             "sp.sort": "transDate",
             "sp.sortOrder": "DESC"
         }
-        if status:
-            params["filter.status"] = status
-        if date_from:
-            params["filter.transDate.op"] = "BETWEEN"
-            params["filter.transDate.val[0]"] = date_from
-            params["filter.transDate.val[1]"] = date_to or date_from
-        if keyword:
-            params["filter.keywords"] = keyword
+        if params.get("status"):
+            api_params["filter.status"] = params["status"]
+        if params.get("date_from"):
+            api_params["filter.transDate.op"] = "BETWEEN"
+            api_params["filter.transDate.val[0]"] = params["date_from"]
+            api_params["filter.transDate.val[1]"] = params.get("date_to", params["date_from"])
+        if params.get("keyword"):
+            api_params["filter.keywords"] = params["keyword"]
+        if params.get("customer_name"):
+            api_params["filter.keywords"] = params["customer_name"]
+
         r = requests.get(
             f"{host}/accurate/api/sales-invoice/list.do",
             headers=accurate_headers(),
-            params=params,
-            timeout=15,
-            allow_redirects=True
+            params=api_params,
+            timeout=15
         )
-        print(f"[INVOICE] {r.status_code} {r.text[:500]}")
         data = r.json()
+        print(f"[TOOL invoices] status={r.status_code} count={len(data.get('d',[]))} total={data.get('sp',{}).get('rowCount',0)}")
+
         if data.get("s") and data.get("d"):
-            sample = data["d"][0] if data["d"] else {}
-            print(f"[SAMPLE INVOICE] {sample}")
-        return data
+            # Enrich nama customer secara paralel
+            invoices = data["d"]
+            def enrich(inv):
+                try:
+                    r2 = requests.get(
+                        f"{host}/accurate/api/sales-invoice/detail.do",
+                        headers=accurate_headers(),
+                        params={"id": inv["id"]},
+                        timeout=10
+                    )
+                    detail = r2.json().get("d", {})
+                    customer = detail.get("customer")
+                    if isinstance(customer, dict):
+                        cname = customer.get("name")
+                    elif isinstance(customer, list) and customer:
+                        cname = customer[0].get("name") if isinstance(customer[0], dict) else str(customer[0])
+                    else:
+                        cname = None
+                    inv["customerName"] = (
+                        detail.get("retailWpName") or
+                        detail.get("customerName") or
+                        cname or "-"
+                    )
+                    inv["outstanding"] = detail.get("outstanding") or 0
+                    inv["totalAmount"] = detail.get("totalAmount") or inv.get("totalAmount") or 0
+                except:
+                    inv["customerName"] = "-"
+            with ThreadPoolExecutor(max_workers=10) as ex:
+                list(ex.map(enrich, invoices))
+
+        return json.dumps(data, ensure_ascii=False)
     except Exception as e:
-        print(f"[INVOICE ERROR] {e}")
-        return None
+        return json.dumps({"error": str(e)})
 
 
-def get_invoice_detail(host, invoice_id):
+def tool_get_invoice_detail(host, invoice_id):
+    """Detail satu invoice berdasarkan ID."""
     try:
-        if not host.startswith("http"):
-            host = f"https://{host}"
         r = requests.get(
             f"{host}/accurate/api/sales-invoice/detail.do",
             headers=accurate_headers(),
@@ -217,504 +154,306 @@ def get_invoice_detail(host, invoice_id):
             timeout=15
         )
         data = r.json()
-        print(f"[DETAIL FIELDS] {list(data.get('d', {}).keys())}")
-        print(f"[DETAIL SAMPLE] {str(data.get('d', {}))[:500]}")
-        return data
+        print(f"[TOOL detail] id={invoice_id} status={r.status_code}")
+        return json.dumps(data, ensure_ascii=False)
     except Exception as e:
-        print(f"[DETAIL ERROR] {e}")
-        return None
+        return json.dumps({"error": str(e)})
 
 
-def get_accurate_data(query, chat_id=None):
-    token_info = get_token_info()
-    if not token_info or not token_info.get("s"):
-        return "Gagal koneksi ke Accurate."
+def tool_get_items(host, keyword, page_size=20):
+    """Cari produk/item: nama, harga, stok."""
+    try:
+        r = requests.get(
+            f"{host}/accurate/api/item/list.do",
+            headers=accurate_headers(),
+            params={
+                "fields": "id,no,name,unitPrice,purchasePrice,availableStock,unit,buyPrice,lastPurchasePrice",
+                "sp.pageSize": page_size,
+                "sp.page": 1,
+                "filter.keywords": keyword
+            },
+            timeout=15
+        )
+        data = r.json()
+        print(f"[TOOL items] keyword='{keyword}' count={len(data.get('d',[]))} total={data.get('sp',{}).get('rowCount',0)}")
+        return json.dumps(data, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
-    d = token_info.get("d", {})
-    host = d.get("database", d.get("data usaha", {})).get("host", "")
-    if not host:
-        return "Host tidak ditemukan."
 
-    now = datetime.datetime.utcnow() + datetime.timedelta(hours=7)
-    today_str = now.strftime("%d/%m/%Y")
-    month_start = now.replace(day=1).strftime("%d/%m/%Y")
-    q = query.lower()
-
-    # DEBUG
-    if "debug" in q or "field" in q:
-        data = get_invoices(host, page_size=1)
-        if data and data.get("s") and data.get("d"):
-            inv_id = data["d"][0].get("id")
-            detail = get_invoice_detail(host, inv_id)
-            d_data = detail.get("d", {}) if detail else {}
-            return f"Fields tersedia:\n{list(d_data.keys())}\n\nSample:\n{str(d_data)[:800]}"
-        return "Gagal ambil data debug."
-
-    # ============================================================
-    # URUTAN PENTING: spesifik dulu, baru umum
-    # ============================================================
-
-    # 1. Belum lunas hari ini / siapa yang belum bayar hari ini
-    is_hari_ini = any(w in q for w in ["hari ini", "tadi", "sekarang"])
-    is_belum = any(w in q for w in ["belum lunas", "belum bayar", "belum", "siapa"])
-    is_detail_query = any(w in q for w in ["siapa", "nama", "atas nama", "list", "daftar"])
-
-    if is_belum and (is_hari_ini or is_detail_query):
-        data = get_invoices(host, page_size=100, date_from=today_str, date_to=today_str, status="OPEN")
-        if data and data.get("s"):
-            invoices = data.get("d", [])
-            sp = data.get("sp", {})
-            total_belum = sp.get("rowCount", len(invoices))
-            invoices = enrich_with_customer_names(host, invoices, max_workers=10)
-            total_nilai = sum(extract_grand_total(i) for i in invoices)
-            result = f"Invoice Belum Lunas Hari Ini ({today_str}):\n"
-            result += f"Total: {total_belum} invoice | Nilai: Rp {total_nilai:,.0f}\n\n"
-            for inv in invoices[:20]:
-                nama = extract_customer_name(inv)
-                total = extract_grand_total(inv)
-                result += f"- {inv.get('number','-')} | {nama} | Rp {total:,.0f}\n"
-                result += f"  Tempo: {inv.get('dueDate','-')}\n"
-            return result
-        return f"Gagal: {str(data)[:200]}"
-
-    # 2. Piutang / belum lunas semua periode (background thread)
-    elif any(w in q for w in ["belum lunas", "belum bayar", "piutang", "outstanding", "jatuh tempo", "unpaid"]):
-        date_from = None
-        date_to = None
-        label_period = "Semua Periode"
-
-        if "juni" in q or "june" in q:
-            date_from = "01/06/2026"
-            date_to = "30/06/2026"
-            label_period = "Juni 2026"
-        elif "mei" in q or "may" in q:
-            date_from = "01/05/2026"
-            date_to = "31/05/2026"
-            label_period = "Mei 2026"
-        elif "bulan ini" in q:
-            date_from = month_start
-            date_to = today_str
-            label_period = "Bulan Ini"
-
-        def hitung_piutang(chat_id, host, date_from, date_to, label_period):
-            try:
-                total_nilai = 0.0
-                total_invoice = 0
-                sample_invoices = []
-                page = 1
-                h = host if host.startswith("http") else f"https://{host}"
-                while True:
-                    params = {
-                        "fields": "id,number,transDate,dueDate,statusName,totalAmount,subTotal,retailWpName",
-                        "sp.pageSize": 200,
-                        "sp.page": page,
-                        "sp.sort": "transDate",
-                        "sp.sortOrder": "DESC",
-                        "filter.status": "OPEN"
-                    }
-                    if date_from:
-                        params["filter.transDate.op"] = "BETWEEN"
-                        params["filter.transDate.val[0]"] = date_from
-                        params["filter.transDate.val[1]"] = date_to or date_from
-                    r = requests.get(
-                        f"{h}/accurate/api/sales-invoice/list.do",
-                        headers=accurate_headers(),
-                        params=params,
-                        timeout=30
-                    )
-                    data = r.json()
-                    if not data.get("s"):
-                        break
-                    page_invoices = data.get("d", [])
-                    sp = data.get("sp", {})
-                    if page == 1:
-                        total_invoice = sp.get("rowCount", 0)
-                        sample_invoices = page_invoices[:5]
-                    for inv in page_invoices:
-                        val = inv.get("totalAmount") or inv.get("subTotal") or 0
-                        total_nilai += float(val)
-                    total_pages = sp.get("pageCount", 1)
-                    print(f"[BG PIUTANG] {page}/{total_pages} Rp {total_nilai:,.0f}")
-                    if page >= total_pages:
-                        break
-                    page += 1
-
-                result = f"✅ Selesai dihitung!\n\n"
-                result += f"Piutang Belum Lunas - {label_period}:\n"
-                result += f"Total invoice: {total_invoice}\n"
-                result += f"Total nilai: Rp {total_nilai:,.0f}\n"
-                result += f"\n⚠️ Nilai adalah total invoice. Jika ada partial payment, angka bisa sedikit berbeda dari Accurate.\n"
-                if sample_invoices:
-                    result += f"\nContoh invoice:\n"
-                    for inv in sample_invoices:
-                        nama = inv.get("retailWpName") or "-"
-                        total = float(inv.get("totalAmount") or inv.get("subTotal") or 0)
-                        result += f"- {inv.get('number','-')} | {nama} | Rp {total:,.0f}\n"
-                send_message(chat_id, result)
-            except Exception as e:
-                send_message(chat_id, f"❌ Gagal hitung piutang: {str(e)[:100]}")
-                print(f"[BG PIUTANG ERROR] {e}")
-
-        t = threading.Thread(target=hitung_piutang, args=(chat_id, host, date_from, date_to, label_period))
-        t.daemon = True
-        t.start()
-        return f"⏳ Sedang menghitung piutang {label_period}...\nData ada 27.000+ invoice, butuh waktu 1-2 menit. Saya kirim hasilnya setelah selesai ya!"
-
-    # 3. Penjualan hari ini
-    elif any(w in q for w in ["omset hari ini", "penjualan hari ini", "transaksi hari ini", "invoice hari ini"]):
-        data = get_invoices(host, page_size=100, date_from=today_str, date_to=today_str)
-        if data and data.get("s"):
-            invoices = data.get("d", [])
-            sp = data.get("sp", {})
-            total_all = sp.get("rowCount", len(invoices))
-            invoices = enrich_with_customer_names(host, invoices, max_workers=10)
-            total = sum(extract_grand_total(inv) for inv in invoices)
-            lunas_list = [i for i in invoices if "lunas" in (i.get("statusName") or "").lower() and "belum" not in (i.get("statusName") or "").lower()]
-            belum_list = [i for i in invoices if "belum" in (i.get("statusName") or "").lower()]
-            result = f"Penjualan Hari Ini ({today_str}):\n\n"
-            result += f"Total invoice: {total_all} | Lunas: {len(lunas_list)} | Belum Lunas: {len(belum_list)}\n"
-            if total > 0:
-                result += f"Total nilai: Rp {total:,.0f}\n"
-            if belum_list:
-                result += f"\nInvoice Belum Lunas:\n"
-                for inv in belum_list:
-                    nama = extract_customer_name(inv)
-                    result += f"- {inv.get('number','-')} | {nama} | Rp {extract_grand_total(inv):,.0f}\n"
-            if lunas_list:
-                result += f"\nInvoice Lunas (10 terbaru):\n"
-                for inv in lunas_list[:10]:
-                    nama = extract_customer_name(inv)
-                    result += f"- {inv.get('number','-')} | {nama} | Rp {extract_grand_total(inv):,.0f}\n"
-            return result
-        return f"Gagal: {str(data)[:200]}"
-
-    # 4. Penjualan bulan ini / Juni / customer sering order
-    elif any(w in q for w in ["omset", "penjualan", "bulan ini", "bulan juni", "juni", "customer", "sering order"]):
-        if "juni" in q or "june" in q:
-            date_from = "01/06/2026"
-            date_to = "30/06/2026"
-            label = "Juni 2026"
-        else:
-            date_from = month_start
-            date_to = today_str
-            label = "Bulan Ini"
-        data = get_invoices(host, page_size=100, date_from=date_from, date_to=date_to)
-        if data and data.get("s"):
-            invoices = data.get("d", [])
-            sp = data.get("sp", {})
-            total_all = sp.get("rowCount", len(invoices))
-            invoices = enrich_with_customer_names(host, invoices, max_workers=10)
-            total_val = sum(extract_grand_total(inv) for inv in invoices)
-            customer_count = {}
-            customer_total = {}
-            for inv in invoices:
-                nama = extract_customer_name(inv)
-                customer_count[nama] = customer_count.get(nama, 0) + 1
-                customer_total[nama] = customer_total.get(nama, 0) + extract_grand_total(inv)
-            top_customers = sorted(customer_count.items(), key=lambda x: x[1], reverse=True)[:5]
-            result = f"Rekap Penjualan {label}:\n\n"
-            result += f"Total invoice: {total_all}\n"
-            if total_val > 0:
-                result += f"Nilai (100 sample): Rp {total_val:,.0f}\n"
-            if top_customers and top_customers[0][0] != "-":
-                result += f"\nTop Customer Paling Sering Order:\n"
-                for i, (nama, count) in enumerate(top_customers, 1):
-                    total_cust = customer_total.get(nama, 0)
-                    result += f"{i}. {nama} - {count} invoice"
-                    if total_cust > 0:
-                        result += f" (Rp {total_cust:,.0f})"
-                    result += "\n"
-            else:
-                result += "\n⚠️ Nama customer belum terbaca.\n"
-            return result
-        return f"Gagal ambil data: {str(data)[:200]}"
-
-    # 5. Rekap semua
-    elif any(w in q for w in ["rekap", "semua", "daftar", "list", "total"]):
-        data = get_invoices(host, page_size=50)
-        if data and data.get("s"):
-            invoices = data.get("d", [])
-            sp = data.get("sp", {})
-            o = sum(1 for i in invoices if "belum" in (i.get("statusName") or "").lower())
-            p = sum(1 for i in invoices if "lunas" in (i.get("statusName") or "").lower() and "belum" not in (i.get("statusName") or "").lower())
-            total_val = sum(extract_grand_total(inv) for inv in invoices)
-            result = f"Rekap Invoice Print Master ({len(invoices)} dari {sp.get('rowCount','?')} total):\n\n"
-            result += f"Lunas: {p} | Belum Lunas: {o}\n"
-            if total_val > 0:
-                result += f"Total nilai: Rp {total_val:,.0f}\n"
-            return result
-        return f"Gagal: {str(data)[:200]}"
-
-    # 6. Produk terlaris hari ini
-    elif any(w in q for w in ["produk terlaris", "paling laku", "terlaris", "terbanyak terjual", "produk hari ini"]):
-        def hitung_produk_terlaris(chat_id, host, today_str):
-            try:
-                h = host if host.startswith("http") else f"https://{host}"
-                # Ambil semua invoice hari ini
-                r = requests.get(
-                    f"{h}/accurate/api/sales-invoice/list.do",
-                    headers=accurate_headers(),
-                    params={
-                        "fields": "id,number,statusName",
-                        "sp.pageSize": 200,
-                        "sp.page": 1,
-                        "filter.transDate.op": "BETWEEN",
-                        "filter.transDate.val[0]": today_str,
-                        "filter.transDate.val[1]": today_str,
-                    },
-                    timeout=15
-                )
-                invoices = r.json().get("d", [])
-                if not invoices:
-                    send_message(chat_id, "Tidak ada invoice hari ini.")
-                    return
-
-                # Ambil detail tiap invoice secara paralel, kumpulkan item
-                product_qty = {}
-                product_total = {}
-
-                def get_items(inv):
-                    try:
-                        r2 = requests.get(
-                            f"{h}/accurate/api/sales-invoice/detail.do",
-                            headers=accurate_headers(),
-                            params={"id": inv["id"]},
-                            timeout=10
-                        )
-                        detail = r2.json().get("d", {})
-                        items = detail.get("detailItem", [])
-                        if not isinstance(items, list):
-                            return
-                        for item in items:
-                            if not isinstance(item, dict):
-                                continue
-                            item_obj = item.get("item", {})
-                            if isinstance(item_obj, list):
-                                item_obj = item_obj[0] if item_obj else {}
-                            name = (item.get("itemName") or
-                                    (item_obj.get("name") if isinstance(item_obj, dict) else None) or
-                                    item.get("name") or "-")
-                            qty = float(item.get("quantity") or item.get("qty") or 0)
-                            amount = float(item.get("amount") or item.get("totalAmount") or 0)
-                            if name and name != "-":
-                                product_qty[name] = product_qty.get(name, 0) + qty
-                                product_total[name] = product_total.get(name, 0) + amount
-                    except Exception as e:
-                        print(f"[ITEM DETAIL ERROR] {e}")
-
-                with ThreadPoolExecutor(max_workers=10) as executor:
-                    futures = [executor.submit(get_items, inv) for inv in invoices]
-                    for f in as_completed(futures):
-                        f.result()
-
-                if not product_qty:
-                    send_message(chat_id, "Data item produk tidak tersedia dari invoice hari ini.")
-                    return
-
-                top = sorted(product_qty.items(), key=lambda x: x[1], reverse=True)[:10]
-                result = f"🏆 Produk Terlaris Hari Ini ({today_str}):\n\n"
-                for i, (name, qty) in enumerate(top, 1):
-                    total = product_total.get(name, 0)
-                    result += f"{i}. {name}\n"
-                    result += f"   Qty: {qty:,.0f} | Nilai: Rp {total:,.0f}\n"
-                send_message(chat_id, result)
-
-            except Exception as e:
-                send_message(chat_id, f"❌ Gagal ambil produk terlaris: {str(e)[:100]}")
-                print(f"[PRODUK TERLARIS ERROR] {e}")
-
-        t = threading.Thread(target=hitung_produk_terlaris, args=(chat_id, host, today_str))
-        t.daemon = True
-        t.start()
-        return "⏳ Sedang menghitung produk terlaris hari ini... Tunggu sebentar ya!"
-
-    # 7. Cari produk / item
-    elif any(w in q for w in ["harga beli", "harga jual", "modal", "hpp", "harga produk", "stok",
-                               "produk", "item", "barang", "vinyl", "stiker", "banner", "kertas",
-                               "tinta", "quantac", "bahan", "material", "cek harga", "harga",
-                               "sku", "kode produk", "daftar produk", "list produk", "ada berapa"]):
-        # Gunakan query asli tapi hapus hanya kata perintah di depan
-        import re
-        # Hapus kata perintah umum di awal kalimat
-        keyword = re.sub(
-            r'^(tolong\s+)?(coba\s+)?(cek|check|lihat|tampilkan|info|berapa|ada|stok|harga|modal|hpp|sku|daftar|list)\s+',
-            '', query.lower(), flags=re.IGNORECASE
-        ).strip()
-        # Hapus kata trailing umum
-        for w in ["hari ini", "sekarang", "dong", "ya", "yaa", "donk", "nya"]:
-            keyword = keyword.replace(w, "").strip()
-        keyword = keyword.strip() or query
-        print(f"[ITEM SEARCH] keyword='{keyword}'")
+def tool_get_piutang_summary(host, chat_id, date_from=None, date_to=None, label="Semua Periode"):
+    """Hitung total piutang semua halaman di background thread."""
+    def run():
         try:
-            if not host.startswith("http"):
-                host = f"https://{host}"
-
-            def search_item(kw):
-                return requests.get(
-                    f"{host}/accurate/api/item/list.do",
+            total_nilai = 0.0
+            total_invoice = 0
+            page = 1
+            while True:
+                params = {
+                    "fields": "id,totalAmount,subTotal,statusName,retailWpName,number,dueDate",
+                    "sp.pageSize": 200,
+                    "sp.page": page,
+                    "filter.status": "OPEN"
+                }
+                if date_from:
+                    params["filter.transDate.op"] = "BETWEEN"
+                    params["filter.transDate.val[0]"] = date_from
+                    params["filter.transDate.val[1]"] = date_to or date_from
+                r = requests.get(
+                    f"{host}/accurate/api/sales-invoice/list.do",
                     headers=accurate_headers(),
-                    params={
-                        "fields": "id,no,name,unitPrice,purchasePrice,availableStock,unit,buyPrice,lastPurchasePrice,sellingPrice,stock",
-                        "sp.pageSize": 50,
-                        "sp.page": 1,
-                        "filter.keywords": kw
-                    },
-                    timeout=15
-                ).json()
-
-            data = search_item(keyword)
-            print(f"[ITEM] keyword='{keyword}' rowCount={data.get('sp',{}).get('rowCount',0)}")
-
-            # Kalau tidak ketemu, coba tiap kata secara terpisah
-            if not data.get("d") and " " in keyword:
-                for word in keyword.split():
-                    if len(word) > 3:
-                        data2 = search_item(word)
-                        if data2.get("d"):
-                            data = data2
-                            keyword = word
-                            print(f"[ITEM] fallback keyword='{word}'")
-                            break
-            if data.get("s") and data.get("d"):
-                items = data["d"]
+                    params=params,
+                    timeout=30
+                )
+                data = r.json()
+                if not data.get("s"):
+                    break
+                page_data = data.get("d", [])
                 sp = data.get("sp", {})
-                total = sp.get("rowCount", len(items))
-                result = f"Produk '{keyword}' ({len(items)} dari {total} SKU):\n\n"
-                for item in items[:20]:
-                    result += f"📦 {item.get('name', '-')}\n"
-                    result += f"   Kode: {item.get('no', '-')}\n"
-                    beli = (item.get("purchasePrice") or item.get("buyPrice") or
-                            item.get("lastPurchasePrice") or 0)
-                    jual = (item.get("unitPrice") or item.get("sellingPrice") or 0)
-                    stok = (item.get("availableStock") if item.get("availableStock") is not None
-                            else item.get("stock"))
-                    if beli:
-                        result += f"   Harga Beli: Rp {float(beli):,.0f}\n"
-                    if jual:
-                        result += f"   Harga Jual: Rp {float(jual):,.0f}\n"
-                    if stok is not None:
-                        result += f"   Stok: {stok} {item.get('unit','')}\n"
-                    result += "\n"
-                if total > 20:
-                    result += f"...dan {total-20} SKU lainnya. Coba keyword lebih spesifik.\n"
-                return result
-            else:
-                return f"Produk '{keyword}' tidak ditemukan.\nCoba keyword lebih spesifik."
+                if page == 1:
+                    total_invoice = sp.get("rowCount", 0)
+                for inv in page_data:
+                    total_nilai += float(inv.get("totalAmount") or inv.get("subTotal") or 0)
+                total_pages = sp.get("pageCount", 1)
+                print(f"[BG PIUTANG] {page}/{total_pages} Rp {total_nilai:,.0f}")
+                if page >= total_pages:
+                    break
+                page += 1
+
+            msg = f"✅ *Piutang Belum Lunas - {label}*\n\n"
+            msg += f"Total invoice: {total_invoice}\n"
+            msg += f"Total nilai: Rp {total_nilai:,.0f}\n"
+            msg += f"\n_⚠️ Nilai adalah total invoice. Jika ada partial payment, angka bisa sedikit berbeda dari Accurate._"
+            send_message(chat_id, msg)
         except Exception as e:
-            print(f"[ITEM ERROR] {e}")
-            return f"Gagal cek produk: {str(e)[:100]}"
+            send_message(chat_id, f"❌ Gagal hitung piutang: {str(e)[:100]}")
 
-    # 7. Cari invoice spesifik
-    else:
-        data = get_invoices(host, keyword=query, page_size=10)
-        if data and data.get("s"):
-            invoices = data.get("d", [])
-            if not invoices:
-                return f"Tidak ada invoice ditemukan untuk: {query}"
-            invoices = enrich_with_customer_names(host, invoices, max_workers=10)
-            result = f"Hasil pencarian '{query}':\n\n"
-            for inv in invoices[:5]:
-                nama = extract_customer_name(inv)
-                total = extract_grand_total(inv)
-                result += f"- {inv.get('number','-')} | {nama}\n"
-                result += f"  Total: Rp {total:,.0f} | {inv.get('statusName','-')}\n"
-                result += f"  Tanggal: {inv.get('transDate','-')}\n\n"
-            return result
-        return f"Tidak ditemukan: {query}"
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started", "message": f"Menghitung piutang {label} di background..."})
 
 
-def ask_claude(chat_id, user_message, accurate_data=None):
+# ============================================================
+# CLAUDE TOOLS DEFINITION
+# ============================================================
+
+TOOLS = [
+    {
+        "name": "get_invoices",
+        "description": "Ambil daftar sales invoice dari Accurate Online. Gunakan untuk pertanyaan tentang invoice, penjualan, omset, customer belum bayar, dll. Bisa filter by status (OPEN=belum lunas, CLOSED=lunas), tanggal, keyword customer.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "Tanggal mulai format DD/MM/YYYY, contoh: 01/06/2026"},
+                "date_to": {"type": "string", "description": "Tanggal akhir format DD/MM/YYYY, contoh: 30/06/2026"},
+                "status": {"type": "string", "description": "OPEN untuk belum lunas, CLOSED untuk lunas. Kosongkan untuk semua."},
+                "keyword": {"type": "string", "description": "Keyword pencarian nama customer atau nomor invoice"},
+                "page_size": {"type": "integer", "description": "Jumlah data, default 50, max 100"}
+            }
+        }
+    },
+    {
+        "name": "get_invoice_detail",
+        "description": "Ambil detail lengkap satu invoice termasuk item produk yang dibeli, dari ID invoice.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "invoice_id": {"type": "integer", "description": "ID invoice dari hasil get_invoices"}
+            },
+            "required": ["invoice_id"]
+        }
+    },
+    {
+        "name": "get_items",
+        "description": "Cari produk/barang di Accurate Online. Gunakan untuk pertanyaan tentang harga beli, harga jual, stok, SKU produk.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "keyword": {"type": "string", "description": "Nama produk yang dicari, contoh: tumbler kagura, stiker vinyl"},
+                "page_size": {"type": "integer", "description": "Jumlah hasil, default 20"}
+            },
+            "required": ["keyword"]
+        }
+    },
+    {
+        "name": "get_piutang_summary",
+        "description": "Hitung total piutang/belum lunas semua periode. Gunakan HANYA untuk pertanyaan total piutang keseluruhan karena prosesnya lama (background). Untuk piutang periode tertentu yang tidak terlalu banyak, gunakan get_invoices saja.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "Tanggal mulai DD/MM/YYYY, kosongkan untuk semua periode"},
+                "date_to": {"type": "string", "description": "Tanggal akhir DD/MM/YYYY"},
+                "label": {"type": "string", "description": "Label periode untuk ditampilkan, contoh: Juni 2026"}
+            }
+        }
+    }
+]
+
+SYSTEM_PROMPT = """Kamu adalah asisten keuangan dan operasional untuk perusahaan Print Master.
+Kamu terhubung langsung ke Accurate Online via API dan bisa mengambil data real-time.
+
+Cara kerja:
+- Gunakan tool yang tersedia untuk ambil data dari Accurate
+- Setelah dapat data, analisa dan jawab pertanyaan user dengan jelas
+- Format angka dalam Rupiah (Rp 1.500.000)
+- Jawab dalam Bahasa Indonesia yang ramah, singkat, gunakan emoji
+- Jika data kosong/tidak ditemukan, sarankan keyword alternatif
+
+Tools yang tersedia:
+- get_invoices: untuk invoice, penjualan, piutang per periode, customer
+- get_invoice_detail: untuk detail satu invoice termasuk produk di dalamnya
+- get_items: untuk harga dan stok produk
+- get_piutang_summary: untuk total piutang keseluruhan (proses di background)
+
+Tanggal hari ini: {today}"""
+
+
+# ============================================================
+# MAIN HANDLER — Claude dengan tool use
+# ============================================================
+
+def handle_with_claude(chat_id, user_text, host):
     if chat_id not in conversation_history:
         conversation_history[chat_id] = []
-    content = f"Data dari Accurate Online:\n{accurate_data}\n\nPertanyaan user: {user_message}" if accurate_data else user_message
-    conversation_history[chat_id].append({"role": "user", "content": content})
+
+    today = (datetime.datetime.utcnow() + datetime.timedelta(hours=7)).strftime("%d/%m/%Y")
+    system = SYSTEM_PROMPT.format(today=today)
+
+    conversation_history[chat_id].append({"role": "user", "content": user_text})
     if len(conversation_history[chat_id]) > 20:
         conversation_history[chat_id] = conversation_history[chat_id][-20:]
-    r = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-        json={"model": "claude-sonnet-4-6", "max_tokens": 1024, "system": SYSTEM_PROMPT, "messages": conversation_history[chat_id]}
-    )
-    reply = r.json()["content"][0]["text"]
-    conversation_history[chat_id].append({"role": "assistant", "content": reply})
-    return reply
 
+    messages = list(conversation_history[chat_id])
+
+    # Loop agentic — Claude bisa panggil multiple tools
+    for _ in range(5):  # max 5 iterasi tool call
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            },
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 2048,
+                "system": system,
+                "tools": TOOLS,
+                "messages": messages
+            },
+            timeout=30
+        )
+        response = r.json()
+        print(f"[CLAUDE] stop_reason={response.get('stop_reason')} content_types={[c['type'] for c in response.get('content',[])]}")
+
+        # Tambah response Claude ke messages
+        messages.append({"role": "assistant", "content": response["content"]})
+
+        # Kalau Claude selesai (tidak ada tool call)
+        if response.get("stop_reason") == "end_turn":
+            text_blocks = [c["text"] for c in response["content"] if c["type"] == "text"]
+            reply = "\n".join(text_blocks)
+            conversation_history[chat_id].append({"role": "assistant", "content": reply})
+            return reply
+
+        # Kalau Claude minta tool
+        if response.get("stop_reason") == "tool_use":
+            tool_results = []
+            for block in response["content"]:
+                if block["type"] != "tool_use":
+                    continue
+
+                tool_name = block["name"]
+                tool_input = block["input"]
+                tool_use_id = block["id"]
+
+                print(f"[TOOL CALL] {tool_name} input={json.dumps(tool_input)[:200]}")
+
+                if tool_name == "get_invoices":
+                    result = tool_get_invoices(host, tool_input)
+                elif tool_name == "get_invoice_detail":
+                    result = tool_get_invoice_detail(host, tool_input["invoice_id"])
+                elif tool_name == "get_items":
+                    result = tool_get_items(host, tool_input["keyword"], tool_input.get("page_size", 20))
+                elif tool_name == "get_piutang_summary":
+                    result = tool_get_piutang_summary(
+                        host, chat_id,
+                        tool_input.get("date_from"),
+                        tool_input.get("date_to"),
+                        tool_input.get("label", "Semua Periode")
+                    )
+                else:
+                    result = json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": result
+                })
+
+            messages.append({"role": "user", "content": tool_results})
+
+    return "Maaf, tidak bisa memproses permintaan ini."
+
+
+# ============================================================
+# FLASK ROUTES
+# ============================================================
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.json
     if "message" not in data:
         return "ok", 200
+
     message = data["message"]
     chat_id = message["chat"]["id"]
     if "text" not in message:
         send_message(chat_id, "Maaf, hanya bisa proses teks.")
         return "ok", 200
+
     user_text = message["text"]
     user_name = message["from"].get("first_name", "")
+
     if user_text == "/start":
         send_message(chat_id,
-            f"Halo {user_name}! Saya Accurate Checker Bot Print Master.\n\n"
-            "Yang bisa saya bantu:\n"
-            "- Penjualan hari ini\n"
-            "- Invoice belum lunas hari ini (siapa saja)\n"
-            "- Total piutang / belum lunas semua periode\n"
-            "- Rekap penjualan bulan Juni\n"
-            "- Customer paling sering order\n"
-            "- Cek harga / stok produk\n"
-            "- Cari invoice per customer"
+            f"Halo {user_name}! Saya Accurate Checker Bot Print Master. 👋\n\n"
+            "Tanya apa saja tentang data Accurate Online kamu:\n"
+            "- 📄 Invoice & status pembayaran\n"
+            "- 💰 Piutang & yang belum lunas\n"
+            "- 📦 Stok & harga produk\n"
+            "- 📊 Rekap penjualan\n"
+            "- 👥 Customer terbanyak order\n\n"
+            "Langsung tanya saja dengan bahasa natural! 😊"
         )
         return "ok", 200
+
     if user_text == "/reset":
         conversation_history[chat_id] = []
-        send_message(chat_id, "Percakapan direset!")
+        send_message(chat_id, "Percakapan direset! ✅")
         return "ok", 200
+
     requests.post(f"{TELEGRAM_API}/sendChatAction", json={"chat_id": chat_id, "action": "typing"})
+
     try:
-        accurate_data = get_accurate_data(user_text, chat_id=chat_id)
-        reply = ask_claude(chat_id, user_text, accurate_data)
+        host = get_host()
+        if not host:
+            send_message(chat_id, "❌ Gagal koneksi ke Accurate Online.")
+            return "ok", 200
+
+        reply = handle_with_claude(chat_id, user_text, host)
         send_message(chat_id, reply)
     except Exception as e:
-        send_message(chat_id, f"Error: {str(e)[:100]}")
+        send_message(chat_id, f"❌ Error: {str(e)[:100]}")
         print(f"[ERROR] {e}")
+
     return "ok", 200
 
 
 @app.route("/", methods=["GET"])
 def index():
     return "Accurate Checker Bot OK", 200
-
-
-@app.route("/debug-invoice", methods=["GET"])
-def debug_invoice():
-    try:
-        token_info = get_token_info()
-        if not token_info or not token_info.get("s"):
-            return {"error": "Gagal koneksi Accurate"}, 500
-        d = token_info.get("d", {})
-        host = d.get("database", d.get("data usaha", {})).get("host", "")
-        if not host.startswith("http"):
-            host = f"https://{host}"
-        r1 = requests.get(
-            f"{host}/accurate/api/sales-invoice/list.do",
-            headers=accurate_headers(),
-            params={"sp.pageSize": 1, "sp.page": 1},
-            timeout=15
-        )
-        list_data = r1.json()
-        inv_id = list_data.get("d", [{}])[0].get("id") if list_data.get("d") else None
-        if not inv_id:
-            return {"error": "Tidak ada invoice"}, 404
-        r2 = requests.get(
-            f"{host}/accurate/api/sales-invoice/detail.do",
-            headers=accurate_headers(),
-            params={"id": inv_id},
-            timeout=15
-        )
-        detail = r2.json().get("d", {})
-        return {"invoice_id": inv_id, "all_fields": detail}
-    except Exception as e:
-        return {"error": str(e)}, 500
 
 
 if __name__ == "__main__":
