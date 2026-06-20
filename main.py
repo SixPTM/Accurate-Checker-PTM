@@ -125,12 +125,18 @@ def fetch_customer_name(host, inv):
         )
         detail = r.json().get("d", {})
         customer = detail.get("customer")
+        # customer bisa berupa dict, list, atau string
+        if isinstance(customer, dict):
+            cname = customer.get("name") or customer.get("customerName")
+        elif isinstance(customer, list) and customer:
+            cname = customer[0].get("name") if isinstance(customer[0], dict) else str(customer[0])
+        else:
+            cname = None
         name = (
             detail.get("retailWpName") or
             detail.get("customerName") or
             detail.get("toName") or
-            (customer.get("name") if isinstance(customer, dict) else None) or
-            "-"
+            cname or "-"
         )
         inv["_customerName"] = str(name).strip() if name else "-"
         outstanding = detail.get("outstanding")
@@ -476,8 +482,18 @@ def get_accurate_data(query, chat_id=None):
                             timeout=10
                         )
                         detail = r2.json().get("d", {})
-                        for item in detail.get("detailItem", []):
-                            name = item.get("itemName") or item.get("item", {}).get("name") or "-"
+                        items = detail.get("detailItem", [])
+                        if not isinstance(items, list):
+                            return
+                        for item in items:
+                            if not isinstance(item, dict):
+                                continue
+                            item_obj = item.get("item", {})
+                            if isinstance(item_obj, list):
+                                item_obj = item_obj[0] if item_obj else {}
+                            name = (item.get("itemName") or
+                                    (item_obj.get("name") if isinstance(item_obj, dict) else None) or
+                                    item.get("name") or "-")
                             qty = float(item.get("quantity") or item.get("qty") or 0)
                             amount = float(item.get("amount") or item.get("totalAmount") or 0)
                             if name and name != "-":
@@ -526,19 +542,33 @@ def get_accurate_data(query, chat_id=None):
         try:
             if not host.startswith("http"):
                 host = f"https://{host}"
-            r = requests.get(
-                f"{host}/accurate/api/item/list.do",
-                headers=accurate_headers(),
-                params={
-                    "fields": "id,no,name,unitPrice,purchasePrice,availableStock,unit,buyPrice,lastPurchasePrice,sellingPrice",
-                    "sp.pageSize": 50,
-                    "sp.page": 1,
-                    "filter.keywords": keyword
-                },
-                timeout=15
-            )
-            data = r.json()
-            print(f"[ITEM] {r.status_code} {r.text[:800]}")
+
+            def search_item(kw):
+                return requests.get(
+                    f"{host}/accurate/api/item/list.do",
+                    headers=accurate_headers(),
+                    params={
+                        "fields": "id,no,name,unitPrice,purchasePrice,availableStock,unit,buyPrice,lastPurchasePrice,sellingPrice,stock",
+                        "sp.pageSize": 50,
+                        "sp.page": 1,
+                        "filter.keywords": kw
+                    },
+                    timeout=15
+                ).json()
+
+            data = search_item(keyword)
+            print(f"[ITEM] keyword='{keyword}' rowCount={data.get('sp',{}).get('rowCount',0)}")
+
+            # Kalau tidak ketemu, coba tiap kata secara terpisah
+            if not data.get("d") and " " in keyword:
+                for word in keyword.split():
+                    if len(word) > 3:
+                        data2 = search_item(word)
+                        if data2.get("d"):
+                            data = data2
+                            keyword = word
+                            print(f"[ITEM] fallback keyword='{word}'")
+                            break
             if data.get("s") and data.get("d"):
                 items = data["d"]
                 sp = data.get("sp", {})
@@ -550,7 +580,8 @@ def get_accurate_data(query, chat_id=None):
                     beli = (item.get("purchasePrice") or item.get("buyPrice") or
                             item.get("lastPurchasePrice") or 0)
                     jual = (item.get("unitPrice") or item.get("sellingPrice") or 0)
-                    stok = item.get("availableStock")
+                    stok = (item.get("availableStock") if item.get("availableStock") is not None
+                            else item.get("stock"))
                     if beli:
                         result += f"   Harga Beli: Rp {float(beli):,.0f}\n"
                     if jual:
