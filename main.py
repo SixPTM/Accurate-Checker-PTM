@@ -366,59 +366,104 @@ def tool_get_items(host, keyword, page_size=20):
         return json.dumps({"error": str(e)})
 
 
-def tool_get_sales_per_item(host, keyword, date_from, date_to):
-    """Laporan penjualan per item menggunakan endpoint laporan Accurate."""
-    try:
-        h = host if host.startswith("http") else f"https://{host}"
+def tool_get_sales_per_item(host, chat_id, keyword, date_from, date_to):
+    """Hitung penjualan per item dengan scan detail invoice di background."""
+    def run():
+        try:
+            h = host if host.startswith("http") else f"https://{host}"
+            kw_lower = keyword.lower()
 
-        # Coba endpoint laporan penjualan per item
-        endpoints = [
-            f"{h}/accurate/api/report/sales-by-item.do",
-            f"{h}/accurate/api/sales-invoice/item-summary.do",
-            f"{h}/accurate/api/report/item-sales-detail.do",
-        ]
-
-        params = {
-            "dateFrom": date_from,
-            "dateTo": date_to,
-            "sp.pageSize": 50,
-            "sp.page": 1
-        }
-        if keyword:
-            params["filter.keywords"] = keyword
-            params["itemName"] = keyword
-
-        for endpoint in endpoints:
-            try:
-                r = requests.get(endpoint, headers=accurate_headers(), params=params, timeout=15)
+            # Ambil semua invoice di periode
+            all_ids = []
+            page = 1
+            while True:
+                params = {
+                    "fields": "id,number,statusName",
+                    "sp.pageSize": 200,
+                    "sp.page": page,
+                    "filter.transDate.op": "BETWEEN",
+                    "filter.transDate.val[0]": date_from,
+                    "filter.transDate.val[1]": date_to
+                }
+                r = requests.get(f"{h}/accurate/api/sales-invoice/list.do",
+                    headers=accurate_headers(), params=params, timeout=30)
                 data = r.json()
-                print(f"[SALES ITEM] {endpoint} status={r.status_code} s={data.get('s')} text={r.text[:200]}")
-                if data.get("s") and data.get("d"):
-                    return json.dumps(data, ensure_ascii=False)
-            except Exception as e:
-                print(f"[SALES ITEM ERROR] {endpoint} {e}")
+                if not data.get("s"):
+                    break
+                page_data = data.get("d", [])
+                all_ids.extend(page_data)
+                sp = data.get("sp", {})
+                total_pages = sp.get("pageCount", 1)
+                total_inv = sp.get("rowCount", 0)
+                print(f"[SALES ITEM BG] page {page}/{total_pages}")
+                if page >= total_pages:
+                    break
+                page += 1
 
-        # Fallback: ambil dari detail item langsung (stok movement)
-        # Cari item dulu
-        items_result = json.loads(tool_get_items(host, keyword or "", 10))
-        items = items_result.get("d", [])
-        if not items:
-            return json.dumps({"error": f"Produk '{keyword}' tidak ditemukan"})
+            send_message(chat_id, f"⏳ Scanning {len(all_ids)} invoice untuk produk '{keyword}'... Tunggu ya!")
 
-        result_data = []
-        for item in items[:5]:
-            result_data.append({
-                "name": item.get("name"),
-                "no": item.get("no"),
-                "currentStock": item.get("availableStock", 0),
-                "note": "Data penjualan per item tidak tersedia via API. Cek di Accurate: Laporan → Penjualan per Item"
-            })
+            # Scan detail invoice secara paralel
+            import threading
+            lock = threading.Lock()
+            item_qty = {}
+            item_total = {}
+            found_invoices = []
 
-        return json.dumps({"s": True, "d": result_data, "note": "Gunakan Accurate Online → Laporan → Penjualan per Item untuk data akurat"}, ensure_ascii=False)
+            def scan_invoice(inv):
+                try:
+                    r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do",
+                        headers=accurate_headers(), params={"id": inv["id"]}, timeout=10)
+                    detail = r2.json().get("d", {})
+                    items = detail.get("detailItem", [])
+                    if not isinstance(items, list):
+                        return
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        item_obj = item.get("item", {})
+                        if isinstance(item_obj, list):
+                            item_obj = item_obj[0] if item_obj else {}
+                        name = (item.get("itemName") or
+                                (item_obj.get("name") if isinstance(item_obj, dict) else None) or "-")
+                        if kw_lower in name.lower():
+                            qty = float(item.get("quantity") or 0)
+                            amount = float(item.get("amount") or 0)
+                            with lock:
+                                item_qty[name] = item_qty.get(name, 0) + qty
+                                item_total[name] = item_total.get(name, 0) + amount
+                                if inv["number"] not in found_invoices:
+                                    found_invoices.append(inv["number"])
+                except:
+                    pass
 
-    except Exception as e:
-        print(f"[SALES ITEM ERROR] {e}")
-        return json.dumps({"error": str(e)})
+            with ThreadPoolExecutor(max_workers=15) as ex:
+                list(ex.map(scan_invoice, all_ids))
+
+            if not item_qty:
+                send_message(chat_id, f"❌ Produk '{keyword}' tidak ditemukan di invoice {date_from} - {date_to}")
+                return
+
+            total_qty = sum(item_qty.values())
+            total_val = sum(item_total.values())
+
+            msg = f"✅ *Penjualan '{keyword}' ({date_from} - {date_to})*\n\n"
+            msg += f"Total qty terjual: {total_qty:,.0f} pcs\n"
+            msg += f"Total nilai: Rp {total_val:,.0f}\n"
+            msg += f"Ditemukan di: {len(found_invoices)} invoice\n\n"
+            msg += "*Per varian:*\n"
+            for name, qty in sorted(item_qty.items(), key=lambda x: x[1], reverse=True):
+                val = item_total.get(name, 0)
+                msg += f"• {name}: {qty:,.0f} pcs (Rp {val:,.0f})\n"
+            send_message(chat_id, msg)
+
+        except Exception as e:
+            send_message(chat_id, f"❌ Error: {str(e)[:100]}")
+            print(f"[SALES ITEM BG ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started", "message": f"Sedang scan invoice untuk produk '{keyword}'..."})
     """Kumpulkan semua customer belum bayar di background."""
     def run():
         try:
@@ -637,15 +682,15 @@ TOOLS = [
     },
     {
         "name": "get_sales_per_item",
-        "description": "Laporan penjualan per item/produk di periode tertentu. Gunakan untuk pertanyaan 'produk X laku berapa', 'total penjualan produk Y bulan ini', 'produk terlaris'. Lebih efisien dari buka detail invoice satu per satu.",
+        "description": "Hitung penjualan produk tertentu di periode tertentu dengan scan detail invoice. Proses di background, hasilnya dikirim otomatis ke Telegram. Gunakan untuk 'niagara laku berapa bulan juni', 'penjualan stiker vinyl juni'.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "keyword": {"type": "string", "description": "Nama produk yang dicari, contoh: niagara, stiker vinyl"},
+                "keyword": {"type": "string", "description": "Nama produk, contoh: niagara, stiker vinyl"},
                 "date_from": {"type": "string", "description": "Tanggal mulai DD/MM/YYYY"},
                 "date_to": {"type": "string", "description": "Tanggal akhir DD/MM/YYYY"}
             },
-            "required": ["date_from", "date_to"]
+            "required": ["keyword", "date_from", "date_to"]
         }
     },
     {
@@ -771,7 +816,7 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_get_items(host, tool_input["keyword"], tool_input.get("page_size", 20))
                 elif tool_name == "get_sales_per_item":
                     result = tool_get_sales_per_item(
-                        host,
+                        host, chat_id,
                         tool_input.get("keyword", ""),
                         tool_input["date_from"],
                         tool_input["date_to"]
