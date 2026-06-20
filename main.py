@@ -161,26 +161,55 @@ def tool_get_invoice_detail(host, invoice_id):
 
 
 def tool_get_items(host, keyword, page_size=20):
-    """Cari produk/item: nama, harga, stok."""
+    """Cari produk/item: nama, harga, stok - filter manual karena API tidak support filter."""
     try:
-        params = {
-            "fields": "id,no,name,unitPrice,purchasePrice,availableStock,unit,buyPrice,lastPurchasePrice",
-            "sp.pageSize": page_size,
-            "sp.page": 1,
-            "filter.name": keyword  # filter.name adalah parameter yang benar!
-        }
-        r = requests.get(
-            f"{host}/accurate/api/item/list.do",
-            headers=accurate_headers(),
-            params=params,
-            timeout=15
-        )
-        data = r.json()
-        print(f"[TOOL items] keyword='{keyword}' count={len(data.get('d',[]))} total={data.get('sp',{}).get('rowCount',0)}")
-        if data.get("d"):
-            print(f"[TOOL items sample] {data['d'][0]}")
-        return json.dumps(data, ensure_ascii=False)
+        keyword_lower = keyword.lower()
+        keywords = keyword_lower.split()
+        matched = []
+        page = 1
+
+        while True:
+            r = requests.get(
+                f"{host}/accurate/api/item/list.do",
+                headers=accurate_headers(),
+                params={
+                    "fields": "id,no,name,unitPrice,purchasePrice,availableStock,unit,buyPrice,lastPurchasePrice",
+                    "sp.pageSize": 100,
+                    "sp.page": page
+                },
+                timeout=15
+            )
+            data = r.json()
+            if not data.get("s"):
+                break
+
+            items = data.get("d", [])
+            sp = data.get("sp", {})
+
+            for item in items:
+                name = (item.get("name") or "").lower()
+                no = (item.get("no") or "").lower()
+                # Match kalau semua kata keyword ada di nama atau kode produk
+                if all(kw in name or kw in no for kw in keywords):
+                    matched.append(item)
+
+            if len(matched) >= page_size or page >= sp.get("pageCount", 1):
+                break
+            page += 1
+
+        total = len(matched)
+        print(f"[TOOL items] keyword='{keyword}' matched={total} pages_scanned={page}")
+        if matched:
+            print(f"[TOOL items sample] {matched[0]}")
+
+        return json.dumps({
+            "s": True,
+            "d": matched[:page_size],
+            "sp": {"rowCount": total}
+        }, ensure_ascii=False)
+
     except Exception as e:
+        print(f"[TOOL items ERROR] {e}")
         return json.dumps({"error": str(e)})
 
 
