@@ -462,18 +462,39 @@ def debug_item():
         host = get_host()
         if not host:
             return {"error": "Gagal dapat host"}, 500
-        r = requests.get(
-            f"{host}/accurate/api/item/list.do",
+
+        fields = "id,no,name,unitPrice,purchasePrice,availableStock,unit"
+        results = {}
+
+        # Test 1: tanpa filter, lihat sample data
+        r1 = requests.get(f"{host}/accurate/api/item/list.do",
             headers=accurate_headers(),
-            params={
-                "fields": "id,no,name,unitPrice,purchasePrice,availableStock,unit,buyPrice,lastPurchasePrice,type",
-                "sp.pageSize": 3,
-                "sp.page": 1
-            },
-            timeout=15
-        )
-        data = r.json()
-        return {"status": r.status_code, "url": r.url, "response": data}
+            params={"fields": fields, "sp.pageSize": 3, "sp.page": 1},
+            timeout=15)
+        results["no_filter"] = r1.json()
+
+        # Test 2: filter.keywords
+        r2 = requests.get(f"{host}/accurate/api/item/list.do",
+            headers=accurate_headers(),
+            params={"fields": fields, "sp.pageSize": 5, "filter.keywords": "stiker"},
+            timeout=15)
+        results["filter_keywords"] = {"count": len(r2.json().get("d", [])), "total": r2.json().get("sp", {}).get("rowCount", 0)}
+
+        # Test 3: filter.name
+        r3 = requests.get(f"{host}/accurate/api/item/list.do",
+            headers=accurate_headers(),
+            params={"fields": fields, "sp.pageSize": 5, "filter.name": "stiker"},
+            timeout=15)
+        results["filter_name"] = {"count": len(r3.json().get("d", [])), "total": r3.json().get("sp", {}).get("rowCount", 0)}
+
+        # Test 4: name (tanpa filter.)
+        r4 = requests.get(f"{host}/accurate/api/item/list.do",
+            headers=accurate_headers(),
+            params={"fields": fields, "sp.pageSize": 5, "name": "stiker"},
+            timeout=15)
+        results["name_param"] = {"count": len(r4.json().get("d", [])), "total": r4.json().get("sp", {}).get("rowCount", 0)}
+
+        return {"results": results}
     except Exception as e:
         return {"error": str(e)}, 500
 
