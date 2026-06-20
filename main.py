@@ -68,6 +68,108 @@ def send_message(chat_id, text):
         "chat_id": chat_id, "text": text, "parse_mode": "Markdown"
     })
 
+def send_file_to_telegram(chat_id, file_bytes, filename, caption=""):
+    try:
+        files = {"document": (filename, file_bytes)}
+        data = {"chat_id": chat_id, "caption": caption}
+        r = requests.post(f"{TELEGRAM_API}/sendDocument", files=files, data=data, timeout=30)
+        print(f"[SEND FILE] {filename} status={r.status_code}")
+        return r.json()
+    except Exception as e:
+        print(f"[SEND FILE ERROR] {e}")
+        return None
+
+def send_photo_to_telegram(chat_id, file_bytes, filename, caption=""):
+    try:
+        files = {"photo": (filename, file_bytes)}
+        data = {"chat_id": chat_id, "caption": caption}
+        r = requests.post(f"{TELEGRAM_API}/sendPhoto", files=files, data=data, timeout=30)
+        print(f"[SEND PHOTO] {filename} status={r.status_code}")
+        return r.json()
+    except Exception as e:
+        print(f"[SEND PHOTO ERROR] {e}")
+        return None
+
+def tool_get_attachment(host, chat_id, invoice_number):
+    """Ambil dan kirim attachment/bukti bayar invoice ke Telegram."""
+    try:
+        h = host if host.startswith("http") else f"https://{host}"
+
+        # Cari invoice by nomor
+        r = requests.get(
+            f"{h}/accurate/api/sales-invoice/list.do",
+            headers=accurate_headers(),
+            params={
+                "fields": "id,number,attachmentExist,statusName,retailWpName",
+                "sp.pageSize": 10,
+                "filter.keywords": invoice_number
+            },
+            timeout=15
+        )
+        invoices = r.json().get("d", [])
+        if not invoices:
+            return json.dumps({"error": f"Invoice {invoice_number} tidak ditemukan"})
+
+        inv = invoices[0]
+        inv_id = inv["id"]
+
+        if not inv.get("attachmentExist"):
+            return json.dumps({"error": f"Invoice {invoice_number} tidak memiliki attachment/bukti bayar"})
+
+        # Coba endpoint attachment list
+        r3 = requests.get(
+            f"{h}/accurate/api/attachment/list.do",
+            headers=accurate_headers(),
+            params={"refId": inv_id, "refType": "SALES_INVOICE"},
+            timeout=15
+        )
+        att_data = r3.json()
+        print(f"[ATTACHMENT LIST] {r3.status_code} {r3.text[:500]}")
+        attachments = att_data.get("d", [])
+
+        # Fallback: cek dari detail invoice
+        if not attachments:
+            r2 = requests.get(
+                f"{h}/accurate/api/sales-invoice/detail.do",
+                headers=accurate_headers(),
+                params={"id": inv_id},
+                timeout=15
+            )
+            detail = r2.json().get("d", {})
+            attachments = detail.get("attachments") or detail.get("attachment") or []
+            print(f"[ATTACHMENT DETAIL] {attachments}")
+
+        if not attachments:
+            return json.dumps({"error": "Attachment ada tapi tidak bisa diambil. Coba cek langsung di Accurate Online."})
+
+        sent = 0
+        for att in attachments[:3]:
+            att_id = att.get("id") or att.get("attachmentId")
+            att_name = att.get("name") or att.get("fileName") or f"bukti_{invoice_number}_{att_id}"
+            dl = requests.get(
+                f"{h}/accurate/api/attachment/download.do",
+                headers=accurate_headers(),
+                params={"id": att_id},
+                timeout=30
+            )
+            print(f"[DOWNLOAD] id={att_id} status={dl.status_code} size={len(dl.content)}")
+            if dl.status_code == 200 and dl.content:
+                ext = att_name.lower().split(".")[-1] if "." in att_name else ""
+                caption = f"Bukti bayar {invoice_number}"
+                if ext in ["jpg", "jpeg", "png", "gif"]:
+                    send_photo_to_telegram(chat_id, dl.content, att_name, caption)
+                else:
+                    send_file_to_telegram(chat_id, dl.content, att_name, caption)
+                sent += 1
+
+        if sent > 0:
+            return json.dumps({"success": True, "sent": sent, "message": f"{sent} file berhasil dikirim"})
+        return json.dumps({"error": "Gagal download attachment"})
+
+    except Exception as e:
+        print(f"[ATTACHMENT ERROR] {e}")
+        return json.dumps({"error": str(e)})
+
 # ============================================================
 # ACCURATE API TOOLS — dipanggil oleh Claude
 # ============================================================
@@ -468,6 +570,17 @@ TOOLS = [
         }
     },
     {
+        "name": "get_attachment",
+        "description": "Ambil dan kirim bukti bayar/attachment dari invoice ke Telegram user. Gunakan ketika user minta lihat bukti bayar, foto transfer, atau dokumen lampiran invoice.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "invoice_number": {"type": "string", "description": "Nomor invoice, contoh: SI.2026.06.00888"}
+            },
+            "required": ["invoice_number"]
+        }
+    },
+    {
         "name": "get_unpaid_customers_background",
         "description": "Ambil daftar semua customer yang belum bayar di periode tertentu. Proses di background karena data banyak. Gunakan untuk pertanyaan 'siapa saja yang belum bayar bulan juni' atau 'daftar customer belum lunas'.",
         "input_schema": {
@@ -507,6 +620,7 @@ Tools yang tersedia:
 - get_invoices: untuk invoice, penjualan, piutang per periode, customer
 - get_invoice_detail: untuk detail satu invoice termasuk produk di dalamnya
 - get_items: untuk harga dan stok produk
+- get_attachment: untuk ambil dan kirim bukti bayar/foto lampiran invoice ke Telegram
 - get_unpaid_customers_background: untuk daftar semua customer yang belum bayar (proses background, hasilnya dikirim otomatis)
 - get_piutang_summary: untuk total nilai piutang keseluruhan (proses di background)
 
@@ -580,6 +694,8 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_get_invoice_detail(host, tool_input["invoice_id"])
                 elif tool_name == "get_items":
                     result = tool_get_items(host, tool_input["keyword"], tool_input.get("page_size", 20))
+                elif tool_name == "get_attachment":
+                    result = tool_get_attachment(host, chat_id, tool_input["invoice_number"])
                 elif tool_name == "get_unpaid_customers_background":
                     result = tool_get_unpaid_customers_background(
                         host, chat_id,
@@ -701,6 +817,35 @@ def debug_item():
         results["name_param"] = {"count": len(r4.json().get("d", [])), "total": r4.json().get("sp", {}).get("rowCount", 0)}
 
         return {"results": results}
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+
+@app.route("/debug-attachment", methods=["GET"])
+def debug_attachment():
+    try:
+        host = get_host()
+        if not host:
+            return {"error": "Gagal dapat host"}, 500
+        r = requests.get(
+            f"{host}/accurate/api/sales-invoice/list.do",
+            headers=accurate_headers(),
+            params={"fields": "id,number,attachmentExist", "sp.pageSize": 20, "sp.page": 1},
+            timeout=15
+        )
+        invoices = r.json().get("d", [])
+        inv_with_att = [i for i in invoices if i.get("attachmentExist")]
+        if not inv_with_att:
+            return {"message": "Tidak ada invoice dengan attachment di 20 terbaru", "all": invoices}
+        inv_id = inv_with_att[0]["id"]
+        inv_num = inv_with_att[0]["number"]
+        r3 = requests.get(
+            f"{host}/accurate/api/attachment/list.do",
+            headers=accurate_headers(),
+            params={"refId": inv_id, "refType": "SALES_INVOICE"},
+            timeout=15
+        )
+        return {"invoice": inv_num, "invoice_id": inv_id, "attachment_list": r3.json()}
     except Exception as e:
         return {"error": str(e)}, 500
 
