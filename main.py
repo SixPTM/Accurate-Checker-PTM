@@ -366,7 +366,59 @@ def tool_get_items(host, keyword, page_size=20):
         return json.dumps({"error": str(e)})
 
 
-def tool_get_unpaid_customers_background(host, chat_id, date_from=None, date_to=None, label=""):
+def tool_get_sales_per_item(host, keyword, date_from, date_to):
+    """Laporan penjualan per item menggunakan endpoint laporan Accurate."""
+    try:
+        h = host if host.startswith("http") else f"https://{host}"
+
+        # Coba endpoint laporan penjualan per item
+        endpoints = [
+            f"{h}/accurate/api/report/sales-by-item.do",
+            f"{h}/accurate/api/sales-invoice/item-summary.do",
+            f"{h}/accurate/api/report/item-sales-detail.do",
+        ]
+
+        params = {
+            "dateFrom": date_from,
+            "dateTo": date_to,
+            "sp.pageSize": 50,
+            "sp.page": 1
+        }
+        if keyword:
+            params["filter.keywords"] = keyword
+            params["itemName"] = keyword
+
+        for endpoint in endpoints:
+            try:
+                r = requests.get(endpoint, headers=accurate_headers(), params=params, timeout=15)
+                data = r.json()
+                print(f"[SALES ITEM] {endpoint} status={r.status_code} s={data.get('s')} text={r.text[:200]}")
+                if data.get("s") and data.get("d"):
+                    return json.dumps(data, ensure_ascii=False)
+            except Exception as e:
+                print(f"[SALES ITEM ERROR] {endpoint} {e}")
+
+        # Fallback: ambil dari detail item langsung (stok movement)
+        # Cari item dulu
+        items_result = json.loads(tool_get_items(host, keyword or "", 10))
+        items = items_result.get("d", [])
+        if not items:
+            return json.dumps({"error": f"Produk '{keyword}' tidak ditemukan"})
+
+        result_data = []
+        for item in items[:5]:
+            result_data.append({
+                "name": item.get("name"),
+                "no": item.get("no"),
+                "currentStock": item.get("availableStock", 0),
+                "note": "Data penjualan per item tidak tersedia via API. Cek di Accurate: Laporan → Penjualan per Item"
+            })
+
+        return json.dumps({"s": True, "d": result_data, "note": "Gunakan Accurate Online → Laporan → Penjualan per Item untuk data akurat"}, ensure_ascii=False)
+
+    except Exception as e:
+        print(f"[SALES ITEM ERROR] {e}")
+        return json.dumps({"error": str(e)})
     """Kumpulkan semua customer belum bayar di background."""
     def run():
         try:
@@ -584,6 +636,19 @@ TOOLS = [
         }
     },
     {
+        "name": "get_sales_per_item",
+        "description": "Laporan penjualan per item/produk di periode tertentu. Gunakan untuk pertanyaan 'produk X laku berapa', 'total penjualan produk Y bulan ini', 'produk terlaris'. Lebih efisien dari buka detail invoice satu per satu.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "keyword": {"type": "string", "description": "Nama produk yang dicari, contoh: niagara, stiker vinyl"},
+                "date_from": {"type": "string", "description": "Tanggal mulai DD/MM/YYYY"},
+                "date_to": {"type": "string", "description": "Tanggal akhir DD/MM/YYYY"}
+            },
+            "required": ["date_from", "date_to"]
+        }
+    },
+    {
         "name": "get_unpaid_customers_background",
         "description": "Ambil daftar semua customer yang belum bayar di periode tertentu. Proses di background karena data banyak. Gunakan untuk pertanyaan 'siapa saja yang belum bayar bulan juni' atau 'daftar customer belum lunas'.",
         "input_schema": {
@@ -624,7 +689,8 @@ Cara kerja:
 Tools yang tersedia:
 - get_invoices: untuk invoice, penjualan, piutang per periode, customer
 - get_invoice_detail: untuk detail satu invoice termasuk produk di dalamnya
-- get_items: untuk harga dan stok produk
+- get_items: untuk harga dan stok produk (nama produk di Accurate mungkin disingkat, contoh: "Tumblr" bukan "Tumbler")
+- get_sales_per_item: untuk laporan penjualan per produk di periode tertentu
 - get_attachment: untuk ambil dan kirim bukti bayar/foto lampiran invoice ke Telegram
 - get_unpaid_customers_background: untuk daftar semua customer yang belum bayar (proses background)
 - get_piutang_summary: untuk total nilai piutang keseluruhan (proses di background)
@@ -703,6 +769,13 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_get_invoice_detail(host, tool_input["invoice_id"])
                 elif tool_name == "get_items":
                     result = tool_get_items(host, tool_input["keyword"], tool_input.get("page_size", 20))
+                elif tool_name == "get_sales_per_item":
+                    result = tool_get_sales_per_item(
+                        host,
+                        tool_input.get("keyword", ""),
+                        tool_input["date_from"],
+                        tool_input["date_to"]
+                    )
                 elif tool_name == "get_attachment":
                     result = tool_get_attachment(host, chat_id, tool_input["invoice_number"])
                 elif tool_name == "get_unpaid_customers_background":
