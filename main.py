@@ -247,11 +247,13 @@ def tool_get_unpaid_customers_background(host, chat_id, date_from=None, date_to=
     """Kumpulkan semua customer belum bayar di background."""
     def run():
         try:
-            customer_data = {}  # {name: {count, total}}
+            customer_data = {}
             page = 1
             total_invoice = 0
             h = host if host.startswith("http") else f"https://{host}"
 
+            # Ambil semua invoice OPEN dengan pagination sequential (bukan paralel)
+            all_invoices = []
             while True:
                 params = {
                     "fields": "id,number,totalAmount,subTotal,retailWpName,dueDate,statusName",
@@ -279,52 +281,65 @@ def tool_get_unpaid_customers_background(host, chat_id, date_from=None, date_to=
                 if page == 1:
                     total_invoice = sp.get("rowCount", 0)
 
-                # Enrich nama customer secara paralel per halaman
-                def enrich(inv):
-                    try:
-                        r2 = requests.get(
-                            f"{h}/accurate/api/sales-invoice/detail.do",
-                            headers=accurate_headers(),
-                            params={"id": inv["id"]},
-                            timeout=10
-                        )
-                        detail = r2.json().get("d", {})
-                        customer = detail.get("customer")
-                        if isinstance(customer, dict):
-                            cname = customer.get("name")
-                        elif isinstance(customer, list) and customer:
-                            cname = customer[0].get("name") if isinstance(customer[0], dict) else None
-                        else:
-                            cname = None
-                        name = detail.get("retailWpName") or detail.get("customerName") or cname or "-"
-                        total = float(detail.get("totalAmount") or inv.get("totalAmount") or inv.get("subTotal") or 0)
-                        if name and name != "-":
-                            if name not in customer_data:
-                                customer_data[name] = {"count": 0, "total": 0.0}
-                            customer_data[name]["count"] += 1
-                            customer_data[name]["total"] += total
-                    except:
-                        pass
-
-                with ThreadPoolExecutor(max_workers=15) as ex:
-                    list(ex.map(enrich, page_data))
-
+                all_invoices.extend(page_data)
                 total_pages = sp.get("pageCount", 1)
-                print(f"[BG UNPAID] page {page}/{total_pages} customers={len(customer_data)}")
+                print(f"[BG UNPAID] page {page}/{total_pages} loaded={len(all_invoices)}")
                 if page >= total_pages:
                     break
                 page += 1
 
-            # Sort by jumlah invoice terbanyak
-            sorted_customers = sorted(customer_data.items(), key=lambda x: x[1]["count"], reverse=True)
+            # Enrich nama customer secara paralel setelah semua halaman terkumpul
+            import threading
+            lock = threading.Lock()
+
+            def enrich(inv):
+                try:
+                    r2 = requests.get(
+                        f"{h}/accurate/api/sales-invoice/detail.do",
+                        headers=accurate_headers(),
+                        params={"id": inv["id"]},
+                        timeout=10
+                    )
+                    detail = r2.json().get("d", {})
+                    customer = detail.get("customer")
+                    if isinstance(customer, dict):
+                        cname = customer.get("name")
+                    elif isinstance(customer, list) and customer:
+                        cname = customer[0].get("name") if isinstance(customer[0], dict) else None
+                    else:
+                        cname = None
+                    name = detail.get("retailWpName") or detail.get("customerName") or cname or "-"
+                    total = float(detail.get("totalAmount") or inv.get("totalAmount") or inv.get("subTotal") or 0)
+                    outstanding = float(detail.get("outstanding") or 0)
+
+                    if name and name != "-":
+                        with lock:
+                            if name not in customer_data:
+                                customer_data[name] = {"count": 0, "total": 0.0, "outstanding": 0.0}
+                            customer_data[name]["count"] += 1
+                            customer_data[name]["total"] += total
+                            customer_data[name]["outstanding"] += outstanding
+                except:
+                    pass
+
+            with ThreadPoolExecutor(max_workers=15) as ex:
+                list(ex.map(enrich, all_invoices))
+
+            # Sort by outstanding terbesar
+            sorted_customers = sorted(customer_data.items(), key=lambda x: x[1]["outstanding"], reverse=True)
+            total_outstanding = sum(v["outstanding"] for v in customer_data.values())
             total_nilai = sum(v["total"] for v in customer_data.values())
 
             msg = f"✅ *Customer Belum Bayar - {label}*\n\n"
-            msg += f"Total invoice: {total_invoice} | Total nilai: Rp {total_nilai:,.0f}\n"
+            msg += f"Total invoice OPEN: {total_invoice}\n"
+            msg += f"Total nilai invoice: Rp {total_nilai:,.0f}\n"
+            if total_outstanding > 0:
+                msg += f"Total outstanding: Rp {total_outstanding:,.0f}\n"
             msg += f"Jumlah customer: {len(customer_data)}\n\n"
-            msg += "*Daftar Customer (urut terbanyak invoice):*\n"
+            msg += "*Daftar Customer (urut outstanding terbesar):*\n"
             for name, d in sorted_customers[:30]:
-                msg += f"• {name} — {d['count']} invoice (Rp {d['total']:,.0f})\n"
+                outstanding_str = f" | Sisa: Rp {d['outstanding']:,.0f}" if d['outstanding'] > 0 else ""
+                msg += f"• {name} — {d['count']} inv{outstanding_str}\n"
             if len(sorted_customers) > 30:
                 msg += f"\n_...dan {len(sorted_customers)-30} customer lainnya_"
             send_message(chat_id, msg)
