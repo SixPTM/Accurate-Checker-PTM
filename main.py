@@ -109,8 +109,9 @@ def tool_get_invoices(host, params):
         print(f"[TOOL invoices] status={r.status_code} count={len(data.get('d',[]))} total={data.get('sp',{}).get('rowCount',0)}")
 
         if data.get("s") and data.get("d"):
-            # Enrich nama customer secara paralel
+            # Enrich nama customer - MAKSIMAL 20 invoice agar tidak timeout
             invoices = data["d"]
+            enrich_limit = min(len(invoices), 20)
             def enrich(inv):
                 try:
                     r2 = requests.get(
@@ -137,7 +138,7 @@ def tool_get_invoices(host, params):
                 except:
                     inv["customerName"] = "-"
             with ThreadPoolExecutor(max_workers=10) as ex:
-                list(ex.map(enrich, invoices))
+                list(ex.map(enrich, invoices[:enrich_limit]))
 
         return json.dumps(data, ensure_ascii=False)
     except Exception as e:
@@ -242,6 +243,102 @@ def tool_get_items(host, keyword, page_size=20):
         return json.dumps({"error": str(e)})
 
 
+def tool_get_unpaid_customers_background(host, chat_id, date_from=None, date_to=None, label=""):
+    """Kumpulkan semua customer belum bayar di background."""
+    def run():
+        try:
+            customer_data = {}  # {name: {count, total}}
+            page = 1
+            total_invoice = 0
+            h = host if host.startswith("http") else f"https://{host}"
+
+            while True:
+                params = {
+                    "fields": "id,number,totalAmount,subTotal,retailWpName,dueDate,statusName",
+                    "sp.pageSize": 200,
+                    "sp.page": page,
+                    "filter.status": "OPEN"
+                }
+                if date_from:
+                    params["filter.transDate.op"] = "BETWEEN"
+                    params["filter.transDate.val[0]"] = date_from
+                    params["filter.transDate.val[1]"] = date_to or date_from
+
+                r = requests.get(
+                    f"{h}/accurate/api/sales-invoice/list.do",
+                    headers=accurate_headers(),
+                    params=params,
+                    timeout=30
+                )
+                data = r.json()
+                if not data.get("s"):
+                    break
+
+                page_data = data.get("d", [])
+                sp = data.get("sp", {})
+                if page == 1:
+                    total_invoice = sp.get("rowCount", 0)
+
+                # Enrich nama customer secara paralel per halaman
+                def enrich(inv):
+                    try:
+                        r2 = requests.get(
+                            f"{h}/accurate/api/sales-invoice/detail.do",
+                            headers=accurate_headers(),
+                            params={"id": inv["id"]},
+                            timeout=10
+                        )
+                        detail = r2.json().get("d", {})
+                        customer = detail.get("customer")
+                        if isinstance(customer, dict):
+                            cname = customer.get("name")
+                        elif isinstance(customer, list) and customer:
+                            cname = customer[0].get("name") if isinstance(customer[0], dict) else None
+                        else:
+                            cname = None
+                        name = detail.get("retailWpName") or detail.get("customerName") or cname or "-"
+                        total = float(detail.get("totalAmount") or inv.get("totalAmount") or inv.get("subTotal") or 0)
+                        if name and name != "-":
+                            if name not in customer_data:
+                                customer_data[name] = {"count": 0, "total": 0.0}
+                            customer_data[name]["count"] += 1
+                            customer_data[name]["total"] += total
+                    except:
+                        pass
+
+                with ThreadPoolExecutor(max_workers=15) as ex:
+                    list(ex.map(enrich, page_data))
+
+                total_pages = sp.get("pageCount", 1)
+                print(f"[BG UNPAID] page {page}/{total_pages} customers={len(customer_data)}")
+                if page >= total_pages:
+                    break
+                page += 1
+
+            # Sort by jumlah invoice terbanyak
+            sorted_customers = sorted(customer_data.items(), key=lambda x: x[1]["count"], reverse=True)
+            total_nilai = sum(v["total"] for v in customer_data.values())
+
+            msg = f"✅ *Customer Belum Bayar - {label}*\n\n"
+            msg += f"Total invoice: {total_invoice} | Total nilai: Rp {total_nilai:,.0f}\n"
+            msg += f"Jumlah customer: {len(customer_data)}\n\n"
+            msg += "*Daftar Customer (urut terbanyak invoice):*\n"
+            for name, d in sorted_customers[:30]:
+                msg += f"• {name} — {d['count']} invoice (Rp {d['total']:,.0f})\n"
+            if len(sorted_customers) > 30:
+                msg += f"\n_...dan {len(sorted_customers)-30} customer lainnya_"
+            send_message(chat_id, msg)
+
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal ambil data: {str(e)[:100]}")
+            print(f"[BG UNPAID ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
+
+
 def tool_get_piutang_summary(host, chat_id, date_from=None, date_to=None, label="Semua Periode"):
     """Hitung total piutang semua halaman di background thread."""
     def run():
@@ -338,7 +435,17 @@ TOOLS = [
         }
     },
     {
-        "name": "get_piutang_summary",
+        "name": "get_unpaid_customers_background",
+        "description": "Ambil daftar semua customer yang belum bayar di periode tertentu. Proses di background karena data banyak. Gunakan untuk pertanyaan 'siapa saja yang belum bayar bulan juni' atau 'daftar customer belum lunas'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "Tanggal mulai DD/MM/YYYY"},
+                "date_to": {"type": "string", "description": "Tanggal akhir DD/MM/YYYY"},
+                "label": {"type": "string", "description": "Label periode, contoh: Juni 2026"}
+            }
+        }
+    },
         "description": "Hitung total piutang/belum lunas semua periode. Gunakan HANYA untuk pertanyaan total piutang keseluruhan karena prosesnya lama (background). Untuk piutang periode tertentu yang tidak terlalu banyak, gunakan get_invoices saja.",
         "input_schema": {
             "type": "object",
@@ -365,7 +472,8 @@ Tools yang tersedia:
 - get_invoices: untuk invoice, penjualan, piutang per periode, customer
 - get_invoice_detail: untuk detail satu invoice termasuk produk di dalamnya
 - get_items: untuk harga dan stok produk
-- get_piutang_summary: untuk total piutang keseluruhan (proses di background)
+- get_unpaid_customers_background: untuk daftar semua customer yang belum bayar (proses background, hasilnya dikirim otomatis)
+- get_piutang_summary: untuk total nilai piutang keseluruhan (proses di background)
 
 Tanggal hari ini: {today}"""
 
@@ -437,6 +545,13 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_get_invoice_detail(host, tool_input["invoice_id"])
                 elif tool_name == "get_items":
                     result = tool_get_items(host, tool_input["keyword"], tool_input.get("page_size", 20))
+                elif tool_name == "get_unpaid_customers_background":
+                    result = tool_get_unpaid_customers_background(
+                        host, chat_id,
+                        tool_input.get("date_from"),
+                        tool_input.get("date_to"),
+                        tool_input.get("label", "")
+                    )
                 elif tool_name == "get_piutang_summary":
                     result = tool_get_piutang_summary(
                         host, chat_id,
