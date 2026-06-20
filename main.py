@@ -614,14 +614,16 @@ Cara kerja:
 - Setelah dapat data, analisa dan jawab pertanyaan user dengan jelas
 - Format angka dalam Rupiah (Rp 1.500.000)
 - Jawab dalam Bahasa Indonesia yang ramah, singkat, gunakan emoji
-- Jika data kosong/tidak ditemukan, sarankan keyword alternatif
+- PENTING: Jangan panggil tool lebih dari 3x per pertanyaan
+- PENTING: Untuk pertanyaan yang butuh cek ratusan invoice satu per satu (misal "cek semua bukti bayar juni"), tolak dengan sopan dan jelaskan keterbatasan — sarankan cek per invoice spesifik
+- Untuk bukti bayar, minta user sebutkan nomor invoice spesifik
 
 Tools yang tersedia:
 - get_invoices: untuk invoice, penjualan, piutang per periode, customer
 - get_invoice_detail: untuk detail satu invoice termasuk produk di dalamnya
 - get_items: untuk harga dan stok produk
 - get_attachment: untuk ambil dan kirim bukti bayar/foto lampiran invoice ke Telegram
-- get_unpaid_customers_background: untuk daftar semua customer yang belum bayar (proses background, hasilnya dikirim otomatis)
+- get_unpaid_customers_background: untuk daftar semua customer yang belum bayar (proses background)
 - get_piutang_summary: untuk total nilai piutang keseluruhan (proses di background)
 
 Tanggal hari ini: {today}"""
@@ -655,7 +657,7 @@ def handle_with_claude(chat_id, user_text, host):
             },
             json={
                 "model": "claude-sonnet-4-6",
-                "max_tokens": 2048,
+                "max_tokens": 4096,
                 "system": system,
                 "tools": TOOLS,
                 "messages": messages
@@ -663,6 +665,10 @@ def handle_with_claude(chat_id, user_text, host):
             timeout=30
         )
         response = r.json()
+        if "content" not in response:
+            print(f"[CLAUDE ERROR] {response}")
+            return "Maaf, terjadi error. Coba tanya dengan lebih spesifik, misalnya sebutkan nomor invoice tertentu."
+
         print(f"[CLAUDE] stop_reason={response.get('stop_reason')} content_types={[c['type'] for c in response.get('content',[])]}")
 
         # Tambah response Claude ke messages
