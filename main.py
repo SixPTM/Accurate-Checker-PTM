@@ -164,13 +164,11 @@ def tool_get_items(host, keyword, page_size=20):
     """Cari produk/item: nama, harga, stok."""
     try:
         params = {
-            "fields": "id,no,name,unitPrice,purchasePrice,availableStock,unit,buyPrice,lastPurchasePrice,type",
+            "fields": "id,no,name,unitPrice,purchasePrice,availableStock,unit,buyPrice,lastPurchasePrice",
             "sp.pageSize": page_size,
             "sp.page": 1,
+            "filter.name": keyword  # filter.name adalah parameter yang benar!
         }
-        if keyword:
-            params["filter.keywords"] = keyword
-
         r = requests.get(
             f"{host}/accurate/api/item/list.do",
             headers=accurate_headers(),
