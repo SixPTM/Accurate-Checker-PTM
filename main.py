@@ -173,7 +173,7 @@ def tool_get_items(host, keyword, page_size=20):
                 f"{host}/accurate/api/item/list.do",
                 headers=accurate_headers(),
                 params={
-                    "fields": "id,no,name,unitPrice,purchasePrice,availableStock,unit,buyPrice,lastPurchasePrice",
+                    "fields": "id,no,name,unitPrice,purchasePrice,availableStock,unit,buyPrice,lastPurchasePrice,quantityOnHand,stock,qty",
                     "sp.pageSize": 100,
                     "sp.page": page
                 },
@@ -189,7 +189,6 @@ def tool_get_items(host, keyword, page_size=20):
             for item in items:
                 name = (item.get("name") or "").lower()
                 no = (item.get("no") or "").lower()
-                # Match kalau semua kata keyword ada di nama atau kode produk
                 if all(kw in name or kw in no for kw in keywords):
                     matched.append(item)
 
@@ -197,8 +196,36 @@ def tool_get_items(host, keyword, page_size=20):
                 break
             page += 1
 
+        # Enrich dengan detail untuk dapat stok yang benar
+        def enrich_item(item):
+            try:
+                r2 = requests.get(
+                    f"{host}/accurate/api/item/detail.do",
+                    headers=accurate_headers(),
+                    params={"id": item["id"]},
+                    timeout=10
+                )
+                detail = r2.json().get("d", {})
+                print(f"[ITEM DETAIL fields] {list(detail.keys())[:20]}")
+                # Ambil semua field yang mungkin berisi stok
+                item["availableStock"] = (
+                    detail.get("availableStock") or
+                    detail.get("quantityOnHand") or
+                    detail.get("stock") or
+                    detail.get("qty") or
+                    detail.get("quantity") or 0
+                )
+                item["unitPrice"] = detail.get("unitPrice") or detail.get("sellingPrice") or item.get("unitPrice") or 0
+                item["purchasePrice"] = detail.get("purchasePrice") or detail.get("buyPrice") or item.get("purchasePrice") or 0
+                item["unit"] = detail.get("unit") or detail.get("unitName") or item.get("unit") or ""
+            except Exception as e:
+                print(f"[ITEM ENRICH ERROR] {e}")
+
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            list(ex.map(enrich_item, matched[:page_size]))
+
         total = len(matched)
-        print(f"[TOOL items] keyword='{keyword}' matched={total} pages_scanned={page}")
+        print(f"[TOOL items] keyword='{keyword}' matched={total}")
         if matched:
             print(f"[TOOL items sample] {matched[0]}")
 
