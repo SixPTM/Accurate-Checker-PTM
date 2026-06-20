@@ -88,16 +88,23 @@ def tool_get_invoices(host, params):
             "sp.sort": "transDate",
             "sp.sortOrder": "DESC"
         }
-        if params.get("status"):
-            api_params["filter.status"] = params["status"]
+
+        keyword = params.get("keyword") or params.get("customer_name")
+        status = params.get("status")
+
+        # Accurate tidak bisa kombinasi keyword + status sekaligus
+        # Kalau ada keyword DAN status, ambil by status dulu lalu filter manual
+        if keyword and status:
+            api_params["filter.status"] = status
+        elif status:
+            api_params["filter.status"] = status
+        elif keyword:
+            api_params["filter.keywords"] = keyword
+
         if params.get("date_from"):
             api_params["filter.transDate.op"] = "BETWEEN"
             api_params["filter.transDate.val[0]"] = params["date_from"]
             api_params["filter.transDate.val[1]"] = params.get("date_to", params["date_from"])
-        if params.get("keyword"):
-            api_params["filter.keywords"] = params["keyword"]
-        if params.get("customer_name"):
-            api_params["filter.keywords"] = params["customer_name"]
 
         r = requests.get(
             f"{host}/accurate/api/sales-invoice/list.do",
@@ -106,10 +113,21 @@ def tool_get_invoices(host, params):
             timeout=15
         )
         data = r.json()
+
+        # Filter manual by keyword jika kombinasi keyword+status
+        if keyword and status and data.get("d"):
+            kw_lower = keyword.lower()
+            filtered = []
+            for inv in data["d"]:
+                name = (inv.get("retailWpName") or "").lower()
+                if kw_lower in name:
+                    filtered.append(inv)
+            data["d"] = filtered
+            print(f"[TOOL invoices] keyword_filter='{keyword}' before={len(data.get('d',[]))+len(data['d'])} after={len(filtered)}")
+
         print(f"[TOOL invoices] status={r.status_code} count={len(data.get('d',[]))} total={data.get('sp',{}).get('rowCount',0)}")
 
         if data.get("s") and data.get("d"):
-            # Enrich nama customer - MAKSIMAL 20 invoice agar tidak timeout
             invoices = data["d"]
             enrich_limit = min(len(invoices), 20)
             def enrich(inv):
