@@ -534,11 +534,17 @@ def get_accurate_data(query, chat_id=None):
                                "tinta", "quantac", "bahan", "material", "cek harga", "harga",
                                "sku", "kode produk", "daftar produk", "list produk", "ada berapa"]):
         keyword = query
-        for w in ["berapa", "harga", "beli", "jual", "modal", "hpp", "produk", "item", "barang",
-                  "stok", "cek", "info", "ok", "tolong", "nya", "itu", "harganya", "sku",
-                  "kode", "daftar", "list", "ada", "semua", "di", "accurate", "untuk"]:
-            keyword = keyword.replace(w, " ").strip()
-        keyword = " ".join(keyword.split()) or query
+        stop_words = [
+            "berapa", "harga", "beli", "jual", "modal", "hpp", "produk", "item", "barang",
+            "stok", "stoc", "stock", "cek", "info", "ok", "tolong", "nya", "itu", "harganya",
+            "sku", "kode", "daftar", "list", "ada", "semua", "di", "accurate", "untuk",
+            "jumlah", "lagi", "coba", "hari", "ini", "sekarang", "total", "sisa", "check",
+            "minta", "bisa", "dong", "ya", "yaa", "dong", "donk", "please", "pls", "tlg",
+            "gimana", "bagaimana", "berapa", "sisa"
+        ]
+        for w in stop_words:
+            keyword = keyword.lower().replace(w, " ")
+        keyword = " ".join(keyword.split()).strip() or query
         try:
             if not host.startswith("http"):
                 host = f"https://{host}"
