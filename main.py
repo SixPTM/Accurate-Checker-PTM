@@ -209,15 +209,17 @@ def tool_get_items(host, keyword, page_size=20):
                 print(f"[ITEM DETAIL fields] {list(detail.keys())[:20]}")
                 # Ambil semua field yang mungkin berisi stok
                 item["availableStock"] = (
+                    detail.get("balance") or
                     detail.get("availableStock") or
                     detail.get("quantityOnHand") or
-                    detail.get("stock") or
-                    detail.get("qty") or
-                    detail.get("quantity") or 0
+                    detail.get("stock") or 0
                 )
                 item["unitPrice"] = detail.get("unitPrice") or detail.get("sellingPrice") or item.get("unitPrice") or 0
                 item["purchasePrice"] = detail.get("purchasePrice") or detail.get("buyPrice") or item.get("purchasePrice") or 0
                 item["unit"] = detail.get("unit") or detail.get("unitName") or item.get("unit") or ""
+                item["unit2"] = detail.get("unit2Name") or ""
+                # Log nilai stok untuk debug
+                print(f"[ITEM STOCK] {item['name']} balance={detail.get('balance')} availableStock={detail.get('availableStock')}")
             except Exception as e:
                 print(f"[ITEM ENRICH ERROR] {e}")
 
