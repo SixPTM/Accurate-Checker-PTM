@@ -426,8 +426,15 @@ def tool_get_sales_per_item(host, chat_id, keyword, date_from, date_to):
                         name = (item.get("itemName") or
                                 (item_obj.get("name") if isinstance(item_obj, dict) else None) or "-")
                         if kw_lower in name.lower():
-                            qty = float(item.get("quantity") or 0)
-                            amount = float(item.get("amount") or 0)
+                            qty = float(item.get("quantity") or item.get("qty") or 0)
+                            amount = float(
+                                item.get("amount") or
+                                item.get("totalAmount") or
+                                item.get("unitPrice", 0) * qty or
+                                item.get("salesPrice", 0) * qty or
+                                item.get("total") or 0
+                            )
+                            print(f"[ITEM FOUND] {name} qty={qty} amount={amount} fields={list(item.keys())[:15]}")
                             with lock:
                                 item_qty[name] = item_qty.get(name, 0) + qty
                                 item_total[name] = item_total.get(name, 0) + amount
