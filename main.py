@@ -163,19 +163,24 @@ def tool_get_invoice_detail(host, invoice_id):
 def tool_get_items(host, keyword, page_size=20):
     """Cari produk/item: nama, harga, stok."""
     try:
+        params = {
+            "fields": "id,no,name,unitPrice,purchasePrice,availableStock,unit,buyPrice,lastPurchasePrice,type",
+            "sp.pageSize": page_size,
+            "sp.page": 1,
+        }
+        if keyword:
+            params["filter.keywords"] = keyword
+
         r = requests.get(
             f"{host}/accurate/api/item/list.do",
             headers=accurate_headers(),
-            params={
-                "fields": "id,no,name,unitPrice,purchasePrice,availableStock,unit,buyPrice,lastPurchasePrice",
-                "sp.pageSize": page_size,
-                "sp.page": 1,
-                "filter.keywords": keyword
-            },
+            params=params,
             timeout=15
         )
         data = r.json()
         print(f"[TOOL items] keyword='{keyword}' count={len(data.get('d',[]))} total={data.get('sp',{}).get('rowCount',0)}")
+        if data.get("d"):
+            print(f"[TOOL items sample] {data['d'][0]}")
         return json.dumps(data, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": str(e)})
@@ -457,20 +462,18 @@ def debug_item():
         host = get_host()
         if not host:
             return {"error": "Gagal dapat host"}, 500
-
-        # Coba tanpa filter dulu
         r = requests.get(
             f"{host}/accurate/api/item/list.do",
             headers=accurate_headers(),
-            params={"sp.pageSize": 3, "sp.page": 1},
+            params={
+                "fields": "id,no,name,unitPrice,purchasePrice,availableStock,unit,buyPrice,lastPurchasePrice,type",
+                "sp.pageSize": 3,
+                "sp.page": 1
+            },
             timeout=15
         )
         data = r.json()
-        return {
-            "status": r.status_code,
-            "url": r.url,
-            "response": data
-        }
+        return {"status": r.status_code, "url": r.url, "response": data}
     except Exception as e:
         return {"error": str(e)}, 500
 
