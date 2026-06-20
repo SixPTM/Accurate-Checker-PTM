@@ -451,6 +451,30 @@ def webhook():
     return "ok", 200
 
 
+@app.route("/debug-item", methods=["GET"])
+def debug_item():
+    try:
+        host = get_host()
+        if not host:
+            return {"error": "Gagal dapat host"}, 500
+
+        # Coba tanpa filter dulu
+        r = requests.get(
+            f"{host}/accurate/api/item/list.do",
+            headers=accurate_headers(),
+            params={"sp.pageSize": 3, "sp.page": 1},
+            timeout=15
+        )
+        data = r.json()
+        return {
+            "status": r.status_code,
+            "url": r.url,
+            "response": data
+        }
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+
 @app.route("/", methods=["GET"])
 def index():
     return "Accurate Checker Bot OK", 200
