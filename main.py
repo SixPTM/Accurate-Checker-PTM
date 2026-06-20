@@ -836,25 +836,36 @@ def debug_attachment():
         host = get_host()
         if not host:
             return {"error": "Gagal dapat host"}, 500
-        r = requests.get(
-            f"{host}/accurate/api/sales-invoice/list.do",
-            headers=accurate_headers(),
-            params={"fields": "id,number,attachmentExist", "sp.pageSize": 20, "sp.page": 1},
-            timeout=15
-        )
-        invoices = r.json().get("d", [])
-        inv_with_att = [i for i in invoices if i.get("attachmentExist")]
-        if not inv_with_att:
-            return {"message": "Tidak ada invoice dengan attachment di 20 terbaru", "all": invoices}
-        inv_id = inv_with_att[0]["id"]
-        inv_num = inv_with_att[0]["number"]
-        r3 = requests.get(
-            f"{host}/accurate/api/attachment/list.do",
-            headers=accurate_headers(),
-            params={"transactionId": inv_id, "transactionType": "SALES_INVOICE"},
-            timeout=15
-        )
-        return {"invoice": inv_num, "invoice_id": inv_id, "attachment_list": r3.json()}
+
+        # Pakai invoice yang kita tahu ada attachment
+        inv_id = 65027  # SI.2026.06.00960
+        results = {}
+
+        endpoints_to_try = [
+            ("attachment/list", {"transactionId": inv_id, "transactionType": "SALES_INVOICE"}),
+            ("document-transaction/list", {"transactionId": inv_id, "transactionType": "SALES_INVOICE"}),
+            ("document-transaction/list", {"salesInvoiceId": inv_id}),
+            ("transaction-document/list", {"transactionId": inv_id}),
+            ("sales-invoice/document", {"id": inv_id}),
+            ("attachment/list", {"id": inv_id}),
+        ]
+
+        for endpoint, params in endpoints_to_try:
+            try:
+                r = requests.get(
+                    f"{host}/accurate/api/{endpoint}.do",
+                    headers=accurate_headers(),
+                    params=params,
+                    timeout=10
+                )
+                results[endpoint + str(params)] = {
+                    "status": r.status_code,
+                    "response": r.text[:300]
+                }
+            except Exception as e:
+                results[endpoint] = {"error": str(e)}
+
+        return {"inv_id": inv_id, "results": results}
     except Exception as e:
         return {"error": str(e)}, 500
 
