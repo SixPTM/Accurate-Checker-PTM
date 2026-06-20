@@ -446,6 +446,8 @@ TOOLS = [
             }
         }
     },
+    {
+        "name": "get_piutang_summary",
         "description": "Hitung total piutang/belum lunas semua periode. Gunakan HANYA untuk pertanyaan total piutang keseluruhan karena prosesnya lama (background). Untuk piutang periode tertentu yang tidak terlalu banyak, gunakan get_invoices saja.",
         "input_schema": {
             "type": "object",
