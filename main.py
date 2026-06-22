@@ -50,9 +50,7 @@ def get_host():
         print(f"[HOST ERROR] {e}")
         return None
 
-def send_message(chat_id, text):
-    if not text or not text.strip():
-        text = "Maaf, tidak ada jawaban yang bisa ditampilkan."
+def _send_one(chat_id, text):
     # Coba kirim dengan Markdown dulu
     try:
         r = requests.post(f"{TELEGRAM_API}/sendMessage",
@@ -69,6 +67,32 @@ def send_message(chat_id, text):
         print(f"[SEND PLAIN] status={r.status_code} {r.text[:200] if r.status_code != 200 else 'ok'}")
     except Exception as e:
         print(f"[SEND ERROR plain] {e}")
+
+
+def send_message(chat_id, text):
+    if not text or not text.strip():
+        text = "Maaf, tidak ada jawaban yang bisa ditampilkan."
+    # Telegram batasi 4096 karakter per pesan. Pecah per baris jika kepanjangan.
+    LIMIT = 3800
+    if len(text) <= LIMIT:
+        _send_one(chat_id, text)
+        return
+    chunk = ""
+    for line in text.split("\n"):
+        # Kalau satu baris saja sudah melebihi limit, potong paksa
+        while len(line) > LIMIT:
+            if chunk:
+                _send_one(chat_id, chunk)
+                chunk = ""
+            _send_one(chat_id, line[:LIMIT])
+            line = line[LIMIT:]
+        if len(chunk) + len(line) + 1 > LIMIT:
+            _send_one(chat_id, chunk)
+            chunk = line
+        else:
+            chunk = chunk + "\n" + line if chunk else line
+    if chunk:
+        _send_one(chat_id, chunk)
 
 def send_file_to_telegram(chat_id, file_bytes, filename, caption=""):
     try:
@@ -677,6 +701,73 @@ def tool_get_overdue_customers(host, chat_id, days=30):
     return json.dumps({"status": "background_started"})
 
 
+def tool_get_unpaid_invoices_detail(host, chat_id, date_from=None, date_to=None, label=""):
+    def run():
+        try:
+            h = host if host.startswith("http") else f"https://{host}"
+            lock = threading.Lock()
+            rows = []
+            all_invoices = []
+            page = 1
+
+            while True:
+                params = {"fields": "id,number,totalAmount,subTotal,retailWpName,statusName",
+                    "sp.pageSize": 200, "sp.page": page, "filter.status": "OPEN"}
+                if date_from:
+                    params["filter.transDate.op"] = "BETWEEN"
+                    params["filter.transDate.val[0]"] = date_from
+                    params["filter.transDate.val[1]"] = date_to or date_from
+                r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+                data = r.json()
+                if not data.get("s"): break
+                page_data = data.get("d", [])
+                sp = data.get("sp", {})
+                all_invoices.extend(page_data)
+                print(f"[BG UNPAID DETAIL] page {page}/{sp.get('pageCount',1)} loaded={len(all_invoices)}")
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+
+            def enrich(inv):
+                try:
+                    r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=10)
+                    detail = r2.json().get("d", {})
+                    customer = detail.get("customer")
+                    if isinstance(customer, dict): cname = customer.get("name")
+                    elif isinstance(customer, list) and customer: cname = customer[0].get("name") if isinstance(customer[0], dict) else None
+                    else: cname = None
+                    name = detail.get("retailWpName") or detail.get("customerName") or cname or "Tanpa Nama"
+                    nilai = float(detail.get("totalAmount") or inv.get("totalAmount") or 0)
+                    number = detail.get("number") or inv.get("number") or "-"
+                    with lock:
+                        rows.append({"number": number, "name": name, "nilai": nilai})
+                except: pass
+
+            with ThreadPoolExecutor(max_workers=15) as ex:
+                list(ex.map(enrich, all_invoices))
+
+            if not rows:
+                send_message(chat_id, f"✅ Tidak ada invoice belum bayar untuk {label}.")
+                return
+
+            rows.sort(key=lambda x: x["nilai"], reverse=True)
+            total_nilai = sum(x["nilai"] for x in rows)
+            header = f"📋 *Invoice Belum Bayar - {label}*\n\n"
+            header += f"Jumlah invoice: {len(rows)}\n"
+            header += f"Total nilai: Rp {total_nilai:,.0f}\n\n*Daftar (urut nilai terbesar):*\n"
+            msg = header
+            for x in rows:
+                msg += f"• {x['number']} | {x['name']} | Rp {x['nilai']:,.0f}\n"
+            send_message(chat_id, msg)
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal ambil daftar invoice: {str(e)[:100]}")
+            print(f"[BG UNPAID DETAIL ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
+
+
 # ============================================================
 # CLAUDE TOOLS DEFINITION
 # ============================================================
@@ -814,6 +905,18 @@ TOOLS = [
                 "days": {"type": "integer", "description": "Jumlah hari lewat jatuh tempo, default 30"}
             }
         }
+    },
+    {
+        "name": "get_unpaid_invoices_detail",
+        "description": "Daftar LENGKAP invoice belum bayar berikut NOMOR invoice, NAMA customer, dan NILAI masing-masing, satu periode. Nama customer diambil lengkap untuk SEMUA invoice (bukan cuma sebagian). WAJIB pakai tool ini kalau user minta rincian invoice belum bayar dengan nomor invoice / nama / nilai per invoice, contoh 'customer belum bayar Juni, sebutkan nomor invoice dan nilainya'. JANGAN pakai get_invoices untuk ini karena get_invoices hanya 100 invoice dan nama tidak lengkap. Background 2-3 menit, hasil dikirim ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD/MM/YYYY"},
+                "date_to": {"type": "string", "description": "DD/MM/YYYY"},
+                "label": {"type": "string", "description": "Label periode"}
+            }
+        }
     }
 ]
 
@@ -829,11 +932,16 @@ PENTING soal efisiensi:
 SANGAT PENTING soal total omset/pendapatan bulanan:
 - Untuk pertanyaan TOTAL pendapatan/omset/penjualan satu bulan atau periode (contoh 'berapa pendapatan Juni', 'total penjualan bulan ini'), WAJIB pakai get_omset_summary. JANGAN pakai get_invoices untuk menjumlahkan omset bulanan, karena get_invoices hanya mengambil 100 invoice dari ratusan/ribuan yang ada, sehingga hasilnya SALAH dan terlalu kecil.
 
+SANGAT PENTING soal daftar invoice belum bayar:
+- Kalau user minta daftar customer/invoice belum bayar satu bulan LENGKAP DENGAN NOMOR INVOICE, NAMA, atau NILAI per invoice (contoh 'customer belum bayar Juni, sebutkan nomornya dan nilainya'), WAJIB pakai get_unpaid_invoices_detail. JANGAN pakai get_invoices, karena get_invoices hanya 100 invoice dan banyak nama customer tidak terisi (muncul 'Tanpa Nama').
+- Kalau user cuma minta ringkasan jumlah customer belum bayar tanpa rincian per invoice, pakai get_unpaid_customers_background.
+
 Tools background (hasilnya dikirim otomatis ke Telegram setelah selesai, beri tahu user untuk menunggu):
 - get_omset_summary: total pendapatan/omset satu periode, baca semua invoice (2-3 menit)
 - get_top_products_background: rekap SEMUA produk terlaris (5-10 menit)
 - get_sales_per_item: penjualan produk tertentu (3-5 menit)  
 - get_unpaid_customers_background: daftar customer belum bayar (2-3 menit)
+- get_unpaid_invoices_detail: daftar invoice belum bayar lengkap dengan nomor + nama + nilai (2-3 menit)
 - get_piutang_summary: total piutang (2-3 menit)
 - get_low_stock: produk yang stoknya menipis di bawah ambang batas (perlu sebut kategori produk)
 - get_overdue_customers: customer yang nunggak lewat jatuh tempo > sekian hari
@@ -906,6 +1014,8 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_get_low_stock(host, chat_id, tool_input["keyword"], tool_input.get("threshold", 30))
                 elif tool_name == "get_overdue_customers":
                     result = tool_get_overdue_customers(host, chat_id, tool_input.get("days", 30))
+                elif tool_name == "get_unpaid_invoices_detail":
+                    result = tool_get_unpaid_invoices_detail(host, chat_id, tool_input.get("date_from"), tool_input.get("date_to"), tool_input.get("label",""))
                 else:
                     result = json.dumps({"error": f"Unknown tool: {tool_name}"})
 
