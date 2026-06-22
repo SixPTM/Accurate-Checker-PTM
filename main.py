@@ -956,7 +956,8 @@ SANGAT PENTING soal total omset/pendapatan bulanan:
 - Untuk pertanyaan TOTAL pendapatan/omset/penjualan satu bulan atau periode (contoh 'berapa pendapatan Juni', 'total penjualan bulan ini'), WAJIB pakai get_omset_summary. JANGAN pakai get_invoices untuk menjumlahkan omset bulanan, karena get_invoices hanya mengambil 100 invoice dari ratusan/ribuan yang ada, sehingga hasilnya SALAH dan terlalu kecil.
 
 SANGAT PENTING soal daftar invoice belum bayar:
-- Kalau user minta daftar customer/invoice belum bayar satu bulan LENGKAP DENGAN NOMOR INVOICE, NAMA, atau NILAI per invoice (contoh 'customer belum bayar Juni, sebutkan nomornya dan nilainya'), WAJIB pakai get_unpaid_invoices_detail. JANGAN pakai get_invoices, karena get_invoices hanya 100 invoice dan banyak nama customer tidak terisi (muncul 'Tanpa Nama').
+- Kalau user minta daftar customer/invoice belum bayar satu bulan LENGKAP DENGAN NOMOR INVOICE, NAMA, atau NILAI per invoice (contoh 'customer belum bayar Juni, sebutkan nomornya dan nilainya', 'piutang Juni atas nama siapa saja, nomor invoice dan jumlahnya'), LANGSUNG panggil get_unpaid_invoices_detail TANPA bertanya ulang dan TANPA menampilkan sampel dari get_invoices. JANGAN pakai get_invoices untuk ini, karena get_invoices hanya 100 invoice dan banyak nama customer tidak terisi (muncul '-').
+- Setelah memanggil tool background, cukup beri tahu user singkat bahwa proses berjalan dan hasil dikirim 2-3 menit lagi. JANGAN tampilkan data sampel apa pun.
 - Kalau user cuma minta ringkasan jumlah customer belum bayar tanpa rincian per invoice, pakai get_unpaid_customers_background.
 
 Tools background (hasilnya dikirim otomatis ke Telegram setelah selesai, beri tahu user untuk menunggu):
