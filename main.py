@@ -481,6 +481,202 @@ def tool_get_piutang_summary(host, chat_id, date_from=None, date_to=None, label=
     return json.dumps({"status": "background_started"})
 
 
+def tool_get_omset_summary(host, chat_id, date_from, date_to, label=""):
+    def run():
+        try:
+            h = host if host.startswith("http") else f"https://{host}"
+            total_semua = 0.0
+            total_lunas = 0.0
+            total_belum = 0.0
+            count_semua = 0
+            count_lunas = 0
+            count_belum = 0
+            page = 1
+            total_invoice = 0
+            while True:
+                params = {"fields": "id,totalAmount,subTotal,statusName", "sp.pageSize": 200, "sp.page": page,
+                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
+                r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+                data = r.json()
+                if not data.get("s"): break
+                page_data = data.get("d", [])
+                sp = data.get("sp", {})
+                if page == 1: total_invoice = sp.get("rowCount", 0)
+                for inv in page_data:
+                    nilai = float(inv.get("totalAmount") or inv.get("subTotal") or 0)
+                    status = (inv.get("statusName") or "").upper()
+                    total_semua += nilai
+                    count_semua += 1
+                    if "LUNAS" in status or "PAID" in status or "CLOSE" in status:
+                        total_lunas += nilai
+                        count_lunas += 1
+                    else:
+                        total_belum += nilai
+                        count_belum += 1
+                print(f"[BG OMSET] {page}/{sp.get('pageCount',1)} total Rp {total_semua:,.0f}")
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+
+            msg = f"💰 *Total Penjualan - {label}*\n\n"
+            msg += f"Total invoice: {count_semua}\n"
+            msg += f"Total penjualan: Rp {total_semua:,.0f}\n\n"
+            msg += f"✅ Sudah lunas: {count_lunas} inv (Rp {total_lunas:,.0f})\n"
+            msg += f"⏳ Belum lunas: {count_belum} inv (Rp {total_belum:,.0f})\n\n"
+            msg += f"_⚠️ Nilai adalah total invoice. Jika ada partial payment, angka bisa sedikit berbeda dari Accurate._"
+            send_message(chat_id, msg)
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal hitung omset: {str(e)[:100]}")
+            print(f"[BG OMSET ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
+
+
+def tool_get_low_stock(host, chat_id, keyword, threshold=30):
+    def run():
+        try:
+            h = host if host.startswith("http") else f"https://{host}"
+            keyword_lower = keyword.lower()
+            keywords = keyword_lower.split()
+            matched = []
+            page = 1
+            while True:
+                r = requests.get(f"{h}/accurate/api/item/list.do", headers=accurate_headers(),
+                    params={"fields": "id,no,name,unitPrice,availableStock,unit", "sp.pageSize": 100, "sp.page": page}, timeout=20)
+                data = r.json()
+                if not data.get("s"): break
+                items = data.get("d", [])
+                sp = data.get("sp", {})
+                for item in items:
+                    name = (item.get("name") or "").lower()
+                    no = (item.get("no") or "").lower()
+                    if all(kw in name or kw in no for kw in keywords):
+                        matched.append(item)
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+
+            lock = threading.Lock()
+            low_items = []
+
+            def check_stock(item):
+                try:
+                    r2 = requests.get(f"{h}/accurate/api/item/detail.do", headers=accurate_headers(), params={"id": item["id"]}, timeout=10)
+                    detail = r2.json().get("d", {})
+                    stock = detail.get("balance")
+                    if stock is None: stock = detail.get("availableStock") or 0
+                    stock = float(stock)
+                    print(f"[LOW STOCK CHECK] {item['name']} stock={stock}")
+                    if stock < threshold:
+                        with lock:
+                            low_items.append({"name": item["name"], "stock": stock})
+                except Exception as e:
+                    print(f"[LOW STOCK ERROR] {e}")
+
+            with ThreadPoolExecutor(max_workers=10) as ex:
+                list(ex.map(check_stock, matched))
+
+            if not low_items:
+                send_message(chat_id, f"✅ Tidak ada produk '{keyword}' dengan stok di bawah {threshold:.0f} pcs. Semua aman!")
+                return
+
+            low_items.sort(key=lambda x: x["stock"])
+            msg = f"⚠️ *Stok Menipis '{keyword}' (di bawah {threshold:.0f} pcs)*\n\n"
+            msg += f"Ditemukan {len(low_items)} produk:\n\n"
+            for it in low_items:
+                msg += f"• {it['name']}: {it['stock']:,.0f} pcs\n"
+            send_message(chat_id, msg)
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal cek stok: {str(e)[:100]}")
+            print(f"[LOW STOCK BG ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
+
+
+def tool_get_overdue_customers(host, chat_id, days=30):
+    def run():
+        try:
+            h = host if host.startswith("http") else f"https://{host}"
+            today = datetime.datetime.utcnow() + datetime.timedelta(hours=7)
+            cutoff = today - datetime.timedelta(days=days)
+            lock = threading.Lock()
+            overdue = {}
+            all_invoices = []
+            page = 1
+
+            while True:
+                params = {"fields": "id,number,totalAmount,subTotal,retailWpName,dueDate,statusName",
+                    "sp.pageSize": 200, "sp.page": page, "filter.status": "OPEN"}
+                r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+                data = r.json()
+                if not data.get("s"): break
+                page_data = data.get("d", [])
+                sp = data.get("sp", {})
+                all_invoices.extend(page_data)
+                print(f"[BG OVERDUE] page {page}/{sp.get('pageCount',1)} loaded={len(all_invoices)}")
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+
+            def parse_date(s):
+                if not s: return None
+                for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+                    try: return datetime.datetime.strptime(s.split(" ")[0], fmt)
+                    except: continue
+                return None
+
+            def enrich(inv):
+                try:
+                    due = parse_date(inv.get("dueDate"))
+                    if due is None or due > cutoff:
+                        return
+                    r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=10)
+                    detail = r2.json().get("d", {})
+                    customer = detail.get("customer")
+                    if isinstance(customer, dict): cname = customer.get("name")
+                    elif isinstance(customer, list) and customer: cname = customer[0].get("name") if isinstance(customer[0], dict) else None
+                    else: cname = None
+                    name = detail.get("retailWpName") or detail.get("customerName") or cname or "-"
+                    nilai = float(detail.get("totalAmount") or inv.get("totalAmount") or 0)
+                    hari_lewat = (today - due).days
+                    if name and name != "-":
+                        with lock:
+                            if name not in overdue: overdue[name] = {"count": 0, "total": 0.0, "max_days": 0}
+                            overdue[name]["count"] += 1
+                            overdue[name]["total"] += nilai
+                            overdue[name]["max_days"] = max(overdue[name]["max_days"], hari_lewat)
+                except: pass
+
+            with ThreadPoolExecutor(max_workers=15) as ex:
+                list(ex.map(enrich, all_invoices))
+
+            if not overdue:
+                send_message(chat_id, f"✅ Tidak ada customer yang menunggak lebih dari {days} hari dari jatuh tempo. Bagus!")
+                return
+
+            sorted_cust = sorted(overdue.items(), key=lambda x: x[1]["total"], reverse=True)
+            total_nilai = sum(v["total"] for v in overdue.values())
+            msg = f"🚨 *Customer Nunggak > {days} Hari (dari jatuh tempo)*\n\n"
+            msg += f"Jumlah customer: {len(overdue)}\n"
+            msg += f"Total tagihan tertunggak: Rp {total_nilai:,.0f}\n\n"
+            msg += f"*Daftar (urut nilai terbesar):*\n"
+            for name, d in sorted_cust[:30]:
+                msg += f"• {name} — {d['count']} inv | Rp {d['total']:,.0f} | telat {d['max_days']} hari\n"
+            if len(sorted_cust) > 30: msg += f"\n_...dan {len(sorted_cust)-30} customer lainnya_"
+            send_message(chat_id, msg)
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal cek tunggakan: {str(e)[:100]}")
+            print(f"[BG OVERDUE ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
+
+
 # ============================================================
 # CLAUDE TOOLS DEFINITION
 # ============================================================
@@ -583,6 +779,41 @@ TOOLS = [
                 "label": {"type": "string", "description": "Label periode"}
             }
         }
+    },
+    {
+        "name": "get_omset_summary",
+        "description": "Hitung TOTAL pendapatan/omset/penjualan satu periode dengan membaca SEMUA invoice (semua halaman, bukan cuma 100). WAJIB pakai tool ini untuk pertanyaan total omset/pendapatan/penjualan per bulan atau per periode, contoh 'berapa pendapatan Juni', 'total penjualan bulan ini', 'omset Mei'. JANGAN pakai get_invoices untuk menghitung total omset karena get_invoices dibatasi 100 invoice. Background 2-3 menit, hasil dikirim otomatis ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD/MM/YYYY"},
+                "date_to": {"type": "string", "description": "DD/MM/YYYY"},
+                "label": {"type": "string", "description": "Label periode, contoh 'Juni 2026'"}
+            },
+            "required": ["date_from", "date_to"]
+        }
+    },
+    {
+        "name": "get_low_stock",
+        "description": "Cek produk kategori tertentu yang stoknya MENIPIS (di bawah ambang batas, default 30 pcs). Untuk 'stok tumbler yang menipis', 'tumbler di bawah 30 pcs', 'mug yang hampir habis'. User HARUS sebut kategori produk (tumbler, mug, banner, dll). Background, hasil dikirim ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "keyword": {"type": "string", "description": "Kategori/nama produk, contoh 'tumbler'"},
+                "threshold": {"type": "integer", "description": "Ambang batas stok menipis, default 30"}
+            },
+            "required": ["keyword"]
+        }
+    },
+    {
+        "name": "get_overdue_customers",
+        "description": "Daftar customer yang menunggak / belum bayar dan sudah LEWAT jatuh tempo lebih dari sekian hari (default 30 hari dari dueDate). Untuk 'siapa yang nunggak lebih dari 30 hari', 'customer telat bayar', 'tunggakan jatuh tempo'. Background 2-3 menit, hasil dikirim ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "description": "Jumlah hari lewat jatuh tempo, default 30"}
+            }
+        }
     }
 ]
 
@@ -592,14 +823,20 @@ Gunakan tools untuk ambil data real-time dari Accurate. Jawab dalam Bahasa Indon
 Format angka: Rp 1.500.000. Jangan panggil tool lebih dari 3x per pertanyaan.
 
 PENTING soal efisiensi:
-- Untuk pertanyaan omset/penjualan/daftar invoice, cukup panggil get_invoices SATU KALI. Hasilnya sudah berisi nama customer dan nilai. JANGAN panggil get_invoice_detail berulang-ulang setelah get_invoices.
+- Untuk pertanyaan omset/penjualan/daftar invoice harian (hari ini, kemarin), cukup panggil get_invoices SATU KALI. Hasilnya sudah berisi nama customer dan nilai. JANGAN panggil get_invoice_detail berulang-ulang setelah get_invoices.
 - get_invoice_detail hanya dipakai kalau user minta rincian item produk di dalam satu invoice tertentu.
 
-Tools background (hasilnya dikirim otomatis ke Telegram setelah selesai):
+SANGAT PENTING soal total omset/pendapatan bulanan:
+- Untuk pertanyaan TOTAL pendapatan/omset/penjualan satu bulan atau periode (contoh 'berapa pendapatan Juni', 'total penjualan bulan ini'), WAJIB pakai get_omset_summary. JANGAN pakai get_invoices untuk menjumlahkan omset bulanan, karena get_invoices hanya mengambil 100 invoice dari ratusan/ribuan yang ada, sehingga hasilnya SALAH dan terlalu kecil.
+
+Tools background (hasilnya dikirim otomatis ke Telegram setelah selesai, beri tahu user untuk menunggu):
+- get_omset_summary: total pendapatan/omset satu periode, baca semua invoice (2-3 menit)
 - get_top_products_background: rekap SEMUA produk terlaris (5-10 menit)
 - get_sales_per_item: penjualan produk tertentu (3-5 menit)  
 - get_unpaid_customers_background: daftar customer belum bayar (2-3 menit)
 - get_piutang_summary: total piutang (2-3 menit)
+- get_low_stock: produk yang stoknya menipis di bawah ambang batas (perlu sebut kategori produk)
+- get_overdue_customers: customer yang nunggak lewat jatuh tempo > sekian hari
 
 Tanggal hari ini: {today}"""
 
@@ -663,6 +900,12 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_get_unpaid_customers_background(host, chat_id, tool_input.get("date_from"), tool_input.get("date_to"), tool_input.get("label",""))
                 elif tool_name == "get_piutang_summary":
                     result = tool_get_piutang_summary(host, chat_id, tool_input.get("date_from"), tool_input.get("date_to"), tool_input.get("label","Semua Periode"))
+                elif tool_name == "get_omset_summary":
+                    result = tool_get_omset_summary(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
+                elif tool_name == "get_low_stock":
+                    result = tool_get_low_stock(host, chat_id, tool_input["keyword"], tool_input.get("threshold", 30))
+                elif tool_name == "get_overdue_customers":
+                    result = tool_get_overdue_customers(host, chat_id, tool_input.get("days", 30))
                 else:
                     result = json.dumps({"error": f"Unknown tool: {tool_name}"})
 
