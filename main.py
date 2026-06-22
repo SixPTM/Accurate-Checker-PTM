@@ -1079,5 +1079,34 @@ def debug_item():
         return {"error": str(e)}, 500
 
 
+@app.route("/debug-invoice", methods=["GET"])
+def debug_invoice():
+    try:
+        host = get_host()
+        if not host: return {"error": "Gagal dapat host"}, 500
+        h = host if host.startswith("http") else f"https://{host}"
+        # Ambil 1 invoice OPEN
+        r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(),
+            params={"fields": "id,number,totalAmount,outstanding", "sp.pageSize": 1, "sp.page": 1, "filter.status": "OPEN"}, timeout=15)
+        lst = r.json().get("d", [])
+        if not lst:
+            return {"error": "Tidak ada invoice OPEN"}, 404
+        inv_id = lst[0]["id"]
+        list_fields = lst[0]
+        # Ambil detail lengkap invoice itu untuk lihat SEMUA field
+        r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(),
+            params={"id": inv_id}, timeout=15)
+        detail = r2.json().get("d", {})
+        # Tampilkan hanya field bertipe angka + nama field, biar mudah dibaca
+        money_fields = {k: v for k, v in detail.items() if isinstance(v, (int, float))}
+        return {
+            "from_list_endpoint": list_fields,
+            "detail_money_fields": money_fields,
+            "detail_all_keys": sorted(list(detail.keys()))
+        }
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
