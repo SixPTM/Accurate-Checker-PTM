@@ -51,10 +51,24 @@ def get_host():
         return None
 
 def send_message(chat_id, text):
+    if not text or not text.strip():
+        text = "Maaf, tidak ada jawaban yang bisa ditampilkan."
+    # Coba kirim dengan Markdown dulu
     try:
-        requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=10)
+        r = requests.post(f"{TELEGRAM_API}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=10)
+        if r.status_code == 200:
+            return
+        print(f"[SEND MARKDOWN FAIL] {r.status_code} {r.text[:200]}")
     except Exception as e:
-        print(f"[SEND ERROR] {e}")
+        print(f"[SEND ERROR markdown] {e}")
+    # Kalau Markdown gagal, kirim ulang sebagai teks biasa (tanpa parse_mode)
+    try:
+        r = requests.post(f"{TELEGRAM_API}/sendMessage",
+            json={"chat_id": chat_id, "text": text}, timeout=10)
+        print(f"[SEND PLAIN] status={r.status_code} {r.text[:200] if r.status_code != 200 else 'ok'}")
+    except Exception as e:
+        print(f"[SEND ERROR plain] {e}")
 
 def send_file_to_telegram(chat_id, file_bytes, filename, caption=""):
     try:
@@ -474,7 +488,7 @@ def tool_get_piutang_summary(host, chat_id, date_from=None, date_to=None, label=
 TOOLS = [
     {
         "name": "get_invoices",
-        "description": "Ambil daftar sales invoice dari Accurate Online. Filter by status (OPEN=belum lunas, CLOSED=lunas), tanggal, keyword customer.",
+        "description": "Ambil daftar sales invoice dari Accurate Online. Filter by status (OPEN=belum lunas, CLOSED=lunas), tanggal, keyword customer. PENTING: hasil tool ini SUDAH otomatis berisi nama customer (customerName), outstanding, dan totalAmount untuk maksimal 20 invoice pertama. JANGAN panggil get_invoice_detail lagi untuk invoice-invoice ini kecuali user minta rincian item produk di dalam satu invoice spesifik.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -488,7 +502,7 @@ TOOLS = [
     },
     {
         "name": "get_invoice_detail",
-        "description": "Ambil detail lengkap satu invoice termasuk item produk.",
+        "description": "Ambil detail lengkap SATU invoice termasuk rincian item produk. Hanya gunakan jika user minta isi/rincian produk dari satu invoice tertentu. Untuk omset/daftar invoice biasa, get_invoices saja sudah cukup.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -577,6 +591,10 @@ SYSTEM_PROMPT = """Kamu adalah asisten keuangan dan operasional untuk perusahaan
 Gunakan tools untuk ambil data real-time dari Accurate. Jawab dalam Bahasa Indonesia, ramah, gunakan emoji.
 Format angka: Rp 1.500.000. Jangan panggil tool lebih dari 3x per pertanyaan.
 
+PENTING soal efisiensi:
+- Untuk pertanyaan omset/penjualan/daftar invoice, cukup panggil get_invoices SATU KALI. Hasilnya sudah berisi nama customer dan nilai. JANGAN panggil get_invoice_detail berulang-ulang setelah get_invoices.
+- get_invoice_detail hanya dipakai kalau user minta rincian item produk di dalam satu invoice tertentu.
+
 Tools background (hasilnya dikirim otomatis ke Telegram setelah selesai):
 - get_top_products_background: rekap SEMUA produk terlaris (5-10 menit)
 - get_sales_per_item: penjualan produk tertentu (3-5 menit)  
@@ -604,7 +622,7 @@ def handle_with_claude(chat_id, user_text, host):
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
             json={"model": "claude-sonnet-4-6", "max_tokens": 4096, "system": system, "tools": TOOLS, "messages": messages},
-            timeout=30
+            timeout=60
         )
         response = r.json()
         if "content" not in response:
@@ -674,7 +692,10 @@ def webhook():
         send_message(chat_id, "Percakapan direset! ✅")
         return "ok", 200
 
-    requests.post(f"{TELEGRAM_API}/sendChatAction", json={"chat_id": chat_id, "action": "typing"})
+    try:
+        requests.post(f"{TELEGRAM_API}/sendChatAction", json={"chat_id": chat_id, "action": "typing"}, timeout=10)
+    except Exception:
+        pass
     try:
         host = get_host()
         if not host:
