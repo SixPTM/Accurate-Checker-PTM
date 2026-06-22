@@ -428,19 +428,20 @@ def tool_get_unpaid_customers_background(host, chat_id, date_from=None, date_to=
                 try:
                     r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=10)
                     detail = r2.json().get("d", {})
+                    owing = float(detail.get("primeOwing") or 0)
+                    if owing <= 0:
+                        return
                     customer = detail.get("customer")
                     if isinstance(customer, dict): cname = customer.get("name")
                     elif isinstance(customer, list) and customer: cname = customer[0].get("name") if isinstance(customer[0], dict) else None
                     else: cname = None
-                    name = detail.get("retailWpName") or detail.get("customerName") or cname or "-"
-                    total = float(detail.get("totalAmount") or inv.get("totalAmount") or 0)
-                    outstanding = float(detail.get("outstanding") or 0)
-                    if name and name != "-":
+                    name = detail.get("retailWpName") or detail.get("customerName") or cname or "Tanpa Nama"
+                    if name:
                         with lock:
                             if name not in customer_data: customer_data[name] = {"count": 0, "total": 0.0, "outstanding": 0.0}
                             customer_data[name]["count"] += 1
-                            customer_data[name]["total"] += total
-                            customer_data[name]["outstanding"] += outstanding
+                            customer_data[name]["total"] += owing
+                            customer_data[name]["outstanding"] += owing
                 except: pass
 
             with ThreadPoolExecutor(max_workers=15) as ex:
@@ -448,16 +449,13 @@ def tool_get_unpaid_customers_background(host, chat_id, date_from=None, date_to=
 
             sorted_customers = sorted(customer_data.items(), key=lambda x: x[1]["outstanding"], reverse=True)
             total_outstanding = sum(v["outstanding"] for v in customer_data.values())
-            total_nilai = sum(v["total"] for v in customer_data.values())
 
             msg = f"✅ *Customer Belum Bayar - {label}*\n\n"
             msg += f"Total invoice OPEN: {total_invoice}\n"
-            msg += f"Total nilai: Rp {total_nilai:,.0f}\n"
-            if total_outstanding > 0: msg += f"Total outstanding: Rp {total_outstanding:,.0f}\n"
-            msg += f"Jumlah customer: {len(customer_data)}\n\n*Daftar (urut outstanding terbesar):*\n"
+            msg += f"Total sisa tagihan: Rp {total_outstanding:,.0f}\n"
+            msg += f"Jumlah customer (masih ada sisa): {len(customer_data)}\n\n*Daftar (urut sisa tagihan terbesar):*\n"
             for name, d in sorted_customers[:30]:
-                outstanding_str = f" | Sisa: Rp {d['outstanding']:,.0f}" if d['outstanding'] > 0 else ""
-                msg += f"• {name} — {d['count']} inv{outstanding_str}\n"
+                msg += f"• {name} — {d['count']} inv | Sisa: Rp {d['outstanding']:,.0f}\n"
             if len(sorted_customers) > 30: msg += f"\n_...dan {len(sorted_customers)-30} customer lainnya_"
             send_message(chat_id, msg)
         except Exception as e:
@@ -473,11 +471,14 @@ def tool_get_piutang_summary(host, chat_id, date_from=None, date_to=None, label=
     def run():
         try:
             h = host if host.startswith("http") else f"https://{host}"
-            total_nilai = 0.0
-            total_invoice = 0
+            lock = threading.Lock()
+            total_owing = [0.0]
+            count_berisa = [0]
+            all_invoices = []
             page = 1
+            total_invoice = 0
             while True:
-                params = {"fields": "id,totalAmount,subTotal", "sp.pageSize": 200, "sp.page": page, "filter.status": "OPEN"}
+                params = {"fields": "id,number", "sp.pageSize": 200, "sp.page": page, "filter.status": "OPEN"}
                 if date_from:
                     params["filter.transDate.op"] = "BETWEEN"
                     params["filter.transDate.val[0]"] = date_from
@@ -488,16 +489,34 @@ def tool_get_piutang_summary(host, chat_id, date_from=None, date_to=None, label=
                 page_data = data.get("d", [])
                 sp = data.get("sp", {})
                 if page == 1: total_invoice = sp.get("rowCount", 0)
-                for inv in page_data:
-                    total_nilai += float(inv.get("totalAmount") or inv.get("subTotal") or 0)
-                print(f"[BG PIUTANG] {page}/{sp.get('pageCount',1)} Rp {total_nilai:,.0f}")
+                all_invoices.extend(page_data)
+                print(f"[BG PIUTANG] list {page}/{sp.get('pageCount',1)} loaded={len(all_invoices)}")
                 if page >= sp.get("pageCount", 1): break
                 page += 1
 
-            msg = f"✅ *Piutang Belum Lunas - {label}*\n\nTotal invoice: {total_invoice}\nTotal nilai: Rp {total_nilai:,.0f}\n\n_⚠️ Nilai adalah total invoice. Jika ada partial payment, angka bisa sedikit berbeda dari Accurate._"
+            def get_owing(inv):
+                try:
+                    r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=10)
+                    detail = r2.json().get("d", {})
+                    owing = float(detail.get("primeOwing") or 0)
+                    if owing > 0:
+                        with lock:
+                            total_owing[0] += owing
+                            count_berisa[0] += 1
+                except: pass
+
+            with ThreadPoolExecutor(max_workers=15) as ex:
+                list(ex.map(get_owing, all_invoices))
+
+            msg = f"✅ *Piutang Belum Lunas - {label}*\n\n"
+            msg += f"Total invoice status OPEN: {total_invoice}\n"
+            msg += f"Invoice yang masih ada sisa: {count_berisa[0]}\n"
+            msg += f"Total sisa tagihan: Rp {total_owing[0]:,.0f}\n\n"
+            msg += f"_Sisa tagihan dihitung dari field primeOwing (sisa yang benar-benar belum dibayar), bukan nilai penuh invoice._"
             send_message(chat_id, msg)
         except Exception as e:
             send_message(chat_id, f"❌ Gagal: {str(e)[:100]}")
+            print(f"[BG PIUTANG ERROR] {e}")
 
     t = threading.Thread(target=run)
     t.daemon = True
@@ -659,18 +678,20 @@ def tool_get_overdue_customers(host, chat_id, days=30):
                         return
                     r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=10)
                     detail = r2.json().get("d", {})
+                    owing = float(detail.get("primeOwing") or 0)
+                    if owing <= 0:
+                        return
                     customer = detail.get("customer")
                     if isinstance(customer, dict): cname = customer.get("name")
                     elif isinstance(customer, list) and customer: cname = customer[0].get("name") if isinstance(customer[0], dict) else None
                     else: cname = None
-                    name = detail.get("retailWpName") or detail.get("customerName") or cname or "-"
-                    nilai = float(detail.get("totalAmount") or inv.get("totalAmount") or 0)
+                    name = detail.get("retailWpName") or detail.get("customerName") or cname or "Tanpa Nama"
                     hari_lewat = (today - due).days
-                    if name and name != "-":
+                    if name:
                         with lock:
                             if name not in overdue: overdue[name] = {"count": 0, "total": 0.0, "max_days": 0}
                             overdue[name]["count"] += 1
-                            overdue[name]["total"] += nilai
+                            overdue[name]["total"] += owing
                             overdue[name]["max_days"] = max(overdue[name]["max_days"], hari_lewat)
                 except: pass
 
@@ -731,29 +752,31 @@ def tool_get_unpaid_invoices_detail(host, chat_id, date_from=None, date_to=None,
                 try:
                     r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=10)
                     detail = r2.json().get("d", {})
+                    owing = float(detail.get("primeOwing") or 0)
+                    if owing <= 0:
+                        return
                     customer = detail.get("customer")
                     if isinstance(customer, dict): cname = customer.get("name")
                     elif isinstance(customer, list) and customer: cname = customer[0].get("name") if isinstance(customer[0], dict) else None
                     else: cname = None
                     name = detail.get("retailWpName") or detail.get("customerName") or cname or "Tanpa Nama"
-                    nilai = float(detail.get("totalAmount") or inv.get("totalAmount") or 0)
                     number = detail.get("number") or inv.get("number") or "-"
                     with lock:
-                        rows.append({"number": number, "name": name, "nilai": nilai})
+                        rows.append({"number": number, "name": name, "nilai": owing})
                 except: pass
 
             with ThreadPoolExecutor(max_workers=15) as ex:
                 list(ex.map(enrich, all_invoices))
 
             if not rows:
-                send_message(chat_id, f"✅ Tidak ada invoice belum bayar untuk {label}.")
+                send_message(chat_id, f"✅ Tidak ada invoice dengan sisa tagihan untuk {label}.")
                 return
 
             rows.sort(key=lambda x: x["nilai"], reverse=True)
             total_nilai = sum(x["nilai"] for x in rows)
             header = f"📋 *Invoice Belum Bayar - {label}*\n\n"
-            header += f"Jumlah invoice: {len(rows)}\n"
-            header += f"Total nilai: Rp {total_nilai:,.0f}\n\n*Daftar (urut nilai terbesar):*\n"
+            header += f"Jumlah invoice (ada sisa): {len(rows)}\n"
+            header += f"Total sisa tagihan: Rp {total_nilai:,.0f}\n\n*Daftar (urut sisa terbesar):*\n"
             msg = header
             for x in rows:
                 msg += f"• {x['number']} | {x['name']} | Rp {x['nilai']:,.0f}\n"
