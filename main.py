@@ -1175,26 +1175,21 @@ def debug_sales():
         host = get_host()
         if not host: return {"error": "Gagal dapat host"}, 500
         h = host if host.startswith("http") else f"https://{host}"
-        # Ambil 5 invoice terbaru
+        # Ambil 8 invoice Juni 2026
         r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(),
-            params={"fields": "id,number,masterSalesmanName,masterSalesmanId", "sp.pageSize": 5, "sp.page": 1,
-                "sp.sort": "transDate", "sp.sortOrder": "DESC"}, timeout=15)
+            params={"fields": "id,number,masterSalesmanName,masterSalesmanId", "sp.pageSize": 8, "sp.page": 1,
+                "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": "01/06/2026", "filter.transDate.val[1]": "30/06/2026"}, timeout=15)
         list_data = r.json().get("d", [])
         hasil = []
         for inv in list_data:
             r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(),
                 params={"id": inv["id"]}, timeout=15)
             detail = r2.json().get("d", {})
-            salesman = detail.get("salesman")
-            salesmanList = detail.get("detailSalesman") or detail.get("salesmanList")
             hasil.append({
                 "number": inv.get("number"),
                 "list_masterSalesmanName": inv.get("masterSalesmanName"),
-                "list_masterSalesmanId": inv.get("masterSalesmanId"),
                 "detail_masterSalesmanName": detail.get("masterSalesmanName"),
-                "detail_masterSalesmanId": detail.get("masterSalesmanId"),
-                "detail_salesman_field": salesman,
-                "detail_salesmanList_field": salesmanList
+                "detail_masterSalesmanId": detail.get("masterSalesmanId")
             })
         return {"hasil": hasil}
     except Exception as e:
