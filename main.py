@@ -1356,24 +1356,44 @@ def debug_finance():
         host = get_host()
         if not host: return {"error": "Gagal dapat host"}, 500
         h = host if host.startswith("http") else f"https://{host}"
-        # Ambil beberapa produk, lihat semua field harga/biaya dari detail
-        r = requests.get(f"{h}/accurate/api/item/list.do", headers=accurate_headers(),
-            params={"fields": "id,no,name", "sp.pageSize": 5, "sp.page": 1}, timeout=15)
-        items = r.json().get("d", [])
-        hasil = []
-        for it in items:
-            r2 = requests.get(f"{h}/accurate/api/item/detail.do", headers=accurate_headers(), params={"id": it["id"]}, timeout=15)
-            detail = r2.json().get("d", {})
-            # Kumpulkan semua field yang ada kata "price"/"cost" + beberapa kandidat
-            harga_fields = {k: v for k, v in detail.items()
-                            if isinstance(v, (int, float)) and ("price" in k.lower() or "cost" in k.lower())}
-            hasil.append({
-                "no": it.get("no"),
-                "name": it.get("name"),
-                "field_harga_biaya": harga_fields,
-                "balance": detail.get("balance")
-            })
-        return {"hasil": hasil}
+        # Scan beberapa invoice Juni, cari item yang namanya mengandung 'sultan',
+        # tampilkan itemName PERSIS seperti tersimpan di detailItem
+        all_ids = []
+        page = 1
+        while True and page <= 3:
+            params = {"fields": "id", "sp.pageSize": 200, "sp.page": page,
+                "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": "01/06/2026", "filter.transDate.val[1]": "30/06/2026"}
+            r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+            data = r.json()
+            if not data.get("s"): break
+            all_ids.extend(data.get("d", []))
+            sp = data.get("sp", {})
+            if page >= sp.get("pageCount", 1): break
+            page += 1
+
+        contoh_itemnames = set()
+        sultan_found = []
+        for inv in all_ids[:300]:
+            try:
+                r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=10)
+                detail = r2.json().get("d", {})
+                items = detail.get("detailItem", [])
+                if not isinstance(items, list): continue
+                for item in items:
+                    if not isinstance(item, dict): continue
+                    nm = item.get("itemName") or ""
+                    if len(contoh_itemnames) < 10:
+                        contoh_itemnames.add(nm)
+                    if "sultan" in nm.lower():
+                        sultan_found.append({"itemName": nm, "qty": item.get("quantity"), "amount": item.get("amount"), "keys": list(item.keys())[:15]})
+                if len(sultan_found) >= 5:
+                    break
+            except: pass
+
+        return {
+            "contoh_itemName_apa_adanya": list(contoh_itemnames),
+            "sultan_ditemukan": sultan_found[:5]
+        }
     except Exception as e:
         return {"error": str(e)}, 500
 
