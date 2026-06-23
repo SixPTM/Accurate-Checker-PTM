@@ -144,19 +144,31 @@ def tool_get_invoices(host, params):
         if data.get("s") and data.get("d"):
             invoices = data["d"]
             def enrich(inv):
-                try:
-                    r2 = requests.get(f"{host}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=10)
-                    detail = r2.json().get("d", {})
-                    customer = detail.get("customer")
-                    if isinstance(customer, dict): cname = customer.get("name")
-                    elif isinstance(customer, list) and customer: cname = customer[0].get("name") if isinstance(customer[0], dict) else str(customer[0])
-                    else: cname = None
-                    inv["customerName"] = detail.get("retailWpName") or detail.get("customerName") or cname or "-"
-                    inv["outstanding"] = detail.get("outstanding") or 0
-                    inv["totalAmount"] = detail.get("totalAmount") or inv.get("totalAmount") or 0
-                except: inv["customerName"] = "-"
-            with ThreadPoolExecutor(max_workers=10) as ex:
-                list(ex.map(enrich, invoices[:20]))
+                detail = None
+                for attempt in range(3):
+                    try:
+                        r2 = requests.get(f"{host}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=12)
+                        d = r2.json()
+                        if d.get("s") and d.get("d"):
+                            detail = d["d"]
+                            break
+                    except Exception:
+                        pass
+                if detail is None:
+                    inv["customerName"] = "(gagal baca)"
+                    return
+                customer = detail.get("customer")
+                if isinstance(customer, dict): cname = customer.get("name")
+                elif isinstance(customer, list) and customer: cname = customer[0].get("name") if isinstance(customer[0], dict) else str(customer[0])
+                else: cname = None
+                inv["customerName"] = detail.get("retailWpName") or detail.get("customerName") or cname or "Tanpa Nama"
+                inv["outstanding"] = detail.get("primeOwing") or 0
+                inv["totalAmount"] = detail.get("totalAmount") or inv.get("totalAmount") or 0
+            # Enrich semua invoice yang terambil bila jumlahnya wajar (mis. harian/mingguan).
+            # Kalau terlalu banyak (>120), enrich 50 pertama saja agar tidak lama/timeout.
+            target = invoices if len(invoices) <= 120 else invoices[:50]
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                list(ex.map(enrich, target))
 
         return json.dumps(data, ensure_ascii=False)
     except Exception as e:
@@ -793,6 +805,129 @@ def tool_get_unpaid_invoices_detail(host, chat_id, date_from=None, date_to=None,
     return json.dumps({"status": "background_started"})
 
 
+def tool_get_product_profit(host, chat_id, keyword, date_from, date_to):
+    def run():
+        try:
+            h = host if host.startswith("http") else f"https://{host}"
+            kw_lower = keyword.lower()
+            keywords = kw_lower.split()
+
+            # 1. Ambil harga modal (balanceUnitCost) tiap varian produk dari master item
+            modal_map = {}
+            page = 1
+            while True:
+                r = requests.get(f"{h}/accurate/api/item/list.do", headers=accurate_headers(),
+                    params={"fields": "id,no,name", "sp.pageSize": 100, "sp.page": page}, timeout=20)
+                data = r.json()
+                if not data.get("s"): break
+                items = data.get("d", [])
+                sp = data.get("sp", {})
+                cocok = []
+                for it in items:
+                    nm = (it.get("name") or "").lower()
+                    no = (it.get("no") or "").lower()
+                    # Cocokkan longgar: hilangkan 'tumbler/tumblr' agar 'tumbler sultan' = 'tumblr sultan'
+                    nm_norm = nm.replace("tumbler", "tumblr")
+                    kws = [k.replace("tumbler", "tumblr") for k in keywords]
+                    if all(k in nm_norm or k in no for k in kws):
+                        cocok.append(it)
+                lock0 = threading.Lock()
+                def amb(it):
+                    try:
+                        r2 = requests.get(f"{h}/accurate/api/item/detail.do", headers=accurate_headers(), params={"id": it["id"]}, timeout=10)
+                        det = r2.json().get("d", {})
+                        modal = float(det.get("balanceUnitCost") or 0)
+                        with lock0:
+                            modal_map[it["name"]] = modal
+                    except: pass
+                with ThreadPoolExecutor(max_workers=8) as ex:
+                    list(ex.map(amb, cocok))
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+
+            if not modal_map:
+                send_message(chat_id, f"❌ Produk '{keyword}' tidak ditemukan di master produk.")
+                return
+
+            # 2. Scan invoice periode, kumpulkan qty & nilai jual produk tsb
+            lock = threading.Lock()
+            jual_qty = {}
+            jual_total = {}
+            all_ids = []
+            page = 1
+            while True:
+                params = {"fields": "id", "sp.pageSize": 200, "sp.page": page,
+                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
+                r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+                data = r.json()
+                if not data.get("s"): break
+                all_ids.extend(data.get("d", []))
+                sp = data.get("sp", {})
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+
+            def scan(inv):
+                try:
+                    r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=10)
+                    detail = r2.json().get("d", {})
+                    items = detail.get("detailItem", [])
+                    if not isinstance(items, list): return
+                    for item in items:
+                        if not isinstance(item, dict): continue
+                        nm = (item.get("itemName") or "").lower().replace("tumbler", "tumblr")
+                        kws = [k.replace("tumbler", "tumblr") for k in keywords]
+                        if all(k in nm for k in kws):
+                            qty = float(item.get("quantity") or item.get("qty") or 0)
+                            amount = float(item.get("amount") or 0)
+                            realname = item.get("itemName") or "-"
+                            with lock:
+                                jual_qty[realname] = jual_qty.get(realname, 0) + qty
+                                jual_total[realname] = jual_total.get(realname, 0) + amount
+                except: pass
+
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                list(ex.map(scan, all_ids))
+
+            if not jual_qty:
+                send_message(chat_id, f"❌ Tidak ada penjualan '{keyword}' di periode {date_from} - {date_to}. (Harga modal tetap bisa dicek lewat 'harga modal {keyword}')")
+                return
+
+            # 3. Hitung profit
+            total_qty = sum(jual_qty.values())
+            total_jual = sum(jual_total.values())
+            # Modal total = sum(qty terjual * modal per unit varian)
+            total_modal = 0.0
+            for nm, qty in jual_qty.items():
+                modal_unit = modal_map.get(nm, 0)
+                total_modal += qty * modal_unit
+            laba = total_jual - total_modal
+            margin = (laba / total_jual * 100) if total_jual > 0 else 0
+
+            msg = f"📊 *Analisa Profit '{keyword}' ({date_from} - {date_to})*\n\n"
+            msg += f"Qty terjual: {total_qty:,.0f} pcs\n"
+            msg += f"Total penjualan: Rp {total_jual:,.0f}\n"
+            msg += f"Total modal (HPP): Rp {total_modal:,.0f}\n"
+            msg += f"Laba kotor: Rp {laba:,.0f}\n"
+            msg += f"Margin profit: {margin:.1f}%\n\n*Per varian:*\n"
+            for nm in sorted(jual_qty, key=lambda x: jual_total.get(x,0), reverse=True):
+                qty = jual_qty[nm]
+                jual = jual_total.get(nm, 0)
+                modal_unit = modal_map.get(nm, 0)
+                jual_unit = (jual/qty) if qty else 0
+                m = ((jual_unit - modal_unit)/jual_unit*100) if jual_unit else 0
+                msg += f"• {nm}: jual Rp {jual_unit:,.0f}/pcs, modal Rp {modal_unit:,.0f}/pcs → margin {m:.0f}%\n"
+            msg += f"\n_Modal = rata-rata HPP Accurate (balanceUnitCost). Margin negatif bisa terjadi jika harga jual di bawah modal atau ada diskon._"
+            send_message(chat_id, msg)
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal hitung profit: {str(e)[:100]}")
+            print(f"[BG PROFIT ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
+
+
 def tool_get_sales_per_salesman(host, chat_id, date_from, date_to, label=""):
     def run():
         try:
@@ -1023,7 +1158,7 @@ TOOLS = [
     },
     {
         "name": "get_sales_per_salesman",
-        "description": "Rekap penjualan per tenaga penjual / sales / salesman di satu periode: nama tiap sales, total nilai penjualan, dan jumlah invoice. Untuk 'penjualan per sales', 'siapa saja sales-nya dan penjualannya berapa', 'rekap salesman Juni', 'tenaga penjual'. Background 1-2 menit, hasil dikirim ke Telegram.",
+        "description": "Rekap penjualan per tenaga penjual / sales / salesman di satu periode: nama tiap sales, total nilai penjualan, dan jumlah invoice. Untuk 'penjualan per sales', 'siapa saja sales-nya dan penjualannya berapa', 'rekap salesman Juni'. Background 3-5 menit, hasil dikirim ke Telegram.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1032,6 +1167,19 @@ TOOLS = [
                 "label": {"type": "string", "description": "Label periode, contoh 'Juni 2026'"}
             },
             "required": ["date_from", "date_to"]
+        }
+    },
+    {
+        "name": "get_product_profit",
+        "description": "Hitung PROFIT/MARGIN/KEUNTUNGAN produk tertentu: bandingkan harga modal (HPP) dengan harga jual dari invoice, hitung laba dan persen margin. Untuk 'berapa profit tumbler sultan', 'margin keuntungan produk X', 'bandingkan harga beli dan jual produk X'. Background 3-5 menit, hasil dikirim ke Telegram. Nama produk Accurate sering disingkat (Tumblr bukan Tumbler) tapi tool sudah menangani.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "keyword": {"type": "string", "description": "Nama produk, contoh 'sultan' atau 'tumbler sultan'"},
+                "date_from": {"type": "string", "description": "DD/MM/YYYY"},
+                "date_to": {"type": "string", "description": "DD/MM/YYYY"}
+            },
+            "required": ["keyword", "date_from", "date_to"]
         }
     }
 ]
@@ -1059,7 +1207,8 @@ Tools background (hasilnya dikirim otomatis ke Telegram setelah selesai, beri ta
 - get_sales_per_item: penjualan produk tertentu (3-5 menit)  
 - get_unpaid_customers_background: daftar customer belum bayar (2-3 menit)
 - get_unpaid_invoices_detail: daftar invoice belum bayar lengkap dengan nomor + nama + nilai (2-3 menit)
-- get_sales_per_salesman: rekap penjualan per tenaga penjual/sales (1-2 menit)
+- get_sales_per_salesman: rekap penjualan per tenaga penjual/sales (3-5 menit)
+- get_product_profit: hitung profit/margin produk (modal vs jual) (3-5 menit)
 - get_piutang_summary: total piutang (2-3 menit)
 - get_low_stock: produk yang stoknya menipis di bawah ambang batas (perlu sebut kategori produk)
 - get_overdue_customers: customer yang nunggak lewat jatuh tempo > sekian hari
@@ -1136,6 +1285,8 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_get_unpaid_invoices_detail(host, chat_id, tool_input.get("date_from"), tool_input.get("date_to"), tool_input.get("label",""))
                 elif tool_name == "get_sales_per_salesman":
                     result = tool_get_sales_per_salesman(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
+                elif tool_name == "get_product_profit":
+                    result = tool_get_product_profit(host, chat_id, tool_input["keyword"], tool_input["date_from"], tool_input["date_to"])
                 else:
                     result = json.dumps({"error": f"Unknown tool: {tool_name}"})
 
