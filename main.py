@@ -1203,34 +1203,24 @@ def debug_finance():
         host = get_host()
         if not host: return {"error": "Gagal dapat host"}, 500
         h = host if host.startswith("http") else f"https://{host}"
-        # Cek 3 invoice spesifik yang katanya "Tanpa Sales" tapi user bilang ada
-        target = ["SI.2026.06.00037", "SI.2026.06.00210", "SI.2026.06.00497"]
-        hasil = {}
-        for nomor in target:
-            try:
-                r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(),
-                    params={"fields": "id,number", "filter.keywords": nomor, "sp.pageSize": 1}, timeout=15)
-                lst = r.json().get("d", [])
-                if not lst:
-                    hasil[nomor] = {"error": "tidak ketemu di list"}
-                    continue
-                inv_id = lst[0]["id"]
-                r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv_id}, timeout=15)
-                detail = r2.json().get("d", {})
-                # Ambil semua field yang mungkin berisi nama orang/sales
-                hasil[nomor] = {
-                    "masterSalesmanName": detail.get("masterSalesmanName"),
-                    "masterSalesmanId": detail.get("masterSalesmanId"),
-                    "createdBy": detail.get("createdBy"),
-                    "cashierEmployeeName": detail.get("cashierEmployeeName"),
-                    "cashierEmployeeId": detail.get("cashierEmployeeId"),
-                    "printUserName": detail.get("printUserName"),
-                    "retailWpName": detail.get("retailWpName"),
-                    "detailItem_count": len(detail.get("detailItem", [])) if isinstance(detail.get("detailItem"), list) else "bukan list"
-                }
-            except Exception as e:
-                hasil[nomor] = {"error": str(e)[:200]}
-        return hasil
+        # Ambil beberapa produk, lihat semua field harga/biaya dari detail
+        r = requests.get(f"{h}/accurate/api/item/list.do", headers=accurate_headers(),
+            params={"fields": "id,no,name", "sp.pageSize": 5, "sp.page": 1}, timeout=15)
+        items = r.json().get("d", [])
+        hasil = []
+        for it in items:
+            r2 = requests.get(f"{h}/accurate/api/item/detail.do", headers=accurate_headers(), params={"id": it["id"]}, timeout=15)
+            detail = r2.json().get("d", {})
+            # Kumpulkan semua field yang ada kata "price"/"cost" + beberapa kandidat
+            harga_fields = {k: v for k, v in detail.items()
+                            if isinstance(v, (int, float)) and ("price" in k.lower() or "cost" in k.lower())}
+            hasil.append({
+                "no": it.get("no"),
+                "name": it.get("name"),
+                "field_harga_biaya": harga_fields,
+                "balance": detail.get("balance")
+            })
+        return {"hasil": hasil}
     except Exception as e:
         return {"error": str(e)}, 500
 
