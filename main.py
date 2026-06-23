@@ -1183,6 +1183,54 @@ def debug_item():
         return {"error": str(e)}, 500
 
 
+@app.route("/debug-nosales", methods=["GET"])
+def debug_nosales():
+    try:
+        host = get_host()
+        if not host: return {"error": "Gagal dapat host"}, 500
+        h = host if host.startswith("http") else f"https://{host}"
+        from concurrent.futures import ThreadPoolExecutor as TPE
+        all_invoices = []
+        page = 1
+        while True:
+            params = {"fields": "id,number", "sp.pageSize": 200, "sp.page": page,
+                "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": "01/06/2026", "filter.transDate.val[1]": "30/06/2026"}
+            r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+            data = r.json()
+            if not data.get("s"): break
+            all_invoices.extend(data.get("d", []))
+            sp = data.get("sp", {})
+            if page >= sp.get("pageCount", 1): break
+            page += 1
+
+        lock = threading.Lock()
+        no_sales = []
+        error_baca = []
+
+        def cek(inv):
+            try:
+                r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=10)
+                detail = r2.json().get("d", {})
+                nm = detail.get("masterSalesmanName")
+                if not nm or not str(nm).strip():
+                    with lock: no_sales.append(inv.get("number"))
+            except Exception:
+                with lock: error_baca.append(inv.get("number"))
+
+        with TPE(max_workers=15) as ex:
+            list(ex.map(cek, all_invoices))
+
+        return {
+            "total_invoice": len(all_invoices),
+            "jumlah_tanpa_sales": len(no_sales),
+            "jumlah_gagal_baca_detail": len(error_baca),
+            "daftar_nomor_tanpa_sales": sorted(no_sales),
+            "daftar_nomor_gagal_baca": sorted(error_baca)
+        }
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+
 @app.route("/debug-sales", methods=["GET"])
 def debug_sales():
     try:
