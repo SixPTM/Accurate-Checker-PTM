@@ -826,10 +826,13 @@ def tool_get_product_profit(host, chat_id, keyword, date_from, date_to):
                 for it in items:
                     nm = (it.get("name") or "").lower()
                     no = (it.get("no") or "").lower()
-                    # Cocokkan longgar: hilangkan 'tumbler/tumblr' agar 'tumbler sultan' = 'tumblr sultan'
                     nm_norm = nm.replace("tumbler", "tumblr")
-                    kws = [k.replace("tumbler", "tumblr") for k in keywords]
-                    if all(k in nm_norm or k in no for k in kws):
+                    no_norm = no.replace("tumbler", "tumblr")
+                    # Cocokkan longgar: abaikan kata 'tumbler/tumblr' (terlalu umum)
+                    kws = [k.replace("tumbler", "tumblr") for k in keywords if k.replace("tumbler","tumblr") != "tumblr"]
+                    if not kws:
+                        kws = [k.replace("tumbler", "tumblr") for k in keywords]
+                    if kws and all(k in nm_norm or k in no_norm for k in kws):
                         cocok.append(it)
                 lock0 = threading.Lock()
                 def amb(it):
@@ -868,18 +871,25 @@ def tool_get_product_profit(host, chat_id, keyword, date_from, date_to):
 
             def scan(inv):
                 try:
-                    r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=10)
+                    r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=12)
                     detail = r2.json().get("d", {})
                     items = detail.get("detailItem", [])
                     if not isinstance(items, list): return
                     for item in items:
                         if not isinstance(item, dict): continue
-                        nm = (item.get("itemName") or "").lower().replace("tumbler", "tumblr")
-                        kws = [k.replace("tumbler", "tumblr") for k in keywords]
-                        if all(k in nm for k in kws):
+                        # Nama item bisa di itemName, atau di objek item di dalamnya
+                        item_obj = item.get("item", {})
+                        if isinstance(item_obj, list): item_obj = item_obj[0] if item_obj else {}
+                        nm_raw = item.get("itemName") or (item_obj.get("name") if isinstance(item_obj, dict) else None) or ""
+                        nm = nm_raw.lower().replace("tumbler", "tumblr")
+                        # Cocokkan longgar: cukup semua kata kunci (selain 'tumbler') ada di nama
+                        kws = [k.replace("tumbler", "tumblr") for k in keywords if k.replace("tumbler","tumblr") != "tumblr"]
+                        if not kws:
+                            kws = [k.replace("tumbler", "tumblr") for k in keywords]
+                        if kws and all(k in nm for k in kws):
                             qty = float(item.get("quantity") or item.get("qty") or 0)
-                            amount = float(item.get("amount") or 0)
-                            realname = item.get("itemName") or "-"
+                            amount = float(item.get("amount") or item.get("totalAmount") or 0)
+                            realname = nm_raw or "-"
                             with lock:
                                 jual_qty[realname] = jual_qty.get(realname, 0) + qty
                                 jual_total[realname] = jual_total.get(realname, 0) + amount
