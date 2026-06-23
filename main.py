@@ -15,6 +15,8 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 ACCURATE_API_TOKEN = os.environ.get("ACCURATE_API_TOKEN")
 ACCURATE_SIGNATURE_SECRET = os.environ.get("ACCURATE_SIGNATURE_SECRET", "")
+GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
+GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID", "")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 ACCURATE_BASE_URL = "https://account.accurate.id/api"
@@ -1367,6 +1369,67 @@ def debug_item():
         return {"status": r.status_code, "response": r.json()}
     except Exception as e:
         return {"error": str(e)}, 500
+
+
+def get_drive_token():
+    """Ambil access token Google Drive dari service account (JWT flow)."""
+    from google.oauth2 import service_account
+    import google.auth.transport.requests
+    info = json.loads(GOOGLE_CREDENTIALS_JSON)
+    creds = service_account.Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/drive.readonly"])
+    creds.refresh(google.auth.transport.requests.Request())
+    return creds.token
+
+
+def drive_list_files(name_contains=None, page_size=1000):
+    """List file di folder GDRIVE_FOLDER_ID. Optional filter nama mengandung teks."""
+    token = get_drive_token()
+    q = f"'{GDRIVE_FOLDER_ID}' in parents and trashed=false"
+    if name_contains:
+        safe = name_contains.replace("'", "")
+        q += f" and name contains '{safe}'"
+    files = []
+    page_token = None
+    while True:
+        params = {"q": q, "fields": "nextPageToken,files(id,name,mimeType,size)",
+                  "pageSize": min(page_size, 1000), "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}
+        if page_token:
+            params["pageToken"] = page_token
+        r = requests.get("https://www.googleapis.com/drive/v3/files",
+                         headers={"Authorization": f"Bearer {token}"}, params=params, timeout=20)
+        data = r.json()
+        files.extend(data.get("files", []))
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+    return files
+
+
+def drive_download_file(file_id):
+    """Download isi file (bytes) dari Drive."""
+    token = get_drive_token()
+    r = requests.get(f"https://www.googleapis.com/drive/v3/files/{file_id}",
+                     headers={"Authorization": f"Bearer {token}"},
+                     params={"alt": "media", "supportsAllDrives": "true"}, timeout=30)
+    return r.content
+
+
+@app.route("/debug-drive", methods=["GET"])
+def debug_drive():
+    try:
+        if not GOOGLE_CREDENTIALS_JSON:
+            return {"error": "GOOGLE_CREDENTIALS_JSON belum diset di Railway"}, 500
+        if not GDRIVE_FOLDER_ID:
+            return {"error": "GDRIVE_FOLDER_ID belum diset di Railway"}, 500
+        files = drive_list_files()
+        return {
+            "status": "OK - koneksi Drive berhasil",
+            "jumlah_file": len(files),
+            "contoh_nama_file": [f["name"] for f in files[:15]]
+        }
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {str(e)[:300]}"}, 500
 
 
 @app.route("/debug-finance", methods=["GET"])
