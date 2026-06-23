@@ -199,8 +199,10 @@ def tool_get_items(host, keyword, page_size=20):
                 item["availableStock"] = detail.get("balance") or detail.get("availableStock") or 0
                 item["unitPrice"] = detail.get("unitPrice") or item.get("unitPrice") or 0
                 item["purchasePrice"] = detail.get("purchasePrice") or item.get("purchasePrice") or 0
+                # Harga modal/HPP rata-rata per unit ada di balanceUnitCost (purchasePrice biasanya 0)
+                item["hargaModal"] = detail.get("balanceUnitCost") or detail.get("defStandardCost") or 0
                 item["unit"] = detail.get("unit") or item.get("unit") or ""
-                print(f"[ITEM STOCK] {item['name']} balance={detail.get('balance')} stock={item['availableStock']}")
+                print(f"[ITEM STOCK] {item['name']} balance={detail.get('balance')} modal={item['hargaModal']}")
             except Exception as e:
                 print(f"[ITEM ENRICH ERROR] {e}")
 
@@ -901,7 +903,7 @@ TOOLS = [
     },
     {
         "name": "get_items",
-        "description": "Cari produk di Accurate: harga, stok, SKU. Nama produk di Accurate mungkin disingkat, contoh 'Tumblr' bukan 'Tumbler'.",
+        "description": "Cari produk di Accurate: harga jual (unitPrice), stok (availableStock), harga modal/HPP per unit (hargaModal, dari rata-rata cost), SKU. Nama produk di Accurate mungkin disingkat, contoh 'Tumblr' bukan 'Tumbler'. Field hargaModal adalah harga modal/beli rata-rata per unit yang sebenarnya (purchasePrice biasanya 0 jadi jangan dipakai).",
         "input_schema": {
             "type": "object",
             "properties": {
