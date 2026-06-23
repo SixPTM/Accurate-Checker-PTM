@@ -1197,6 +1197,34 @@ def debug_item():
         return {"error": str(e)}, 500
 
 
+@app.route("/debug-finance", methods=["GET"])
+def debug_finance():
+    try:
+        host = get_host()
+        if not host: return {"error": "Gagal dapat host"}, 500
+        h = host if host.startswith("http") else f"https://{host}"
+        # Coba beberapa kemungkinan endpoint laporan/akun keuangan Accurate
+        kandidat = [
+            ("glaccount/list.do", {"sp.pageSize": 3, "sp.page": 1}),
+            ("general-ledger/list.do", {"sp.pageSize": 3, "sp.page": 1}),
+            ("profit-loss/list.do", {}),
+            ("report/profit-loss.do", {}),
+            ("financial-statement/profit-loss.do", {}),
+            ("glaccount/get-balance-list.do", {"sp.pageSize": 3}),
+        ]
+        hasil = {}
+        for path, params in kandidat:
+            try:
+                r = requests.get(f"{h}/accurate/api/{path}", headers=accurate_headers(), params=params, timeout=15)
+                body = r.text[:400]
+                hasil[path] = {"status": r.status_code, "preview": body}
+            except Exception as e:
+                hasil[path] = {"error": str(e)[:200]}
+        return hasil
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+
 @app.route("/debug-nosales", methods=["GET"])
 def debug_nosales():
     try:
