@@ -1203,23 +1203,31 @@ def debug_finance():
         host = get_host()
         if not host: return {"error": "Gagal dapat host"}, 500
         h = host if host.startswith("http") else f"https://{host}"
-        # Coba beberapa kemungkinan endpoint laporan/akun keuangan Accurate
-        kandidat = [
-            ("glaccount/list.do", {"sp.pageSize": 3, "sp.page": 1}),
-            ("general-ledger/list.do", {"sp.pageSize": 3, "sp.page": 1}),
-            ("profit-loss/list.do", {}),
-            ("report/profit-loss.do", {}),
-            ("financial-statement/profit-loss.do", {}),
-            ("glaccount/get-balance-list.do", {"sp.pageSize": 3}),
-        ]
         hasil = {}
-        for path, params in kandidat:
+
+        # 1. Coba glaccount dengan field lengkap (nama, tipe, saldo)
+        try:
+            r = requests.get(f"{h}/accurate/api/glaccount/list.do", headers=accurate_headers(),
+                params={"fields": "id,no,name,accountType,accountTypeName,balance,currencyBalance", "sp.pageSize": 5, "sp.page": 1}, timeout=15)
+            hasil["glaccount_with_fields"] = {"status": r.status_code, "preview": r.text[:600]}
+        except Exception as e:
+            hasil["glaccount_with_fields"] = {"error": str(e)[:200]}
+
+        # 2. Coba profit-loss.do dengan beberapa kombinasi parameter tanggal
+        date_combos = [
+            {"fromDate": "01/06/2026", "toDate": "30/06/2026"},
+            {"startDate": "01/06/2026", "endDate": "30/06/2026"},
+            {"sp.fromDate": "01/06/2026", "sp.toDate": "30/06/2026"},
+            {"periodStart": "01/06/2026", "periodEnd": "30/06/2026"},
+            {"fromDate": "2026-06-01", "toDate": "2026-06-30"},
+        ]
+        for i, combo in enumerate(date_combos):
             try:
-                r = requests.get(f"{h}/accurate/api/{path}", headers=accurate_headers(), params=params, timeout=15)
-                body = r.text[:400]
-                hasil[path] = {"status": r.status_code, "preview": body}
+                r = requests.get(f"{h}/accurate/api/report/profit-loss.do", headers=accurate_headers(), params=combo, timeout=20)
+                hasil[f"profit_loss_combo_{i}"] = {"params": combo, "status": r.status_code, "preview": r.text[:400]}
             except Exception as e:
-                hasil[path] = {"error": str(e)[:200]}
+                hasil[f"profit_loss_combo_{i}"] = {"params": combo, "error": str(e)[:200]}
+
         return hasil
     except Exception as e:
         return {"error": str(e)}, 500
