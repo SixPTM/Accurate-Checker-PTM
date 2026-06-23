@@ -791,6 +791,56 @@ def tool_get_unpaid_invoices_detail(host, chat_id, date_from=None, date_to=None,
     return json.dumps({"status": "background_started"})
 
 
+def tool_get_sales_per_salesman(host, chat_id, date_from, date_to, label=""):
+    def run():
+        try:
+            h = host if host.startswith("http") else f"https://{host}"
+            sales_data = {}
+            page = 1
+            total_invoice = 0
+            while True:
+                params = {"fields": "id,totalAmount,subTotal,masterSalesmanName", "sp.pageSize": 200, "sp.page": page,
+                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
+                r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+                data = r.json()
+                if not data.get("s"): break
+                page_data = data.get("d", [])
+                sp = data.get("sp", {})
+                if page == 1: total_invoice = sp.get("rowCount", 0)
+                for inv in page_data:
+                    sales_name = inv.get("masterSalesmanName") or "Tanpa Sales"
+                    nilai = float(inv.get("totalAmount") or inv.get("subTotal") or 0)
+                    if sales_name not in sales_data:
+                        sales_data[sales_name] = {"count": 0, "total": 0.0}
+                    sales_data[sales_name]["count"] += 1
+                    sales_data[sales_name]["total"] += nilai
+                print(f"[BG SALES] page {page}/{sp.get('pageCount',1)}")
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+
+            if not sales_data:
+                send_message(chat_id, f"❌ Tidak ada data penjualan untuk {label}.")
+                return
+
+            sorted_sales = sorted(sales_data.items(), key=lambda x: x[1]["total"], reverse=True)
+            grand_total = sum(v["total"] for v in sales_data.values())
+            msg = f"👥 *Penjualan per Sales - {label}*\n\n"
+            msg += f"Total invoice: {total_invoice}\n"
+            msg += f"Total penjualan: Rp {grand_total:,.0f}\n"
+            msg += f"Jumlah sales: {len(sales_data)}\n\n*Rincian (urut nilai terbesar):*\n"
+            for name, d in sorted_sales:
+                msg += f"• {name}: Rp {d['total']:,.0f} ({d['count']} inv)\n"
+            send_message(chat_id, msg)
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal rekap sales: {str(e)[:100]}")
+            print(f"[BG SALES ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
+
+
 # ============================================================
 # CLAUDE TOOLS DEFINITION
 # ============================================================
@@ -940,6 +990,19 @@ TOOLS = [
                 "label": {"type": "string", "description": "Label periode"}
             }
         }
+    },
+    {
+        "name": "get_sales_per_salesman",
+        "description": "Rekap penjualan per tenaga penjual / sales / salesman di satu periode: nama tiap sales, total nilai penjualan, dan jumlah invoice. Untuk 'penjualan per sales', 'siapa saja sales-nya dan penjualannya berapa', 'rekap salesman Juni', 'tenaga penjual'. Background 1-2 menit, hasil dikirim ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD/MM/YYYY"},
+                "date_to": {"type": "string", "description": "DD/MM/YYYY"},
+                "label": {"type": "string", "description": "Label periode, contoh 'Juni 2026'"}
+            },
+            "required": ["date_from", "date_to"]
+        }
     }
 ]
 
@@ -966,6 +1029,7 @@ Tools background (hasilnya dikirim otomatis ke Telegram setelah selesai, beri ta
 - get_sales_per_item: penjualan produk tertentu (3-5 menit)  
 - get_unpaid_customers_background: daftar customer belum bayar (2-3 menit)
 - get_unpaid_invoices_detail: daftar invoice belum bayar lengkap dengan nomor + nama + nilai (2-3 menit)
+- get_sales_per_salesman: rekap penjualan per tenaga penjual/sales (1-2 menit)
 - get_piutang_summary: total piutang (2-3 menit)
 - get_low_stock: produk yang stoknya menipis di bawah ambang batas (perlu sebut kategori produk)
 - get_overdue_customers: customer yang nunggak lewat jatuh tempo > sekian hari
@@ -1040,6 +1104,8 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_get_overdue_customers(host, chat_id, tool_input.get("days", 30))
                 elif tool_name == "get_unpaid_invoices_detail":
                     result = tool_get_unpaid_invoices_detail(host, chat_id, tool_input.get("date_from"), tool_input.get("date_to"), tool_input.get("label",""))
+                elif tool_name == "get_sales_per_salesman":
+                    result = tool_get_sales_per_salesman(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 else:
                     result = json.dumps({"error": f"Unknown tool: {tool_name}"})
 
