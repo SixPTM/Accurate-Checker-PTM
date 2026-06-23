@@ -815,21 +815,33 @@ def tool_get_sales_per_salesman(host, chat_id, date_from, date_to, label=""):
                 page += 1
 
             def enrich(inv):
-                try:
-                    r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=10)
-                    detail = r2.json().get("d", {})
-                    sales_name = detail.get("masterSalesmanName")
-                    if not sales_name or not str(sales_name).strip():
-                        sales_name = "Tanpa Sales"
-                    nilai = float(detail.get("totalAmount") or detail.get("subTotal") or inv.get("totalAmount") or 0)
+                # Coba baca detail sampai 3x kalau gagal/timeout
+                detail = None
+                for attempt in range(3):
+                    try:
+                        r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=15)
+                        d = r2.json()
+                        if d.get("s") and d.get("d"):
+                            detail = d["d"]
+                            break
+                    except Exception:
+                        pass
+                if detail is None:
                     with lock:
-                        if sales_name not in sales_data:
-                            sales_data[sales_name] = {"count": 0, "total": 0.0}
-                        sales_data[sales_name]["count"] += 1
-                        sales_data[sales_name]["total"] += nilai
-                except: pass
+                        sales_data.setdefault("(Gagal dibaca)", {"count": 0, "total": 0.0})
+                        sales_data["(Gagal dibaca)"]["count"] += 1
+                    return
+                sales_name = detail.get("masterSalesmanName")
+                if not sales_name or not str(sales_name).strip():
+                    sales_name = "Tanpa Sales"
+                nilai = float(detail.get("totalAmount") or detail.get("subTotal") or inv.get("totalAmount") or 0)
+                with lock:
+                    if sales_name not in sales_data:
+                        sales_data[sales_name] = {"count": 0, "total": 0.0}
+                    sales_data[sales_name]["count"] += 1
+                    sales_data[sales_name]["total"] += nilai
 
-            with ThreadPoolExecutor(max_workers=15) as ex:
+            with ThreadPoolExecutor(max_workers=8) as ex:
                 list(ex.map(enrich, all_invoices))
 
             if not sales_data:
