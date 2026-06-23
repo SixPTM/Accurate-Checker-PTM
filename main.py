@@ -795,11 +795,13 @@ def tool_get_sales_per_salesman(host, chat_id, date_from, date_to, label=""):
     def run():
         try:
             h = host if host.startswith("http") else f"https://{host}"
+            lock = threading.Lock()
             sales_data = {}
+            all_invoices = []
             page = 1
             total_invoice = 0
             while True:
-                params = {"fields": "id,totalAmount,subTotal,masterSalesmanName", "sp.pageSize": 200, "sp.page": page,
+                params = {"fields": "id,number", "sp.pageSize": 200, "sp.page": page,
                     "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
                 r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
                 data = r.json()
@@ -807,16 +809,28 @@ def tool_get_sales_per_salesman(host, chat_id, date_from, date_to, label=""):
                 page_data = data.get("d", [])
                 sp = data.get("sp", {})
                 if page == 1: total_invoice = sp.get("rowCount", 0)
-                for inv in page_data:
-                    sales_name = inv.get("masterSalesmanName") or "Tanpa Sales"
-                    nilai = float(inv.get("totalAmount") or inv.get("subTotal") or 0)
-                    if sales_name not in sales_data:
-                        sales_data[sales_name] = {"count": 0, "total": 0.0}
-                    sales_data[sales_name]["count"] += 1
-                    sales_data[sales_name]["total"] += nilai
-                print(f"[BG SALES] page {page}/{sp.get('pageCount',1)}")
+                all_invoices.extend(page_data)
+                print(f"[BG SALES] list {page}/{sp.get('pageCount',1)} loaded={len(all_invoices)}")
                 if page >= sp.get("pageCount", 1): break
                 page += 1
+
+            def enrich(inv):
+                try:
+                    r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=10)
+                    detail = r2.json().get("d", {})
+                    sales_name = detail.get("masterSalesmanName")
+                    if not sales_name or not str(sales_name).strip():
+                        sales_name = "Tanpa Sales"
+                    nilai = float(detail.get("totalAmount") or detail.get("subTotal") or inv.get("totalAmount") or 0)
+                    with lock:
+                        if sales_name not in sales_data:
+                            sales_data[sales_name] = {"count": 0, "total": 0.0}
+                        sales_data[sales_name]["count"] += 1
+                        sales_data[sales_name]["total"] += nilai
+                except: pass
+
+            with ThreadPoolExecutor(max_workers=15) as ex:
+                list(ex.map(enrich, all_invoices))
 
             if not sales_data:
                 send_message(chat_id, f"❌ Tidak ada data penjualan untuk {label}.")
