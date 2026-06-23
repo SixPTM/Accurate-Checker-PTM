@@ -1203,31 +1203,33 @@ def debug_finance():
         host = get_host()
         if not host: return {"error": "Gagal dapat host"}, 500
         h = host if host.startswith("http") else f"https://{host}"
+        # Cek 3 invoice spesifik yang katanya "Tanpa Sales" tapi user bilang ada
+        target = ["SI.2026.06.00037", "SI.2026.06.00210", "SI.2026.06.00497"]
         hasil = {}
-
-        # 1. Coba glaccount dengan field lengkap (nama, tipe, saldo)
-        try:
-            r = requests.get(f"{h}/accurate/api/glaccount/list.do", headers=accurate_headers(),
-                params={"fields": "id,no,name,accountType,accountTypeName,balance,currencyBalance", "sp.pageSize": 5, "sp.page": 1}, timeout=15)
-            hasil["glaccount_with_fields"] = {"status": r.status_code, "preview": r.text[:600]}
-        except Exception as e:
-            hasil["glaccount_with_fields"] = {"error": str(e)[:200]}
-
-        # 2. Coba profit-loss.do dengan beberapa kombinasi parameter tanggal
-        date_combos = [
-            {"fromDate": "01/06/2026", "toDate": "30/06/2026"},
-            {"startDate": "01/06/2026", "endDate": "30/06/2026"},
-            {"sp.fromDate": "01/06/2026", "sp.toDate": "30/06/2026"},
-            {"periodStart": "01/06/2026", "periodEnd": "30/06/2026"},
-            {"fromDate": "2026-06-01", "toDate": "2026-06-30"},
-        ]
-        for i, combo in enumerate(date_combos):
+        for nomor in target:
             try:
-                r = requests.get(f"{h}/accurate/api/report/profit-loss.do", headers=accurate_headers(), params=combo, timeout=20)
-                hasil[f"profit_loss_combo_{i}"] = {"params": combo, "status": r.status_code, "preview": r.text[:400]}
+                r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(),
+                    params={"fields": "id,number", "filter.keywords": nomor, "sp.pageSize": 1}, timeout=15)
+                lst = r.json().get("d", [])
+                if not lst:
+                    hasil[nomor] = {"error": "tidak ketemu di list"}
+                    continue
+                inv_id = lst[0]["id"]
+                r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv_id}, timeout=15)
+                detail = r2.json().get("d", {})
+                # Ambil semua field yang mungkin berisi nama orang/sales
+                hasil[nomor] = {
+                    "masterSalesmanName": detail.get("masterSalesmanName"),
+                    "masterSalesmanId": detail.get("masterSalesmanId"),
+                    "createdBy": detail.get("createdBy"),
+                    "cashierEmployeeName": detail.get("cashierEmployeeName"),
+                    "cashierEmployeeId": detail.get("cashierEmployeeId"),
+                    "printUserName": detail.get("printUserName"),
+                    "retailWpName": detail.get("retailWpName"),
+                    "detailItem_count": len(detail.get("detailItem", [])) if isinstance(detail.get("detailItem"), list) else "bukan list"
+                }
             except Exception as e:
-                hasil[f"profit_loss_combo_{i}"] = {"params": combo, "error": str(e)[:200]}
-
+                hasil[nomor] = {"error": str(e)[:200]}
         return hasil
     except Exception as e:
         return {"error": str(e)}, 500
