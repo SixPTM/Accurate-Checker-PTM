@@ -815,17 +815,19 @@ def tool_get_sales_per_salesman(host, chat_id, date_from, date_to, label=""):
                 page += 1
 
             def enrich(inv):
-                # Coba baca detail sampai 3x kalau gagal/timeout
+                # Coba baca detail sampai 5x dengan jeda kalau gagal/timeout
                 detail = None
-                for attempt in range(3):
+                for attempt in range(5):
                     try:
-                        r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=15)
+                        r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=20)
                         d = r2.json()
                         if d.get("s") and d.get("d"):
                             detail = d["d"]
                             break
                     except Exception:
                         pass
+                    import time as _t
+                    _t.sleep(0.5 * (attempt + 1))
                 if detail is None:
                     with lock:
                         sales_data.setdefault("(Gagal dibaca)", {"count": 0, "total": 0.0})
@@ -841,7 +843,7 @@ def tool_get_sales_per_salesman(host, chat_id, date_from, date_to, label=""):
                     sales_data[sales_name]["count"] += 1
                     sales_data[sales_name]["total"] += nilai
 
-            with ThreadPoolExecutor(max_workers=8) as ex:
+            with ThreadPoolExecutor(max_workers=5) as ex:
                 list(ex.map(enrich, all_invoices))
 
             if not sales_data:
