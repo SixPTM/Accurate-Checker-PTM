@@ -1169,6 +1169,38 @@ def debug_item():
         return {"error": str(e)}, 500
 
 
+@app.route("/debug-sales", methods=["GET"])
+def debug_sales():
+    try:
+        host = get_host()
+        if not host: return {"error": "Gagal dapat host"}, 500
+        h = host if host.startswith("http") else f"https://{host}"
+        # Ambil 5 invoice terbaru
+        r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(),
+            params={"fields": "id,number,masterSalesmanName,masterSalesmanId", "sp.pageSize": 5, "sp.page": 1,
+                "sp.sort": "transDate", "sp.sortOrder": "DESC"}, timeout=15)
+        list_data = r.json().get("d", [])
+        hasil = []
+        for inv in list_data:
+            r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(),
+                params={"id": inv["id"]}, timeout=15)
+            detail = r2.json().get("d", {})
+            salesman = detail.get("salesman")
+            salesmanList = detail.get("detailSalesman") or detail.get("salesmanList")
+            hasil.append({
+                "number": inv.get("number"),
+                "list_masterSalesmanName": inv.get("masterSalesmanName"),
+                "list_masterSalesmanId": inv.get("masterSalesmanId"),
+                "detail_masterSalesmanName": detail.get("masterSalesmanName"),
+                "detail_masterSalesmanId": detail.get("masterSalesmanId"),
+                "detail_salesman_field": salesman,
+                "detail_salesmanList_field": salesmanList
+            })
+        return {"hasil": hasil}
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+
 @app.route("/debug-invoice", methods=["GET"])
 def debug_invoice():
     try:
