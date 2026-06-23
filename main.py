@@ -888,9 +888,18 @@ def tool_get_product_profit(host, chat_id, keyword, date_from, date_to):
                             kws = [k.replace("tumbler", "tumblr") for k in keywords]
                         if kws and all(k in nm for k in kws):
                             qty = float(item.get("quantity") or item.get("qty") or 0)
-                            amount = float(item.get("amount") or item.get("totalAmount") or 0)
+                            # Harga jual: coba beberapa field. amount sering 0,
+                            # jadi fallback ke unitPrice*qty atau totalPrice.
+                            unit_jual = float(item.get("unitPrice") or item.get("price") or 0)
+                            amount = float(item.get("amount") or item.get("totalAmount") or item.get("totalPrice") or 0)
+                            if amount <= 0 and unit_jual > 0:
+                                amount = unit_jual * qty
                             realname = nm_raw or "-"
+                            # Log sekali untuk lihat field angka yang tersedia (diagnosa harga jual)
                             with lock:
+                                if not jual_qty:
+                                    angka = {k: v for k, v in item.items() if isinstance(v, (int, float))}
+                                    print(f"[PROFIT FIELD CEK] {realname} -> {angka}")
                                 jual_qty[realname] = jual_qty.get(realname, 0) + qty
                                 jual_total[realname] = jual_total.get(realname, 0) + amount
                 except: pass
@@ -1366,44 +1375,29 @@ def debug_finance():
         host = get_host()
         if not host: return {"error": "Gagal dapat host"}, 500
         h = host if host.startswith("http") else f"https://{host}"
-        # Scan beberapa invoice Juni, cari item yang namanya mengandung 'sultan',
-        # tampilkan itemName PERSIS seperti tersimpan di detailItem
-        all_ids = []
-        page = 1
-        while True and page <= 3:
-            params = {"fields": "id", "sp.pageSize": 200, "sp.page": page,
-                "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": "01/06/2026", "filter.transDate.val[1]": "30/06/2026"}
-            r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
-            data = r.json()
-            if not data.get("s"): break
-            all_ids.extend(data.get("d", []))
-            sp = data.get("sp", {})
-            if page >= sp.get("pageCount", 1): break
-            page += 1
-
-        contoh_itemnames = set()
-        sultan_found = []
-        for inv in all_ids[:300]:
+        # Ambil beberapa invoice Juni, tampilkan SEMUA field di detailItem (untuk cari harga jual)
+        r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(),
+            params={"fields": "id", "sp.pageSize": 200, "sp.page": 1,
+                "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": "01/06/2026", "filter.transDate.val[1]": "30/06/2026"}, timeout=30)
+        ids = r.json().get("d", [])
+        hasil = []
+        for inv in ids[:50]:
             try:
-                r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=10)
+                r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=12)
                 detail = r2.json().get("d", {})
                 items = detail.get("detailItem", [])
                 if not isinstance(items, list): continue
                 for item in items:
                     if not isinstance(item, dict): continue
                     nm = item.get("itemName") or ""
-                    if len(contoh_itemnames) < 10:
-                        contoh_itemnames.add(nm)
-                    if "sultan" in nm.lower():
-                        sultan_found.append({"itemName": nm, "qty": item.get("quantity"), "amount": item.get("amount"), "keys": list(item.keys())[:15]})
-                if len(sultan_found) >= 5:
-                    break
+                    if "sultan" in nm.lower() or "garvi" in nm.lower():
+                        # tampilkan semua field angka di item ini
+                        angka = {k: v for k, v in item.items() if isinstance(v, (int, float))}
+                        hasil.append({"itemName": nm, "field_angka": angka})
+                        if len(hasil) >= 3:
+                            return {"contoh_detailItem": hasil}
             except: pass
-
-        return {
-            "contoh_itemName_apa_adanya": list(contoh_itemnames),
-            "sultan_ditemukan": sultan_found[:5]
-        }
+        return {"contoh_detailItem": hasil, "catatan": "kalau kosong, tidak ketemu sultan/garvi di 50 invoice pertama"}
     except Exception as e:
         return {"error": str(e)}, 500
 
