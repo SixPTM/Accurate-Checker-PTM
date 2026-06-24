@@ -1221,6 +1221,19 @@ TOOLS = [
         }
     },
     {
+        "name": "piutang_per_sales",
+        "description": "Rekap piutang (tagihan belum dibayar) DIKELOMPOKKAN PER SALES/salesman di satu periode: tiap sales total piutangnya berapa, lengkap rincian nomor invoice + nama customer + umur piutang (berapa hari). Untuk 'piutang per sales', 'tagihan belum bayar tiap sales', 'sales mana yang piutangnya paling besar'. Background 5-10 menit, hasil ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD/MM/YYYY"},
+                "date_to": {"type": "string", "description": "DD/MM/YYYY"},
+                "label": {"type": "string", "description": "Label periode, contoh 'Juni 2026'"}
+            },
+            "required": ["date_from", "date_to"]
+        }
+    },
+    {
         "name": "cek_piutang_customer",
         "description": "Cek piutang/tagihan belum dibayar untuk SATU customer tertentu berdasarkan nama, lengkap dengan umur piutang (sudah berapa hari). Untuk 'piutang si X', 'berapa utang customer Y', 'tagihan Z sudah berapa lama'. Cukup beri nama customer apa adanya (mis. 'Rico'), tool akan mencari. Background, hasil ke Telegram.",
         "input_schema": {
@@ -1270,6 +1283,7 @@ Tools background (hasilnya dikirim otomatis ke Telegram setelah selesai, beri ta
 - get_product_profit: hitung profit/margin produk (modal vs jual) (3-5 menit)
 - cek_bukti_bayar: cek & cocokkan bukti bayar invoice dari Google Drive
 - cek_piutang_customer: cek piutang SATU customer berdasarkan nama + umur piutang (berapa hari). WAJIB pakai ini untuk 'piutang si X', 'utang customer Y berapa', JANGAN pakai get_invoices. Cukup beri nama customer apa adanya.
+- piutang_per_sales: rekap piutang DIKELOMPOKKAN PER SALES + rincian customer & umur. WAJIB pakai ini untuk 'piutang per sales', 'tagihan belum bayar tiap sales'. JANGAN pakai get_invoices atau get_sales_per_salesman (itu untuk omset, bukan piutang).
 - get_produk_terlaku: rekap SEMUA produk terlaku di rentang tanggal, terurut dari qty tertinggi ke terendah, menampilkan qty + jumlah invoice + nilai Rp, tanpa perlu keyword. WAJIB pakai ini untuk SEMUA pertanyaan 'produk terlaku/terlaris/paling laku' baik harian, mingguan, MAUPUN BULANAN. Untuk 'produk terlaku hari ini' panggil date_from=date_to=tanggal hari ini. Untuk 'produk terlaku bulan ini' panggil date_from=01/bulan, date_to=tanggal hari ini.
 - get_piutang_summary: total piutang (2-3 menit)
 - get_low_stock: produk yang stoknya menipis di bawah ambang batas (perlu sebut kategori produk)
@@ -1353,6 +1367,8 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_cek_bukti_bayar(host, chat_id, tool_input["nomor_invoice"])
                 elif tool_name == "cek_piutang_customer":
                     result = tool_cek_piutang_customer(host, chat_id, tool_input["nama_customer"])
+                elif tool_name == "piutang_per_sales":
+                    result = tool_piutang_per_sales(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "get_produk_terlaku":
                     result = tool_get_produk_terlaku(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 else:
@@ -1593,6 +1609,88 @@ def tool_get_produk_terlaku(host, chat_id, date_from, date_to, label=""):
         except Exception as e:
             send_message(chat_id, f"❌ Gagal rekap produk: {str(e)[:120]}")
             print(f"[PRODUK TERLAKU ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
+
+
+def tool_piutang_per_sales(host, chat_id, date_from, date_to, label=""):
+    def run():
+        try:
+            h = host if host.startswith("http") else f"https://{host}"
+            from datetime import datetime
+            # Ambil semua invoice di periode
+            all_inv = []
+            page = 1
+            while True:
+                params = {"fields": "id,number,transDate,dueDate", "sp.pageSize": 200, "sp.page": page,
+                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
+                r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+                data = r.json()
+                if not data.get("s"): break
+                all_inv.extend(data.get("d", []))
+                sp = data.get("sp", {})
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+
+            lock = threading.Lock()
+            per_sales = {}  # nama_sales -> {"total": x, "items": [...]}
+
+            def cek(inv):
+                detail = None
+                for attempt in range(5):
+                    try:
+                        r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=20)
+                        d = r2.json()
+                        if d.get("s") and d.get("d"):
+                            detail = d["d"]; break
+                    except Exception: pass
+                    import time as _t; _t.sleep(0.4 * (attempt + 1))
+                if detail is None: return
+                owing = float(detail.get("primeOwing") or 0)
+                if owing <= 0: return  # cuma yang masih ada piutang
+                sales = detail.get("masterSalesmanName") or "Tanpa Sales"
+                cust = detail.get("retailWpName") or detail.get("customerName") or "?"
+                due = detail.get("dueDate") or inv.get("dueDate") or ""
+                tgl = detail.get("transDate") or inv.get("transDate") or ""
+                umur = None
+                acuan = due or tgl
+                for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                    try:
+                        dd = datetime.strptime(acuan, fmt); umur = (datetime.now() - dd).days; break
+                    except: pass
+                with lock:
+                    if sales not in per_sales:
+                        per_sales[sales] = {"total": 0.0, "items": []}
+                    per_sales[sales]["total"] += owing
+                    per_sales[sales]["items"].append({"number": inv.get("number"), "cust": cust, "owing": owing, "umur": umur, "due": due})
+
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                list(ex.map(cek, all_inv))
+
+            if not per_sales:
+                send_message(chat_id, f"✅ Tidak ada piutang di periode {label or (date_from + ' - ' + date_to)}.")
+                return
+
+            grand = sum(v["total"] for v in per_sales.values())
+            judul = label or f"{date_from} - {date_to}"
+            msg = f"💰 *Piutang per Sales - {judul}*\n"
+            msg += f"Total piutang: Rp {grand:,.0f}\n\n"
+            # urut sales dari piutang terbesar
+            for sales in sorted(per_sales, key=lambda s: per_sales[s]["total"], reverse=True):
+                d = per_sales[sales]
+                msg += f"━━━━━━━━━━\n👤 *{sales}* — Rp {d['total']:,.0f} ({len(d['items'])} inv)\n"
+                # urut invoice dari umur terlama
+                for it in sorted(d["items"], key=lambda x: (x["umur"] if x["umur"] is not None else -1), reverse=True):
+                    umur_txt = f"{it['umur']} hari" if it["umur"] is not None else "?"
+                    msg += f"  • {it['number']} | {it['cust']} | Rp {it['owing']:,.0f} | {umur_txt}\n"
+            msg += f"\n_Umur dari jatuh tempo sampai hari ini. Sisa tagihan = primeOwing._"
+            send_message(chat_id, msg)
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal rekap piutang per sales: {str(e)[:120]}")
+            print(f"[PIUTANG SALES ERROR] {e}")
 
     t = threading.Thread(target=run)
     t.daemon = True
