@@ -1440,15 +1440,28 @@ def debug_env():
 def debug_drive():
     try:
         if not GOOGLE_CREDENTIALS_B64 and not GOOGLE_CREDENTIALS_JSON:
-            return {"error": "Kredensial Google belum diset (GOOGLE_CREDENTIALS_B64 atau GOOGLE_CREDENTIALS_JSON)"}, 500
+            return {"error": "Kredensial Google belum diset"}, 500
         if not GDRIVE_FOLDER_ID:
-            return {"error": "GDRIVE_FOLDER_ID belum diset di Railway"}, 500
+            return {"error": "GDRIVE_FOLDER_ID belum diset"}, 500
         files = drive_list_files()
-        return {
-            "status": "OK - koneksi Drive berhasil",
-            "jumlah_file": len(files),
-            "contoh_nama_file": [f["name"] for f in files[:15]]
-        }
+        hasil = {"folder_utama_isi": [], "subfolder_isi": {}}
+        for f in files:
+            is_folder = f.get("mimeType") == "application/vnd.google-apps.folder"
+            hasil["folder_utama_isi"].append({"nama": f["name"], "tipe": "folder" if is_folder else "file"})
+            # Kalau ini folder, intip isinya
+            if is_folder:
+                token = get_drive_token()
+                q = f"'{f['id']}' in parents and trashed=false"
+                r = requests.get("https://www.googleapis.com/drive/v3/files",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={"q": q, "fields": "files(id,name,mimeType)", "pageSize": 20,
+                            "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}, timeout=20)
+                sub = r.json().get("files", [])
+                hasil["subfolder_isi"][f["name"]] = {
+                    "jumlah": len(sub),
+                    "contoh": [x["name"] for x in sub[:15]]
+                }
+        return hasil
     except Exception as e:
         return {"error": f"{type(e).__name__}: {str(e)[:300]}"}, 500
 
