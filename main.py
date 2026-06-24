@@ -1104,19 +1104,6 @@ TOOLS = [
         }
     },
     {
-        "name": "get_top_products_background",
-        "description": "Rekap SEMUA produk terlaris di periode tertentu. Background 5-10 menit. Untuk 'produk apa paling laku bulan juni', 'top produk'.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "date_from": {"type": "string", "description": "DD/MM/YYYY"},
-                "date_to": {"type": "string", "description": "DD/MM/YYYY"},
-                "label": {"type": "string", "description": "Label periode"}
-            },
-            "required": ["date_from", "date_to"]
-        }
-    },
-    {
         "name": "get_unpaid_customers_background",
         "description": "Daftar semua customer belum bayar. Background 2-3 menit. Untuk 'siapa saja belum bayar bulan juni'.",
         "input_schema": {
@@ -1258,14 +1245,13 @@ SANGAT PENTING soal daftar invoice belum bayar:
 
 Tools background (hasilnya dikirim otomatis ke Telegram setelah selesai, beri tahu user untuk menunggu):
 - get_omset_summary: total pendapatan/omset satu periode, baca semua invoice (2-3 menit)
-- get_top_products_background: rekap SEMUA produk terlaris (5-10 menit)
 - get_sales_per_item: penjualan produk tertentu (3-5 menit)  
 - get_unpaid_customers_background: daftar customer belum bayar (2-3 menit)
 - get_unpaid_invoices_detail: daftar invoice belum bayar lengkap dengan nomor + nama + nilai (2-3 menit)
 - get_sales_per_salesman: rekap penjualan per tenaga penjual/sales (3-5 menit)
 - get_product_profit: hitung profit/margin produk (modal vs jual) (3-5 menit)
 - cek_bukti_bayar: cek & cocokkan bukti bayar invoice dari Google Drive
-- get_produk_terlaku: rekap SEMUA produk terlaku di rentang tanggal, terurut tertinggi-terendah, tanpa perlu keyword. WAJIB pakai ini untuk 'produk terlaku hari ini/minggu ini', JANGAN pakai get_sales_per_item (yang butuh keyword) atau get_top_products_background (yang untuk bulanan). Untuk 'produk terlaku hari ini' panggil dengan date_from=date_to=tanggal hari ini.
+- get_produk_terlaku: rekap SEMUA produk terlaku di rentang tanggal, terurut dari qty tertinggi ke terendah, menampilkan qty + jumlah invoice + nilai Rp, tanpa perlu keyword. WAJIB pakai ini untuk SEMUA pertanyaan 'produk terlaku/terlaris/paling laku' baik harian, mingguan, MAUPUN BULANAN. Untuk 'produk terlaku hari ini' panggil date_from=date_to=tanggal hari ini. Untuk 'produk terlaku bulan ini' panggil date_from=01/bulan, date_to=tanggal hari ini.
 - get_piutang_summary: total piutang (2-3 menit)
 - get_low_stock: produk yang stoknya menipis di bawah ambang batas (perlu sebut kategori produk)
 - get_overdue_customers: customer yang nunggak lewat jatuh tempo > sekian hari
