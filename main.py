@@ -817,12 +817,29 @@ def tool_get_unpaid_invoices_detail(host, chat_id, date_from=None, date_to=None,
     return json.dumps({"status": "background_started"})
 
 
+def _normalisasi_nama(teks):
+    """Samakan variasi ejaan umum agar pencocokan produk lebih tahan banting."""
+    t = (teks or "").lower()
+    t = t.replace("tumbler", "tumblr")     # Accurate pakai 'tumblr'
+    t = t.replace("cartoon", "carton")     # samakan carton/cartoon
+    t = t.replace("-", " ")                # samakan pemisah
+    return t
+
+# Kata terlalu umum -> diabaikan sebagai filter pencocokan
+_KATA_UMUM = {"tumblr", "kertas", "uv", "grafir", "mug", "stiker", "set", "premium"}
+
+def _kata_kunci_cocok(keyword):
+    kws = [k for k in _normalisasi_nama(keyword).split() if k not in _KATA_UMUM]
+    if not kws:  # kalau semua kata kebetulan umum, pakai apa adanya
+        kws = _normalisasi_nama(keyword).split()
+    return kws
+
+
 def tool_get_product_profit(host, chat_id, keyword, date_from, date_to):
     def run():
         try:
             h = host if host.startswith("http") else f"https://{host}"
-            kw_lower = keyword.lower()
-            keywords = kw_lower.split()
+            kws_cari = _kata_kunci_cocok(keyword)
 
             # 1. Ambil harga modal (balanceUnitCost) tiap varian produk dari master item
             modal_map = {}
@@ -836,15 +853,9 @@ def tool_get_product_profit(host, chat_id, keyword, date_from, date_to):
                 sp = data.get("sp", {})
                 cocok = []
                 for it in items:
-                    nm = (it.get("name") or "").lower()
-                    no = (it.get("no") or "").lower()
-                    nm_norm = nm.replace("tumbler", "tumblr")
-                    no_norm = no.replace("tumbler", "tumblr")
-                    # Cocokkan longgar: abaikan kata 'tumbler/tumblr' (terlalu umum)
-                    kws = [k.replace("tumbler", "tumblr") for k in keywords if k.replace("tumbler","tumblr") != "tumblr"]
-                    if not kws:
-                        kws = [k.replace("tumbler", "tumblr") for k in keywords]
-                    if kws and all(k in nm_norm or k in no_norm for k in kws):
+                    nm_norm = _normalisasi_nama(it.get("name"))
+                    no_norm = _normalisasi_nama(it.get("no"))
+                    if all(k in nm_norm or k in no_norm for k in kws_cari):
                         cocok.append(it)
                 lock0 = threading.Lock()
                 def amb(it):
@@ -893,12 +904,8 @@ def tool_get_product_profit(host, chat_id, keyword, date_from, date_to):
                         item_obj = item.get("item", {})
                         if isinstance(item_obj, list): item_obj = item_obj[0] if item_obj else {}
                         nm_raw = item.get("itemName") or (item_obj.get("name") if isinstance(item_obj, dict) else None) or ""
-                        nm = nm_raw.lower().replace("tumbler", "tumblr")
-                        # Cocokkan longgar: cukup semua kata kunci (selain 'tumbler') ada di nama
-                        kws = [k.replace("tumbler", "tumblr") for k in keywords if k.replace("tumbler","tumblr") != "tumblr"]
-                        if not kws:
-                            kws = [k.replace("tumbler", "tumblr") for k in keywords]
-                        if kws and all(k in nm for k in kws):
+                        nm = _normalisasi_nama(nm_raw)
+                        if all(k in nm for k in kws_cari):
                             qty = float(item.get("quantity") or item.get("qty") or 0)
                             # Harga jual: coba beberapa field. amount sering 0,
                             # jadi fallback ke unitPrice*qty atau totalPrice.
