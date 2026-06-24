@@ -16,7 +16,17 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 ACCURATE_API_TOKEN = os.environ.get("ACCURATE_API_TOKEN")
 ACCURATE_SIGNATURE_SECRET = os.environ.get("ACCURATE_SIGNATURE_SECRET", "")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
+GOOGLE_CREDENTIALS_B64 = os.environ.get("GOOGLE_CREDENTIALS_B64", "")
 GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID", "")
+
+def _load_google_creds_info():
+    """Ambil isi kredensial JSON, dari base64 (diutamakan) atau JSON langsung."""
+    if GOOGLE_CREDENTIALS_B64:
+        decoded = base64.b64decode(GOOGLE_CREDENTIALS_B64).decode("utf-8")
+        return json.loads(decoded)
+    if GOOGLE_CREDENTIALS_JSON:
+        return json.loads(GOOGLE_CREDENTIALS_JSON)
+    raise RuntimeError("Kredensial Google belum diset")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 ACCURATE_BASE_URL = "https://account.accurate.id/api"
@@ -1375,7 +1385,7 @@ def get_drive_token():
     """Ambil access token Google Drive dari service account (JWT flow)."""
     from google.oauth2 import service_account
     import google.auth.transport.requests
-    info = json.loads(GOOGLE_CREDENTIALS_JSON)
+    info = _load_google_creds_info()
     creds = service_account.Credentials.from_service_account_info(
         info, scopes=["https://www.googleapis.com/auth/drive.readonly"])
     creds.refresh(google.auth.transport.requests.Request())
@@ -1415,11 +1425,22 @@ def drive_download_file(file_id):
     return r.content
 
 
+@app.route("/debug-env", methods=["GET"])
+def debug_env():
+    return {
+        "ada_GOOGLE_CREDENTIALS_B64": bool(GOOGLE_CREDENTIALS_B64),
+        "panjang_B64": len(GOOGLE_CREDENTIALS_B64),
+        "ada_GOOGLE_CREDENTIALS_JSON": bool(GOOGLE_CREDENTIALS_JSON),
+        "ada_GDRIVE_FOLDER_ID": bool(GDRIVE_FOLDER_ID),
+        "kode_versi": "baca-base64"
+    }
+
+
 @app.route("/debug-drive", methods=["GET"])
 def debug_drive():
     try:
-        if not GOOGLE_CREDENTIALS_JSON:
-            return {"error": "GOOGLE_CREDENTIALS_JSON belum diset di Railway"}, 500
+        if not GOOGLE_CREDENTIALS_B64 and not GOOGLE_CREDENTIALS_JSON:
+            return {"error": "Kredensial Google belum diset (GOOGLE_CREDENTIALS_B64 atau GOOGLE_CREDENTIALS_JSON)"}, 500
         if not GDRIVE_FOLDER_ID:
             return {"error": "GDRIVE_FOLDER_ID belum diset di Railway"}, 500
         files = drive_list_files()
