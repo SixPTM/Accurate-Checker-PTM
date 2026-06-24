@@ -1466,7 +1466,7 @@ def drive_cari_file_invoice(nomor_invoice):
 
 
 def baca_nominal_dari_gambar(image_bytes, mime_type):
-    """Kirim gambar ke Claude vision, minta baca nominal pembayaran."""
+    """Kirim gambar ke Claude vision, minta baca nominal total akhir. Return (angka, penjelasan)."""
     b64img = base64.b64encode(image_bytes).decode("utf-8")
     media = mime_type if mime_type in ("image/png", "image/jpeg", "image/webp", "image/gif") else "image/png"
     payload = {
@@ -1476,7 +1476,7 @@ def baca_nominal_dari_gambar(image_bytes, mime_type):
             "role": "user",
             "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": media, "data": b64img}},
-                {"type": "text", "text": "Ini bukti pembayaran/transfer. Berapa nominal/jumlah uang yang dibayarkan? Jawab HANYA angka rupiah tanpa titik/koma/teks lain. Kalau tidak jelas/tidak ada, jawab 0."}
+                {"type": "text", "text": "Ini bukti pembayaran/transfer. Berapa TOTAL AKHIR yang benar-benar dibayar (nominal setelah dikurangi potongan/diskon/voucher, BUKAN subtotal sebelum potongan)? Petunjuk: total akhir biasanya angka paling besar atau berwarna merah/menonjol. Balas dalam format PERSIS: 'ANGKA|penjelasan singkat'. Contoh: '46500|total setelah diskon, warna merah'. Kalau tidak jelas, balas '0|alasan'."}
             ]
         }]
     }
@@ -1488,9 +1488,16 @@ def baca_nominal_dari_gambar(image_bytes, mime_type):
     for blk in data.get("content", []):
         if blk.get("type") == "text":
             teks += blk["text"]
-    # ambil angka saja
-    angka = "".join(c for c in teks if c.isdigit())
-    return int(angka) if angka else 0
+    teks = teks.strip()
+    # format "ANGKA|penjelasan"
+    if "|" in teks:
+        bagian = teks.split("|", 1)
+        angka = "".join(c for c in bagian[0] if c.isdigit())
+        penjelasan = bagian[1].strip()
+    else:
+        angka = "".join(c for c in teks if c.isdigit())
+        penjelasan = ""
+    return (int(angka) if angka else 0, penjelasan)
 
 
 def tool_cek_bukti_bayar(host, chat_id, nomor_invoice):
@@ -1520,14 +1527,17 @@ def tool_cek_bukti_bayar(host, chat_id, nomor_invoice):
             # 3. Download file pertama, baca nominal
             f = files[0]
             img = drive_download_file(f["id"])
-            nominal_foto = baca_nominal_dari_gambar(img, f.get("mimeType", "image/png"))
+            nominal_foto, penjelasan = baca_nominal_dari_gambar(img, f.get("mimeType", "image/png"))
 
             # 4. Bandingkan
             msg = f"📎 *Cek Bukti Bayar {nomor_invoice}*\n\n"
             msg += f"File ditemukan: {f['name']}\n"
             if nilai_invoice is not None:
                 msg += f"Nilai invoice (Accurate): Rp {nilai_invoice:,.0f}\n"
-            msg += f"Nominal terbaca di bukti: Rp {nominal_foto:,.0f}\n\n"
+            msg += f"Nominal terbaca di bukti: Rp {nominal_foto:,.0f}\n"
+            if penjelasan:
+                msg += f"_(yang dibaca: {penjelasan})_\n"
+            msg += "\n"
             if nilai_invoice is not None and nominal_foto > 0:
                 selisih = nominal_foto - nilai_invoice
                 if abs(selisih) < 1:
