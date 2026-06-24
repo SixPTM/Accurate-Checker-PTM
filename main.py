@@ -1212,6 +1212,17 @@ TOOLS = [
             },
             "required": ["keyword", "date_from", "date_to"]
         }
+    },
+    {
+        "name": "cek_bukti_bayar",
+        "description": "Cek bukti bayar/pembayaran sebuah invoice dari Google Drive: cari file bukti (dinamai sesuai nomor invoice), baca nominal di foto, bandingkan dengan nilai invoice di Accurate. Untuk 'cek bukti bayar invoice X', 'apakah invoice X sudah ada bukti bayarnya', 'cocokkan pembayaran invoice X'. Background, hasil dikirim ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nomor_invoice": {"type": "string", "description": "Nomor invoice lengkap, contoh SI.2026.06.00986"}
+            },
+            "required": ["nomor_invoice"]
+        }
     }
 ]
 
@@ -1240,6 +1251,7 @@ Tools background (hasilnya dikirim otomatis ke Telegram setelah selesai, beri ta
 - get_unpaid_invoices_detail: daftar invoice belum bayar lengkap dengan nomor + nama + nilai (2-3 menit)
 - get_sales_per_salesman: rekap penjualan per tenaga penjual/sales (3-5 menit)
 - get_product_profit: hitung profit/margin produk (modal vs jual) (3-5 menit)
+- cek_bukti_bayar: cek & cocokkan bukti bayar invoice dari Google Drive
 - get_piutang_summary: total piutang (2-3 menit)
 - get_low_stock: produk yang stoknya menipis di bawah ambang batas (perlu sebut kategori produk)
 - get_overdue_customers: customer yang nunggak lewat jatuh tempo > sekian hari
@@ -1318,6 +1330,8 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_get_sales_per_salesman(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "get_product_profit":
                     result = tool_get_product_profit(host, chat_id, tool_input["keyword"], tool_input["date_from"], tool_input["date_to"])
+                elif tool_name == "cek_bukti_bayar":
+                    result = tool_cek_bukti_bayar(host, chat_id, tool_input["nomor_invoice"])
                 else:
                     result = json.dumps({"error": f"Unknown tool: {tool_name}"})
 
@@ -1423,6 +1437,114 @@ def drive_download_file(file_id):
                      headers={"Authorization": f"Bearer {token}"},
                      params={"alt": "media", "supportsAllDrives": "true"}, timeout=30)
     return r.content
+
+
+def drive_cari_subfolder(nama_subfolder):
+    """Cari ID subfolder (mis. 'Juni 2026') di dalam folder utama."""
+    token = get_drive_token()
+    q = f"'{GDRIVE_FOLDER_ID}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    r = requests.get("https://www.googleapis.com/drive/v3/files",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"q": q, "fields": "files(id,name)", "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}, timeout=20)
+    for f in r.json().get("files", []):
+        if f["name"].lower() == nama_subfolder.lower():
+            return f["id"]
+    return None
+
+
+def drive_cari_file_invoice(nomor_invoice):
+    """Cari file bukti bayar yang namanya mengandung nomor invoice, di semua subfolder."""
+    token = get_drive_token()
+    # cari di seluruh folder (folder utama + subfolder) berdasar nama mengandung nomor
+    safe = nomor_invoice.replace("'", "")
+    q = f"name contains '{safe}' and trashed=false"
+    r = requests.get("https://www.googleapis.com/drive/v3/files",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"q": q, "fields": "files(id,name,mimeType)", "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}, timeout=20)
+    files = [f for f in r.json().get("files", []) if f.get("mimeType") != "application/vnd.google-apps.folder"]
+    return files
+
+
+def baca_nominal_dari_gambar(image_bytes, mime_type):
+    """Kirim gambar ke Claude vision, minta baca nominal pembayaran."""
+    b64img = base64.b64encode(image_bytes).decode("utf-8")
+    media = mime_type if mime_type in ("image/png", "image/jpeg", "image/webp", "image/gif") else "image/png"
+    payload = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 300,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": media, "data": b64img}},
+                {"type": "text", "text": "Ini bukti pembayaran/transfer. Berapa nominal/jumlah uang yang dibayarkan? Jawab HANYA angka rupiah tanpa titik/koma/teks lain. Kalau tidak jelas/tidak ada, jawab 0."}
+            ]
+        }]
+    }
+    r = requests.post("https://api.anthropic.com/v1/messages",
+        headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+        json=payload, timeout=40)
+    data = r.json()
+    teks = ""
+    for blk in data.get("content", []):
+        if blk.get("type") == "text":
+            teks += blk["text"]
+    # ambil angka saja
+    angka = "".join(c for c in teks if c.isdigit())
+    return int(angka) if angka else 0
+
+
+def tool_cek_bukti_bayar(host, chat_id, nomor_invoice):
+    def run():
+        try:
+            h = host if host.startswith("http") else f"https://{host}"
+            # 1. Ambil nilai invoice dari Accurate
+            r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(),
+                params={"fields": "id,number", "filter.keywords": nomor_invoice, "sp.pageSize": 1}, timeout=15)
+            lst = r.json().get("d", [])
+            nilai_invoice = None
+            if lst:
+                inv_id = lst[0]["id"]
+                r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv_id}, timeout=15)
+                det = r2.json().get("d", {})
+                nilai_invoice = float(det.get("totalAmount") or 0)
+
+            # 2. Cari file bukti bayar di Drive
+            files = drive_cari_file_invoice(nomor_invoice)
+            if not files:
+                msg = f"❌ Bukti bayar untuk {nomor_invoice} TIDAK ditemukan di Google Drive."
+                if nilai_invoice is not None:
+                    msg += f"\nNilai invoice di Accurate: Rp {nilai_invoice:,.0f}"
+                send_message(chat_id, msg)
+                return
+
+            # 3. Download file pertama, baca nominal
+            f = files[0]
+            img = drive_download_file(f["id"])
+            nominal_foto = baca_nominal_dari_gambar(img, f.get("mimeType", "image/png"))
+
+            # 4. Bandingkan
+            msg = f"📎 *Cek Bukti Bayar {nomor_invoice}*\n\n"
+            msg += f"File ditemukan: {f['name']}\n"
+            if nilai_invoice is not None:
+                msg += f"Nilai invoice (Accurate): Rp {nilai_invoice:,.0f}\n"
+            msg += f"Nominal terbaca di bukti: Rp {nominal_foto:,.0f}\n\n"
+            if nilai_invoice is not None and nominal_foto > 0:
+                selisih = nominal_foto - nilai_invoice
+                if abs(selisih) < 1:
+                    msg += "✅ COCOK - nominal bukti sama dengan invoice."
+                else:
+                    msg += f"⚠️ BERBEDA - selisih Rp {selisih:,.0f}.\n_Bisa karena bayar sebagian, digabung invoice lain, biaya admin, atau foto terbaca kurang akurat._"
+            else:
+                msg += "_Tidak bisa membandingkan (nilai invoice atau nominal foto tidak terbaca)._"
+            send_message(chat_id, msg)
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal cek bukti bayar: {str(e)[:150]}")
+            print(f"[BUKTI BAYAR ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
 
 
 @app.route("/debug-env", methods=["GET"])
