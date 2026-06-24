@@ -1557,17 +1557,17 @@ def tool_get_produk_terlaku(host, chat_id, date_from, date_to, label=""):
                 send_message(chat_id, f"❌ Tidak ada produk terjual di periode {date_from} - {date_to}.")
                 return
 
-            # Urutkan dari qty tertinggi
-            urut = sorted(qty_map.items(), key=lambda x: x[1], reverse=True)
+            # Urutkan dari NILAI Rp tertinggi (nominal terbesar)
+            urut = sorted(nilai_map.items(), key=lambda x: x[1], reverse=True)
             total_qty = sum(qty_map.values())
             total_nilai = sum(nilai_map.values())
             judul = label or f"{date_from} - {date_to}"
-            msg = f"🏆 *Produk Terlaku - {judul}*\n"
+            msg = f"🏆 *Produk Terlaku (by Nominal) - {judul}*\n"
             msg += f"Dari {len(all_ids)} invoice | Total {total_qty:,.0f} pcs | Rp {total_nilai:,.0f}\n\n"
-            for i, (nm, qty) in enumerate(urut, 1):
-                nilai = nilai_map.get(nm, 0)
+            for i, (nm, nilai) in enumerate(urut, 1):
+                qty = qty_map.get(nm, 0)
                 jml_inv = inv_map.get(nm, 0)
-                msg += f"{i}. {nm}: {qty:,.0f} pcs | {jml_inv} inv | Rp {nilai:,.0f}\n"
+                msg += f"{i}. {nm}: Rp {nilai:,.0f} | {qty:,.0f} pcs | {jml_inv} inv\n"
             send_message(chat_id, msg)
         except Exception as e:
             send_message(chat_id, f"❌ Gagal rekap produk: {str(e)[:120]}")
