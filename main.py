@@ -1214,6 +1214,19 @@ TOOLS = [
         }
     },
     {
+        "name": "get_produk_terlaku",
+        "description": "Rekap SEMUA produk terlaku/terjual di satu rentang tanggal, diurutkan dari qty tertinggi ke terendah, semua kategori sekaligus (tidak perlu keyword). Untuk 'produk terlaku hari ini', 'produk paling laris minggu ini', 'urutkan semua produk dari penjualan tertinggi'. Cocok untuk rentang pendek (harian/mingguan) karena cepat. Untuk rentang panjang sebulan penuh boleh juga tapi lebih lama. Background, hasil dikirim ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD/MM/YYYY"},
+                "date_to": {"type": "string", "description": "DD/MM/YYYY"},
+                "label": {"type": "string", "description": "Label periode, contoh 'Hari Ini 24 Juni 2026'"}
+            },
+            "required": ["date_from", "date_to"]
+        }
+    },
+    {
         "name": "cek_bukti_bayar",
         "description": "Cek bukti bayar/pembayaran sebuah invoice dari Google Drive: cari file bukti (dinamai sesuai nomor invoice), baca nominal di foto, bandingkan dengan nilai invoice di Accurate. Untuk 'cek bukti bayar invoice X', 'apakah invoice X sudah ada bukti bayarnya', 'cocokkan pembayaran invoice X'. Background, hasil dikirim ke Telegram.",
         "input_schema": {
@@ -1252,6 +1265,7 @@ Tools background (hasilnya dikirim otomatis ke Telegram setelah selesai, beri ta
 - get_sales_per_salesman: rekap penjualan per tenaga penjual/sales (3-5 menit)
 - get_product_profit: hitung profit/margin produk (modal vs jual) (3-5 menit)
 - cek_bukti_bayar: cek & cocokkan bukti bayar invoice dari Google Drive
+- get_produk_terlaku: rekap SEMUA produk terlaku di rentang tanggal, terurut tertinggi-terendah, tanpa perlu keyword. WAJIB pakai ini untuk 'produk terlaku hari ini/minggu ini', JANGAN pakai get_sales_per_item (yang butuh keyword) atau get_top_products_background (yang untuk bulanan). Untuk 'produk terlaku hari ini' panggil dengan date_from=date_to=tanggal hari ini.
 - get_piutang_summary: total piutang (2-3 menit)
 - get_low_stock: produk yang stoknya menipis di bawah ambang batas (perlu sebut kategori produk)
 - get_overdue_customers: customer yang nunggak lewat jatuh tempo > sekian hari
@@ -1332,6 +1346,8 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_get_product_profit(host, chat_id, tool_input["keyword"], tool_input["date_from"], tool_input["date_to"])
                 elif tool_name == "cek_bukti_bayar":
                     result = tool_cek_bukti_bayar(host, chat_id, tool_input["nomor_invoice"])
+                elif tool_name == "get_produk_terlaku":
+                    result = tool_get_produk_terlaku(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 else:
                     result = json.dumps({"error": f"Unknown tool: {tool_name}"})
 
@@ -1498,6 +1514,76 @@ def baca_nominal_dari_gambar(image_bytes, mime_type):
         angka = "".join(c for c in teks if c.isdigit())
         penjelasan = ""
     return (int(angka) if angka else 0, penjelasan)
+
+
+def tool_get_produk_terlaku(host, chat_id, date_from, date_to, label=""):
+    def run():
+        try:
+            h = host if host.startswith("http") else f"https://{host}"
+            # Ambil semua invoice di rentang
+            all_ids = []
+            page = 1
+            while True:
+                params = {"fields": "id", "sp.pageSize": 200, "sp.page": page,
+                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
+                r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+                data = r.json()
+                if not data.get("s"): break
+                all_ids.extend(data.get("d", []))
+                sp = data.get("sp", {})
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+
+            lock = threading.Lock()
+            qty_map = {}
+            nilai_map = {}
+            def scan(inv):
+                try:
+                    r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=12)
+                    detail = r2.json().get("d", {})
+                    items = detail.get("detailItem", [])
+                    if not isinstance(items, list): return
+                    for item in items:
+                        if not isinstance(item, dict): continue
+                        item_obj = item.get("item", {})
+                        if isinstance(item_obj, list): item_obj = item_obj[0] if item_obj else {}
+                        nm = item.get("itemName") or (item_obj.get("name") if isinstance(item_obj, dict) else None) or "(tanpa nama)"
+                        qty = float(item.get("quantity") or item.get("qty") or 0)
+                        unit_jual = float(item.get("unitPrice") or item.get("price") or 0)
+                        amount = float(item.get("amount") or item.get("totalAmount") or item.get("totalPrice") or 0)
+                        if amount <= 0 and unit_jual > 0:
+                            amount = unit_jual * qty
+                        with lock:
+                            qty_map[nm] = qty_map.get(nm, 0) + qty
+                            nilai_map[nm] = nilai_map.get(nm, 0) + amount
+                except: pass
+
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                list(ex.map(scan, all_ids))
+
+            if not qty_map:
+                send_message(chat_id, f"❌ Tidak ada produk terjual di periode {date_from} - {date_to}.")
+                return
+
+            # Urutkan dari qty tertinggi
+            urut = sorted(qty_map.items(), key=lambda x: x[1], reverse=True)
+            total_qty = sum(qty_map.values())
+            total_nilai = sum(nilai_map.values())
+            judul = label or f"{date_from} - {date_to}"
+            msg = f"🏆 *Produk Terlaku - {judul}*\n"
+            msg += f"Dari {len(all_ids)} invoice | Total {total_qty:,.0f} pcs | Rp {total_nilai:,.0f}\n\n"
+            for i, (nm, qty) in enumerate(urut, 1):
+                nilai = nilai_map.get(nm, 0)
+                msg += f"{i}. {nm}: {qty:,.0f} pcs (Rp {nilai:,.0f})\n"
+            send_message(chat_id, msg)
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal rekap produk: {str(e)[:120]}")
+            print(f"[PRODUK TERLAKU ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
 
 
 def tool_cek_bukti_bayar(host, chat_id, nomor_invoice):
