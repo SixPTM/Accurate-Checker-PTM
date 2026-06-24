@@ -1537,12 +1537,14 @@ def tool_get_produk_terlaku(host, chat_id, date_from, date_to, label=""):
             lock = threading.Lock()
             qty_map = {}
             nilai_map = {}
+            inv_map = {}
             def scan(inv):
                 try:
                     r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=12)
                     detail = r2.json().get("d", {})
                     items = detail.get("detailItem", [])
                     if not isinstance(items, list): return
+                    produk_di_inv = set()
                     for item in items:
                         if not isinstance(item, dict): continue
                         item_obj = item.get("item", {})
@@ -1556,6 +1558,10 @@ def tool_get_produk_terlaku(host, chat_id, date_from, date_to, label=""):
                         with lock:
                             qty_map[nm] = qty_map.get(nm, 0) + qty
                             nilai_map[nm] = nilai_map.get(nm, 0) + amount
+                        produk_di_inv.add(nm)
+                    with lock:
+                        for nm in produk_di_inv:
+                            inv_map[nm] = inv_map.get(nm, 0) + 1
                 except: pass
 
             with ThreadPoolExecutor(max_workers=8) as ex:
@@ -1574,7 +1580,8 @@ def tool_get_produk_terlaku(host, chat_id, date_from, date_to, label=""):
             msg += f"Dari {len(all_ids)} invoice | Total {total_qty:,.0f} pcs | Rp {total_nilai:,.0f}\n\n"
             for i, (nm, qty) in enumerate(urut, 1):
                 nilai = nilai_map.get(nm, 0)
-                msg += f"{i}. {nm}: {qty:,.0f} pcs (Rp {nilai:,.0f})\n"
+                jml_inv = inv_map.get(nm, 0)
+                msg += f"{i}. {nm}: {qty:,.0f} pcs | {jml_inv} inv | Rp {nilai:,.0f}\n"
             send_message(chat_id, msg)
         except Exception as e:
             send_message(chat_id, f"❌ Gagal rekap produk: {str(e)[:120]}")
