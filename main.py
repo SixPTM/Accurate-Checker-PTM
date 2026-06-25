@@ -1538,6 +1538,7 @@ def drive_cari_file_invoice(nomor_invoice):
 
 def baca_nominal_dari_gambar(image_bytes, mime_type):
     """Kirim gambar ke Claude vision, minta baca nominal total akhir. Return (angka, penjelasan)."""
+    import re as _re
     b64img = base64.b64encode(image_bytes).decode("utf-8")
     media = mime_type if mime_type in ("image/png", "image/jpeg", "image/webp", "image/gif") else "image/png"
     payload = {
@@ -1547,28 +1548,43 @@ def baca_nominal_dari_gambar(image_bytes, mime_type):
             "role": "user",
             "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": media, "data": b64img}},
-                {"type": "text", "text": "Ini bukti pembayaran/transfer. Berapa TOTAL AKHIR yang benar-benar dibayar (nominal setelah dikurangi potongan/diskon/voucher, BUKAN subtotal sebelum potongan)? Petunjuk: total akhir biasanya angka paling besar atau berwarna merah/menonjol. Balas dalam format PERSIS: 'ANGKA|penjelasan singkat'. Contoh: '46500|total setelah diskon, warna merah'. Kalau tidak jelas, balas '0|alasan'."}
+                {"type": "text", "text": "Ini bukti pembayaran/transfer (sering dari Shopee/marketplace). Baca nominal TOTAL yang dibayar pembeli (atau total penghasilan yang tertera paling menonjol). PENTING soal format jawaban: baris PERTAMA berisi HANYA angka nominal tanpa titik, koma, Rp, atau teks apa pun (contoh kalau Rp59.980 tulis: 59980). Baris KEDUA berisi penjelasan singkat. Jangan tulis angka lain di baris pertama. Kalau tidak terbaca, baris pertama tulis 0."}
             ]
         }]
     }
-    r = requests.post("https://api.anthropic.com/v1/messages",
-        headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-        json=payload, timeout=40)
-    data = r.json()
+    try:
+        r = requests.post("https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json=payload, timeout=40)
+        data = r.json()
+    except Exception:
+        return (0, "gagal hubungi AI")
     teks = ""
     for blk in data.get("content", []):
         if blk.get("type") == "text":
             teks += blk["text"]
     teks = teks.strip()
-    # format "ANGKA|penjelasan"
-    if "|" in teks:
-        bagian = teks.split("|", 1)
-        angka = "".join(c for c in bagian[0] if c.isdigit())
-        penjelasan = bagian[1].strip()
-    else:
-        angka = "".join(c for c in teks if c.isdigit())
-        penjelasan = ""
-    return (int(angka) if angka else 0, penjelasan)
+    if not teks:
+        return (0, "")
+    baris = teks.split("\n")
+    baris1 = baris[0]
+    penjelasan = " ".join(baris[1:]).strip() if len(baris) > 1 else ""
+    # Dari baris pertama, ambil rangkaian angka pertama; buang titik/koma ribuan
+    bersih = baris1.replace(".", "").replace(",", "").replace(" ", "")
+    m = _re.search(r"\d+", bersih)
+    angka = 0
+    if m:
+        kandidat = m.group(0)
+        # batasi panjang wajar (maks 12 digit = ratusan miliar); kalau lebih, ambil 12 pertama
+        if len(kandidat) > 12:
+            kandidat = kandidat[:12]
+        try:
+            angka = int(kandidat)
+        except:
+            angka = 0
+    if not penjelasan:
+        penjelasan = baris1[:80]
+    return (angka, penjelasan)
 
 
 def tool_get_produk_terlaku(host, chat_id, date_from, date_to, label=""):
