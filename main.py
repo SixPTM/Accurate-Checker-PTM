@@ -1790,11 +1790,13 @@ def tool_cek_bukti_bayar(host, chat_id, nomor_invoice):
                 params={"fields": "id,number", "filter.keywords": nomor_invoice, "sp.pageSize": 1}, timeout=15)
             lst = r.json().get("d", [])
             nilai_invoice = None
-            if lst:
-                inv_id = lst[0]["id"]
-                r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv_id}, timeout=15)
-                det = r2.json().get("d", {})
-                nilai_invoice = float(det.get("totalAmount") or 0)
+            if lst and isinstance(lst[0], dict):
+                inv_id = lst[0].get("id")
+                if inv_id:
+                    r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv_id}, timeout=15)
+                    det = r2.json().get("d", {})
+                    if isinstance(det, dict):
+                        nilai_invoice = float(det.get("totalAmount") or 0)
 
             # 2. Cari file bukti bayar di Drive
             files = drive_cari_file_invoice(nomor_invoice)
@@ -1807,6 +1809,9 @@ def tool_cek_bukti_bayar(host, chat_id, nomor_invoice):
 
             # 3. Download file pertama, baca nominal
             f = files[0]
+            if not isinstance(f, dict) or not f.get("id"):
+                send_message(chat_id, f"❌ File bukti {nomor_invoice} ditemukan tapi formatnya tidak terbaca.")
+                return
             img = drive_download_file(f["id"])
             nominal_foto, penjelasan = baca_nominal_dari_gambar(img, f.get("mimeType", "image/png"))
 
