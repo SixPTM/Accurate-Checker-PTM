@@ -864,7 +864,7 @@ def tool_get_product_profit(host, chat_id, keyword, date_from, date_to):
                         det = r2.json().get("d", {})
                         modal = float(det.get("balanceUnitCost") or 0)
                         with lock0:
-                            modal_map[it["name"]] = modal
+                            modal_map[_normalisasi_nama(it["name"])] = modal
                     except: pass
                 with ThreadPoolExecutor(max_workers=8) as ex:
                     list(ex.map(amb, cocok))
@@ -936,7 +936,7 @@ def tool_get_product_profit(host, chat_id, keyword, date_from, date_to):
             # Modal total = sum(qty terjual * modal per unit varian)
             total_modal = 0.0
             for nm, qty in jual_qty.items():
-                modal_unit = modal_map.get(nm, 0)
+                modal_unit = modal_map.get(_normalisasi_nama(nm), 0)
                 total_modal += qty * modal_unit
             laba = total_jual - total_modal
             margin = (laba / total_jual * 100) if total_jual > 0 else 0
@@ -950,7 +950,7 @@ def tool_get_product_profit(host, chat_id, keyword, date_from, date_to):
             for nm in sorted(jual_qty, key=lambda x: jual_total.get(x,0), reverse=True):
                 qty = jual_qty[nm]
                 jual = jual_total.get(nm, 0)
-                modal_unit = modal_map.get(nm, 0)
+                modal_unit = modal_map.get(_normalisasi_nama(nm), 0)
                 jual_unit = (jual/qty) if qty else 0
                 m = ((jual_unit - modal_unit)/jual_unit*100) if jual_unit else 0
                 msg += f"• {nm}: jual Rp {jual_unit:,.0f}/pcs, modal Rp {modal_unit:,.0f}/pcs → margin {m:.0f}%\n"
