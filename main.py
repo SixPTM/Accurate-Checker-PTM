@@ -1297,6 +1297,20 @@ TOOLS = [
         }
     },
     {
+        "name": "get_customer_terbanyak",
+        "description": "Rekap CUSTOMER dengan order/pesanan TERBANYAK di satu periode: tiap customer berapa kali order (jumlah invoice) dan total nilai belanjanya, diurutkan dari terbanyak. WAJIB pakai tool ini untuk 'customer order terbanyak', 'pelanggan paling sering pesan', 'customer dengan belanja terbesar', 'siapa customer paling aktif 6 bulan'. JANGAN pakai get_unpaid_invoices_detail atau get_invoices untuk ini. Default urut by jumlah order; pakai urut_by='nilai' kalau user minta yang belanjanya/nilainya terbesar. Background 2-3 menit, hasil ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD/MM/YYYY"},
+                "date_to": {"type": "string", "description": "DD/MM/YYYY"},
+                "label": {"type": "string", "description": "Label periode, contoh '6 Bulan Terakhir' atau 'Jan-Jun 2026'"},
+                "urut_by": {"type": "string", "description": "'order' (default, urut jumlah order) atau 'nilai' (urut total belanja Rp terbesar)"}
+            },
+            "required": ["date_from", "date_to"]
+        }
+    },
+    {
         "name": "cek_bukti_bayar",
         "description": "Cek bukti bayar/pembayaran sebuah invoice dari Google Drive: cari file bukti (dinamai sesuai nomor invoice), baca nominal di foto, bandingkan dengan nilai invoice di Accurate. Untuk 'cek bukti bayar invoice X', 'apakah invoice X sudah ada bukti bayarnya', 'cocokkan pembayaran invoice X'. Background, hasil dikirim ke Telegram.",
         "input_schema": {
@@ -1341,6 +1355,7 @@ Tools background (hasilnya dikirim otomatis ke Telegram setelah selesai, beri ta
 - cek_piutang_customer: cek piutang SATU customer berdasarkan nama + umur piutang (berapa hari). WAJIB pakai ini untuk 'piutang si X', 'utang customer Y berapa', JANGAN pakai get_invoices. Cukup beri nama customer apa adanya.
 - piutang_per_sales: rekap piutang DIKELOMPOKKAN PER SALES + rincian customer & umur. WAJIB pakai ini untuk 'piutang per sales', 'tagihan belum bayar tiap sales'. JANGAN pakai get_invoices atau get_sales_per_salesman (itu untuk omset, bukan piutang).
 - get_produk_terlaku: rekap SEMUA produk terlaku di rentang tanggal, terurut dari qty tertinggi ke terendah, menampilkan qty + jumlah invoice + nilai Rp, tanpa perlu keyword. WAJIB pakai ini untuk SEMUA pertanyaan 'produk terlaku/terlaris/paling laku' baik harian, mingguan, MAUPUN BULANAN. Untuk 'produk terlaku hari ini' panggil date_from=date_to=tanggal hari ini. Untuk 'produk terlaku bulan ini' panggil date_from=01/bulan, date_to=tanggal hari ini.
+- get_customer_terbanyak: rekap CUSTOMER dengan order terbanyak di satu periode (berapa kali order + total belanja), terurut dari terbanyak. WAJIB pakai ini untuk 'customer order terbanyak', 'pelanggan paling sering pesan', 'customer belanja terbesar', 'customer paling aktif'. Default urut_by='order' (jumlah order); pakai urut_by='nilai' kalau user minta yang nilai/belanjanya terbesar. Untuk '6 bulan terakhir' hitung date_from = tanggal 6 bulan lalu, date_to = hari ini.
 - get_piutang_summary: total piutang (2-3 menit)
 - get_low_stock: produk yang stoknya menipis di bawah ambang batas (perlu sebut kategori produk)
 - get_overdue_customers: customer yang nunggak lewat jatuh tempo > sekian hari
@@ -1435,6 +1450,8 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_piutang_per_sales(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "get_produk_terlaku":
                     result = tool_get_produk_terlaku(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
+                elif tool_name == "get_customer_terbanyak":
+                    result = tool_get_customer_terbanyak(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""), tool_input.get("urut_by","order"))
                 else:
                     result = json.dumps({"error": f"Unknown tool: {tool_name}"})
 
@@ -1746,6 +1763,103 @@ def tool_cek_rekening_tujuan(host, chat_id, date_from, date_to, label=""):
         except Exception as e:
             send_message(chat_id, f"❌ Gagal cek rekening tujuan: {str(e)[:150]}")
             print(f"[REKENING ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
+
+
+def tool_get_customer_terbanyak(host, chat_id, date_from, date_to, label="", urut_by="order"):
+    def run():
+        try:
+            h = host if host.startswith("http") else f"https://{host}"
+            # Ambil semua invoice di periode (semua halaman) beserta nama customer & nilai
+            all_inv = []
+            page = 1
+            total_invoice = 0
+            while True:
+                params = {"fields": "id,number,retailWpName,totalAmount,subTotal", "sp.pageSize": 200, "sp.page": page,
+                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
+                r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+                data = r.json()
+                if not data.get("s"): break
+                page_data = data.get("d", [])
+                sp = data.get("sp", {})
+                if page == 1: total_invoice = sp.get("rowCount", 0)
+                all_inv.extend(page_data)
+                print(f"[CUST TERBANYAK] page {page}/{sp.get('pageCount',1)} loaded={len(all_inv)}")
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+
+            # Cek apakah nama customer sudah ada di list (retailWpName).
+            # Untuk invoice yang namanya kosong, baru buka detail (hemat waktu).
+            lock = threading.Lock()
+            cust = {}  # nama -> {"count": x, "total": y}
+
+            def catat(name, nilai):
+                if not name or not str(name).strip():
+                    name = "Tanpa Nama"
+                with lock:
+                    if name not in cust:
+                        cust[name] = {"count": 0, "total": 0.0}
+                    cust[name]["count"] += 1
+                    cust[name]["total"] += nilai
+
+            perlu_detail = []
+            for inv in all_inv:
+                if not isinstance(inv, dict): continue
+                nama = inv.get("retailWpName")
+                nilai = float(inv.get("totalAmount") or inv.get("subTotal") or 0)
+                if nama and str(nama).strip():
+                    catat(nama, nilai)
+                else:
+                    perlu_detail.append(inv)
+
+            # Invoice tanpa nama di list -> ambil dari detail dengan fallback lengkap
+            def ambil_detail(inv):
+                try:
+                    r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=12)
+                    det = r2.json().get("d", {})
+                    customer = det.get("customer")
+                    if isinstance(customer, dict): cname = customer.get("name")
+                    elif isinstance(customer, list) and customer: cname = customer[0].get("name") if isinstance(customer[0], dict) else None
+                    else: cname = None
+                    nama = det.get("retailWpName") or det.get("customerName") or cname or "Tanpa Nama"
+                    nilai = float(det.get("totalAmount") or det.get("subTotal") or inv.get("totalAmount") or 0)
+                    catat(nama, nilai)
+                except: 
+                    catat("Tanpa Nama", float(inv.get("totalAmount") or 0))
+
+            if perlu_detail:
+                with ThreadPoolExecutor(max_workers=8) as ex:
+                    list(ex.map(ambil_detail, perlu_detail))
+
+            if not cust:
+                send_message(chat_id, f"❌ Tidak ada data order di periode {date_from} - {date_to}.")
+                return
+
+            # Urutkan: by 'nilai' (total belanja) atau by 'order' (jumlah invoice)
+            if urut_by == "nilai":
+                urut = sorted(cust.items(), key=lambda x: x[1]["total"], reverse=True)
+                judul_urut = "Total Belanja Terbesar"
+            else:
+                urut = sorted(cust.items(), key=lambda x: x[1]["count"], reverse=True)
+                judul_urut = "Order Terbanyak"
+
+            grand_total = sum(v["total"] for v in cust.values())
+            judul = label or f"{date_from} - {date_to}"
+            msg = f"🏅 *Customer {judul_urut} - {judul}*\n"
+            msg += f"Total invoice: {total_invoice} | Total nilai: Rp {grand_total:,.0f}\n"
+            msg += f"Jumlah customer: {len(cust)}\n\n*Top 30:*\n"
+            for i, (nama, d) in enumerate(urut[:30], 1):
+                msg += f"{i}. {nama} — {d['count']} order | Rp {d['total']:,.0f}\n"
+            if len(urut) > 30:
+                msg += f"\n_...dan {len(urut)-30} customer lainnya_"
+            send_message(chat_id, msg)
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal rekap customer: {str(e)[:120]}")
+            print(f"[CUST TERBANYAK ERROR] {e}")
 
     t = threading.Thread(target=run)
     t.daemon = True
