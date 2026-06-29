@@ -1866,7 +1866,13 @@ def tool_piutang_per_sales(host, chat_id, date_from, date_to, label=""):
                 owing = float(detail.get("primeOwing") or 0)
                 if owing <= 0: return  # cuma yang masih ada piutang
                 sales = detail.get("masterSalesmanName") or "Tanpa Sales"
-                cust = detail.get("retailWpName") or detail.get("customerName") or "?"
+                # Ambil nama customer dengan fallback lengkap (sama seperti fungsi lain),
+                # supaya tidak muncul '?' kalau retailWpName/customerName kosong.
+                customer = detail.get("customer")
+                if isinstance(customer, dict): cname = customer.get("name")
+                elif isinstance(customer, list) and customer: cname = customer[0].get("name") if isinstance(customer[0], dict) else None
+                else: cname = None
+                cust = detail.get("retailWpName") or detail.get("customerName") or cname or "Tanpa Nama"
                 due = detail.get("dueDate") or inv.get("dueDate") or ""
                 tgl = detail.get("transDate") or inv.get("transDate") or ""
                 umur = None
@@ -1944,7 +1950,7 @@ def tool_cek_piutang_customer(host, chat_id, nama_customer):
             nama_terdeteksi = set()
 
             def proses_satu(inv, owing):
-                cust = inv.get("retailWpName") or "?"
+                cust = inv.get("retailWpName") or "Tanpa Nama"
                 with lock:
                     nama_terdeteksi.add(cust)
                 if owing and owing > 0:
