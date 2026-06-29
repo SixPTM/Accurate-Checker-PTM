@@ -2131,31 +2131,28 @@ def debug_finance():
         host = get_host()
         if not host: return {"error": "Gagal dapat host"}, 500
         h = host if host.startswith("http") else f"https://{host}"
-        # Ambil beberapa invoice Juni, tampilkan SEMUA field di detailItem (untuk cari harga jual)
-        r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(),
-            params={"fields": "id", "sp.pageSize": 200, "sp.page": 1,
-                "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": "01/06/2026", "filter.transDate.val[1]": "30/06/2026"}, timeout=30)
-        ids = r.json().get("d", [])
-        hasil = []
-        for inv in ids[:50]:
-            try:
-                r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=12)
-                detail = r2.json().get("d", {})
-                items = detail.get("detailItem", [])
-                if not isinstance(items, list): continue
-                for item in items:
-                    if not isinstance(item, dict): continue
-                    nm = item.get("itemName") or ""
-                    if "sultan" in nm.lower() or "garvi" in nm.lower():
-                        # tampilkan semua field angka di item ini
-                        angka = {k: v for k, v in item.items() if isinstance(v, (int, float))}
-                        hasil.append({"itemName": nm, "field_angka": angka})
-                        if len(hasil) >= 3:
-                            return {"contoh_detailItem": hasil}
-            except: pass
-        return {"contoh_detailItem": hasil, "catatan": "kalau kosong, tidak ketemu sultan/garvi di 50 invoice pertama"}
+        all_inv = []
+        page = 1
+        while True:
+            params = {"fields": "id,number,transDate", "filter.keywords": "PRINTIVA MULTIPACK",
+                      "sp.pageSize": 100, "sp.page": page}
+            r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+            data = r.json()
+            if not data.get("s"): break
+            all_inv.extend(data.get("d", []))
+            sp = data.get("sp", {})
+            if page >= sp.get("pageCount", 1): break
+            page += 1
+            if page > 30: break
+        tgls = [i.get("transDate") for i in all_inv if isinstance(i, dict)]
+        return {
+            "jumlah_invoice_printiva_terdeteksi": len(all_inv),
+            "contoh_5_pertama": [i.get("number") for i in all_inv[:5] if isinstance(i, dict)],
+            "contoh_5_terakhir": [i.get("number") for i in all_inv[-5:] if isinstance(i, dict)],
+            "rentang_tanggal": f"{min(tgls) if tgls else '?'} s/d {max(tgls) if tgls else '?'}"
+        }
     except Exception as e:
-        return {"error": str(e)}, 500
+        return {"error": f"{type(e).__name__}: {str(e)[:300]}"}, 500
 
 
 @app.route("/debug-nosales", methods=["GET"])
