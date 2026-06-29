@@ -1245,6 +1245,19 @@ TOOLS = [
         }
     },
     {
+        "name": "bukti_tidak_cocok_per_sales",
+        "description": "Cek bukti bayar satu periode, ambil yang nominalnya TIDAK COCOK dengan invoice, lalu kelompokkan PER SALES (nama sales -> nomor invoice -> nilai invoice vs bukti -> selisih). Untuk 'rincian bukti bayar yang tidak cocok per sales', 'invoice mana yang selisih dikelompokkan per salesman'. Background beberapa menit, hasil ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD/MM/YYYY"},
+                "date_to": {"type": "string", "description": "DD/MM/YYYY"},
+                "label": {"type": "string", "description": "Label periode"}
+            },
+            "required": ["date_from", "date_to"]
+        }
+    },
+    {
         "name": "cek_nominal_massal",
         "description": "Cek KECOCOKAN NOMINAL untuk SEMUA invoice satu periode yang ada bukti bayarnya di Drive sekaligus (baca foto vs nilai invoice), diproses paralel agar lebih cepat. Untuk 'cek apakah semua bukti bayar sudah sesuai/cocok', 'cocokkan nominal semua bukti bulan X'. Hanya memproses invoice yang sudah ada filenya di Drive. Background beberapa menit, hasil ke Telegram.",
         "input_schema": {
@@ -1310,6 +1323,7 @@ Tools background (hasilnya dikirim otomatis ke Telegram setelah selesai, beri ta
 - cek_bukti_bayar: cek & cocokkan bukti bayar SATU invoice dari Google Drive (baca nominal foto)
 - cek_bukti_bayar_massal: cek SEMUA invoice satu periode, mana yang sudah/belum ada file bukti di Drive. WAJIB pakai ini untuk 'cek semua bukti bayar bulan X', 'invoice mana yang belum ada bukti'. JANGAN pakai get_invoices/attachmentExist (itu lampiran Accurate, bukan Drive). Ini cek keberadaan file saja, bukan nominal.
 - cek_nominal_massal: cek KECOCOKAN NOMINAL semua bukti bayar satu periode sekaligus (baca foto vs invoice, paralel). WAJIB pakai ini untuk 'cek apakah semua bukti sudah sesuai/cocok', 'cocokkan nominal semua bukti'. Lebih cepat dari cek satu-satu.
+- bukti_tidak_cocok_per_sales: cek bukti bayar yang TIDAK COCOK, dikelompokkan per SALES (sales -> invoice -> selisih). WAJIB pakai ini untuk 'rincian bukti tidak cocok per sales', 'invoice selisih dikelompokkan per salesman'. Langsung jalankan, JANGAN minta user kirim hasil sebelumnya.
 - cek_piutang_customer: cek piutang SATU customer berdasarkan nama + umur piutang (berapa hari). WAJIB pakai ini untuk 'piutang si X', 'utang customer Y berapa', JANGAN pakai get_invoices. Cukup beri nama customer apa adanya.
 - piutang_per_sales: rekap piutang DIKELOMPOKKAN PER SALES + rincian customer & umur. WAJIB pakai ini untuk 'piutang per sales', 'tagihan belum bayar tiap sales'. JANGAN pakai get_invoices atau get_sales_per_salesman (itu untuk omset, bukan piutang).
 - get_produk_terlaku: rekap SEMUA produk terlaku di rentang tanggal, terurut dari qty tertinggi ke terendah, menampilkan qty + jumlah invoice + nilai Rp, tanpa perlu keyword. WAJIB pakai ini untuk SEMUA pertanyaan 'produk terlaku/terlaris/paling laku' baik harian, mingguan, MAUPUN BULANAN. Untuk 'produk terlaku hari ini' panggil date_from=date_to=tanggal hari ini. Untuk 'produk terlaku bulan ini' panggil date_from=01/bulan, date_to=tanggal hari ini.
@@ -1397,6 +1411,8 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_cek_bukti_bayar_massal(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "cek_nominal_massal":
                     result = tool_cek_nominal_massal(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
+                elif tool_name == "bukti_tidak_cocok_per_sales":
+                    result = tool_bukti_tidak_cocok_per_sales(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "cek_piutang_customer":
                     result = tool_cek_piutang_customer(host, chat_id, tool_input["nama_customer"])
                 elif tool_name == "piutang_per_sales":
@@ -1831,6 +1847,122 @@ def tool_cek_piutang_customer(host, chat_id, nama_customer):
         except Exception as e:
             send_message(chat_id, f"❌ Gagal cek piutang customer: {str(e)[:120]}")
             print(f"[PIUTANG CUST ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
+
+
+def tool_bukti_tidak_cocok_per_sales(host, chat_id, date_from, date_to, label=""):
+    def run():
+        try:
+            h = host if host.startswith("http") else f"https://{host}"
+            token = get_drive_token()
+            # 1. Kumpulkan file Drive: nomor(upper) -> {id, mimeType}
+            file_map = {}
+            def daftar(folder_id):
+                page_token = None
+                while True:
+                    params = {"q": f"'{folder_id}' in parents and trashed=false",
+                              "fields": "nextPageToken,files(id,name,mimeType)", "pageSize": 1000,
+                              "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}
+                    if page_token: params["pageToken"] = page_token
+                    rs = requests.get("https://www.googleapis.com/drive/v3/files",
+                        headers={"Authorization": f"Bearer {token}"}, params=params, timeout=30)
+                    ds = rs.json()
+                    for x in ds.get("files", []):
+                        if x.get("mimeType") == "application/vnd.google-apps.folder":
+                            daftar(x["id"])
+                        else:
+                            key = x["name"].rsplit(".", 1)[0].strip().upper()
+                            file_map[key] = {"id": x["id"], "mimeType": x.get("mimeType", "image/png")}
+                    page_token = ds.get("nextPageToken")
+                    if not page_token: break
+            r = requests.get("https://www.googleapis.com/drive/v3/files",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"q": f"'{GDRIVE_FOLDER_ID}' in parents and trashed=false", "fields": "files(id,name,mimeType)",
+                        "pageSize": 1000, "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}, timeout=30)
+            for f in r.json().get("files", []):
+                if f.get("mimeType") == "application/vnd.google-apps.folder":
+                    daftar(f["id"])
+                else:
+                    key = f["name"].rsplit(".", 1)[0].strip().upper()
+                    file_map[key] = {"id": f["id"], "mimeType": f.get("mimeType", "image/png")}
+
+            # 2. Ambil invoice periode + nilai
+            all_inv = []
+            page = 1
+            while True:
+                params = {"fields": "id,number,totalAmount", "sp.pageSize": 200, "sp.page": page,
+                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
+                rr = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+                dd = rr.json()
+                if not dd.get("s"): break
+                all_inv.extend(dd.get("d", []))
+                sp = dd.get("sp", {})
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+
+            target = []
+            for inv in all_inv:
+                if not isinstance(inv, dict): continue
+                nomor = (inv.get("number") or "").strip().upper()
+                if nomor in file_map:
+                    target.append({"id": inv.get("id"), "number": inv.get("number"),
+                                   "nilai": float(inv.get("totalAmount") or 0), "file": file_map[nomor]})
+            if not target:
+                send_message(chat_id, f"Tidak ada invoice {label} yang ada bukti di Drive.")
+                return
+
+            # 3. Baca nominal paralel; kumpulkan yang BEDA
+            lock = threading.Lock()
+            beda = []
+            def proses(t):
+                try:
+                    img = drive_download_file(t["file"]["id"])
+                    nominal, _ = baca_nominal_dari_gambar(img, t["file"]["mimeType"])
+                    if nominal > 0 and abs(nominal - t["nilai"]) >= 1:
+                        with lock:
+                            beda.append({"id": t["id"], "number": t["number"], "invoice": t["nilai"], "bukti": nominal})
+                except: pass
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                list(ex.map(proses, target))
+
+            if not beda:
+                send_message(chat_id, f"✅ Semua bukti bayar {label} yang terbaca COCOK dengan invoice. Tidak ada yang berbeda.")
+                return
+
+            # 4. Untuk yang beda, ambil nama sales dari detail
+            def ambil_sales(b):
+                try:
+                    r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": b["id"]}, timeout=12)
+                    det = r2.json().get("d", {})
+                    b["sales"] = det.get("masterSalesmanName") or "Tanpa Sales"
+                except:
+                    b["sales"] = "?"
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                list(ex.map(ambil_sales, beda))
+
+            # 5. Kelompokkan per sales
+            per_sales = {}
+            for b in beda:
+                per_sales.setdefault(b["sales"], []).append(b)
+
+            judul = label or f"{date_from} - {date_to}"
+            msg = f"⚠️ *Bukti Bayar Tidak Cocok per Sales - {judul}*\n"
+            msg += f"Total tidak cocok: {len(beda)} invoice\n\n"
+            for sales in sorted(per_sales, key=lambda s: len(per_sales[s]), reverse=True):
+                items = per_sales[sales]
+                msg += f"━━━━━━━━━━\n👤 *{sales}* ({len(items)} invoice)\n"
+                for b in items:
+                    selisih = b["bukti"] - b["invoice"]
+                    msg += f"  • {b['number']}: invoice Rp {b['invoice']:,.0f} vs bukti Rp {b['bukti']:,.0f} (selisih Rp {selisih:,.0f})\n"
+            msg += "\n_Nominal foto dibaca AI, selisih kecil bisa karena salah baca digit. Selisih besar perlu dicek manual._"
+            send_message(chat_id, msg)
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal: {str(e)[:150]}")
+            print(f"[BEDA PER SALES ERROR] {e}")
 
     t = threading.Thread(target=run)
     t.daemon = True
