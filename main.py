@@ -1751,12 +1751,12 @@ def tool_cek_piutang_customer(host, chat_id, nama_customer):
         try:
             h = host if host.startswith("http") else f"https://{host}"
             from datetime import datetime
-            # Cari invoice yang nama customernya mengandung keyword (pakai filter.keywords)
+            # Ambil SEMUA invoice customer ini, sekaligus minta primeOwing di list (tanpa buka detail satu-satu)
             all_inv = []
             page = 1
             while True:
-                params = {"fields": "id,number,transDate,dueDate,totalAmount,retailWpName,statusName",
-                    "filter.keywords": nama_customer, "sp.pageSize": 100, "sp.page": page, "sp.sort": "transDate"}
+                params = {"fields": "id,number,transDate,dueDate,primeOwing,retailWpName",
+                    "filter.keywords": nama_customer, "sp.pageSize": 100, "sp.page": page}
                 r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
                 data = r.json()
                 if not data.get("s"): break
@@ -1764,47 +1764,54 @@ def tool_cek_piutang_customer(host, chat_id, nama_customer):
                 sp = data.get("sp", {})
                 if page >= sp.get("pageCount", 1): break
                 page += 1
-                if page > 10: break  # batasi maksimal 1000 invoice
+                if page > 50: break  # pengaman, maksimal 5000 invoice
 
             if not all_inv:
                 send_message(chat_id, f"❌ Tidak ditemukan invoice untuk customer '{nama_customer}'. Coba cek ejaan namanya.")
                 return
 
-            # Enrich tiap invoice: ambil primeOwing (sisa tagihan) dari detail
+            # Cek apakah primeOwing tersedia di list. Kalau semua None/tidak ada, fallback ke detail.
+            ada_owing_di_list = any(isinstance(i, dict) and i.get("primeOwing") is not None for i in all_inv)
+
             lock = threading.Lock()
             piutang = []
             nama_terdeteksi = set()
-            def cek(inv):
-                try:
-                    r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=12)
-                    det = r2.json().get("d", {})
-                    owing = float(det.get("primeOwing") or 0)
-                    cust = det.get("retailWpName") or det.get("customerName") or "?"
-                    with lock:
-                        nama_terdeteksi.add(cust)
-                    if owing > 0:
-                        tgl = det.get("transDate") or inv.get("transDate") or ""
-                        due = det.get("dueDate") or inv.get("dueDate") or ""
-                        # hitung umur dari tanggal jatuh tempo (atau transDate kalau due kosong)
-                        umur = None
-                        acuan = due or tgl
-                        for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
-                            try:
-                                d = datetime.strptime(acuan, fmt)
-                                umur = (datetime.now() - d).days
-                                break
-                            except: pass
-                        with lock:
-                            piutang.append({"number": inv.get("number"), "owing": owing,
-                                            "tgl": tgl, "due": due, "umur": umur, "cust": cust})
-                except: pass
 
-            with ThreadPoolExecutor(max_workers=6) as ex:
-                list(ex.map(cek, all_inv))
+            def proses_satu(inv, owing):
+                cust = inv.get("retailWpName") or "?"
+                with lock:
+                    nama_terdeteksi.add(cust)
+                if owing and owing > 0:
+                    tgl = inv.get("transDate") or ""
+                    due = inv.get("dueDate") or ""
+                    umur = None
+                    acuan = due or tgl
+                    for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                        try:
+                            dd = datetime.strptime(acuan, fmt); umur = (datetime.now() - dd).days; break
+                        except: pass
+                    with lock:
+                        piutang.append({"number": inv.get("number"), "owing": owing, "due": due, "umur": umur})
+
+            if ada_owing_di_list:
+                # cepat: pakai primeOwing dari list langsung
+                for inv in all_inv:
+                    if isinstance(inv, dict):
+                        proses_satu(inv, float(inv.get("primeOwing") or 0))
+            else:
+                # fallback: buka detail (lebih lambat), tetap proses semua
+                def cek(inv):
+                    try:
+                        r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=12)
+                        det = r2.json().get("d", {})
+                        proses_satu({**inv, "retailWpName": det.get("retailWpName")}, float(det.get("primeOwing") or 0))
+                    except: pass
+                with ThreadPoolExecutor(max_workers=6) as ex:
+                    list(ex.map(cek, all_inv))
 
             if not piutang:
                 nama_str = ", ".join(list(nama_terdeteksi)[:5])
-                send_message(chat_id, f"✅ Customer '{nama_customer}' ({nama_str}) tidak punya piutang. Semua invoice lunas.\n(Dicek dari {len(all_inv)} invoice)")
+                send_message(chat_id, f"✅ Customer '{nama_customer}' ({nama_str}) tidak punya piutang. Semua lunas.\n(Dicek dari {len(all_inv)} invoice)")
                 return
 
             piutang.sort(key=lambda x: (x["umur"] if x["umur"] is not None else -1), reverse=True)
@@ -1812,12 +1819,14 @@ def tool_cek_piutang_customer(host, chat_id, nama_customer):
             nama_str = ", ".join(list(nama_terdeteksi)[:5])
             msg = f"💰 *Piutang Customer: {nama_customer}*\n"
             msg += f"(cocok: {nama_str})\n\n"
-            msg += f"Total piutang: Rp {total:,.0f} dari {len(piutang)} invoice\n\n"
-            for p in piutang:
+            msg += f"Total piutang: Rp {total:,.0f} dari {len(piutang)} invoice (dicek {len(all_inv)} invoice)\n\n"
+            for p in piutang[:60]:
                 umur_txt = f"{p['umur']} hari" if p["umur"] is not None else "?"
-                tempo = f" (jatuh tempo {p['due']})" if p["due"] else ""
-                msg += f"• {p['number']}: Rp {p['owing']:,.0f} — umur {umur_txt}{tempo}\n"
-            msg += f"\n_Umur dihitung dari tanggal jatuh tempo sampai hari ini. Sisa tagihan dari field primeOwing._"
+                tempo = f" (JT {p['due']})" if p["due"] else ""
+                msg += f"• {p['number']}: Rp {p['owing']:,.0f} — {umur_txt}{tempo}\n"
+            if len(piutang) > 60:
+                msg += f"... dan {len(piutang)-60} invoice lagi\n"
+            msg += f"\n_Sisa tagihan = primeOwing. Umur dari jatuh tempo sampai hari ini._"
             send_message(chat_id, msg)
         except Exception as e:
             send_message(chat_id, f"❌ Gagal cek piutang customer: {str(e)[:120]}")
