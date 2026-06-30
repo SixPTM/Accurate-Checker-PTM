@@ -1298,7 +1298,7 @@ TOOLS = [
     },
     {
         "name": "get_customer_terbanyak",
-        "description": "Rekap CUSTOMER dengan order/pesanan TERBANYAK di satu periode: tiap customer berapa kali order (jumlah invoice) dan total nilai belanjanya, diurutkan dari terbanyak. Hasil MEMISAHKAN customer asli (di atas) dari channel/marketplace seperti Shopee, Tokopedia, dan 'Tanpa Nama' (di bagian terpisah). WAJIB pakai tool ini untuk 'customer order terbanyak', 'pelanggan paling sering pesan', 'customer dengan belanja terbesar', 'siapa customer paling aktif 6 bulan'. JANGAN pakai get_unpaid_invoices_detail atau get_invoices untuk ini. Default urut by jumlah order; pakai urut_by='nilai' kalau user minta yang belanjanya/nilainya terbesar. Background 2-3 menit, hasil ke Telegram.",
+        "description": "Rekap CUSTOMER dengan order/pesanan TERBANYAK di satu periode: tiap customer berapa kali order (jumlah invoice) dan total nilai belanjanya, diurutkan dari terbanyak. Hasil MEMISAHKAN customer asli (di atas) dari channel/marketplace seperti Shopee, Tokopedia, dan 'Tanpa Nama' (di bagian terpisah). Nilai diambil dari detail tiap invoice agar akurat. WAJIB pakai tool ini untuk 'customer order terbanyak', 'pelanggan paling sering pesan', 'customer dengan belanja terbesar', 'siapa customer paling aktif 6 bulan'. JANGAN pakai get_unpaid_invoices_detail atau get_invoices untuk ini. Default urut by jumlah order; pakai urut_by='nilai' kalau user minta yang belanjanya/nilainya terbesar. Background, untuk periode panjang (6 bulan) bisa 5-10 menit, hasil ke Telegram.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -2072,8 +2072,9 @@ def tool_get_customer_terbanyak(host, chat_id, date_from, date_to, label="", uru
                 if page >= sp.get("pageCount", 1): break
                 page += 1
 
-            # Cek apakah nama customer sudah ada di list (retailWpName).
-            # Untuk invoice yang namanya kosong, baru buka detail (hemat waktu).
+            # PENTING: totalAmount di endpoint LIST sering 0/kosong, jadi tidak bisa dipakai
+            # untuk menjumlahkan nilai. Kita buka DETAIL tiap invoice untuk nilai yang akurat
+            # (sama seperti tool omset). Nama customer juga diambil dari detail dengan fallback.
             lock = threading.Lock()
             cust = {}  # nama -> {"count": x, "total": y}
 
@@ -2086,34 +2087,33 @@ def tool_get_customer_terbanyak(host, chat_id, date_from, date_to, label="", uru
                     cust[name]["count"] += 1
                     cust[name]["total"] += nilai
 
-            perlu_detail = []
-            for inv in all_inv:
-                if not isinstance(inv, dict): continue
-                nama = inv.get("retailWpName")
-                nilai = float(inv.get("totalAmount") or inv.get("subTotal") or 0)
-                if nama and str(nama).strip():
-                    catat(nama, nilai)
-                else:
-                    perlu_detail.append(inv)
-
-            # Invoice tanpa nama di list -> ambil dari detail dengan fallback lengkap
             def ambil_detail(inv):
-                try:
-                    r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=12)
-                    det = r2.json().get("d", {})
-                    customer = det.get("customer")
-                    if isinstance(customer, dict): cname = customer.get("name")
-                    elif isinstance(customer, list) and customer: cname = customer[0].get("name") if isinstance(customer[0], dict) else None
-                    else: cname = None
-                    nama = det.get("retailWpName") or det.get("customerName") or cname or "Tanpa Nama"
-                    nilai = float(det.get("totalAmount") or det.get("subTotal") or inv.get("totalAmount") or 0)
-                    catat(nama, nilai)
-                except: 
-                    catat("Tanpa Nama", float(inv.get("totalAmount") or 0))
+                if not isinstance(inv, dict):
+                    return
+                detail = None
+                for attempt in range(4):
+                    try:
+                        r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=15)
+                        d = r2.json()
+                        if d.get("s") and d.get("d"):
+                            detail = d["d"]; break
+                    except Exception: pass
+                    import time as _t; _t.sleep(0.4 * (attempt + 1))
+                if detail is None:
+                    # gagal baca detail: pakai nama dari list kalau ada, nilai 0 (jangan ngarang)
+                    catat(inv.get("retailWpName") or "Tanpa Nama", 0.0)
+                    return
+                customer = detail.get("customer")
+                if isinstance(customer, dict): cname = customer.get("name")
+                elif isinstance(customer, list) and customer: cname = customer[0].get("name") if isinstance(customer[0], dict) else None
+                else: cname = None
+                nama = detail.get("retailWpName") or detail.get("customerName") or cname or "Tanpa Nama"
+                # Nilai invoice dari detail: totalAmount paling akurat, fallback ke subTotal
+                nilai = float(detail.get("totalAmount") or detail.get("subTotal") or 0)
+                catat(nama, nilai)
 
-            if perlu_detail:
-                with ThreadPoolExecutor(max_workers=8) as ex:
-                    list(ex.map(ambil_detail, perlu_detail))
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                list(ex.map(ambil_detail, all_inv))
 
             if not cust:
                 send_message(chat_id, f"❌ Tidak ada data order di periode {date_from} - {date_to}.")
