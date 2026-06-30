@@ -1298,7 +1298,7 @@ TOOLS = [
     },
     {
         "name": "get_customer_terbanyak",
-        "description": "Rekap CUSTOMER dengan order/pesanan TERBANYAK di satu periode: tiap customer berapa kali order (jumlah invoice) dan total nilai belanjanya, diurutkan dari terbanyak. Hasil MEMISAHKAN customer asli (di atas) dari channel/marketplace seperti Shopee, Tokopedia, dan 'Tanpa Nama' (di bagian terpisah). Nilai diambil dari detail tiap invoice agar akurat. WAJIB pakai tool ini untuk 'customer order terbanyak', 'pelanggan paling sering pesan', 'customer dengan belanja terbesar', 'siapa customer paling aktif 6 bulan'. JANGAN pakai get_unpaid_invoices_detail atau get_invoices untuk ini. Default urut by jumlah order; pakai urut_by='nilai' kalau user minta yang belanjanya/nilainya terbesar. Background, untuk periode panjang (6 bulan) bisa 5-10 menit, hasil ke Telegram.",
+        "description": "Rekap CUSTOMER dengan order/pesanan TERBANYAK di satu periode: tiap customer berapa kali order (jumlah invoice) dan total nilai belanjanya. Hasil MEMISAHKAN customer asli (di atas) dari channel/marketplace seperti Shopee, Tokopedia, dan 'Tanpa Nama' (di bagian terpisah). Nilai diambil dari detail tiap invoice agar akurat. WAJIB pakai tool ini untuk 'customer order terbanyak', 'pelanggan paling sering pesan', 'customer dengan belanja terbesar', 'siapa customer paling aktif 6 bulan'. JANGAN pakai get_unpaid_invoices_detail atau get_invoices untuk ini. DEFAULT urut by NILAI rupiah (belanja terbesar di atas); pakai urut_by='order' HANYA kalau user eksplisit minta diurutkan dari jumlah/banyaknya order. Background, untuk periode panjang (6 bulan) bisa 5-10 menit, hasil ke Telegram.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1480,7 +1480,7 @@ def handle_with_claude(chat_id, user_text, host):
                 elif tool_name == "get_produk_terlaku":
                     result = tool_get_produk_terlaku(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "get_customer_terbanyak":
-                    result = tool_get_customer_terbanyak(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""), tool_input.get("urut_by","order"))
+                    result = tool_get_customer_terbanyak(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""), tool_input.get("urut_by","nilai"))
                 elif tool_name == "get_rata_sales_per_bulan":
                     result = tool_get_rata_sales_per_bulan(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "get_customer_reguler":
@@ -2050,7 +2050,7 @@ def tool_get_customer_reguler(host, chat_id, date_from, date_to, keyword="stiker
     return json.dumps({"status": "background_started"})
 
 
-def tool_get_customer_terbanyak(host, chat_id, date_from, date_to, label="", urut_by="order"):
+def tool_get_customer_terbanyak(host, chat_id, date_from, date_to, label="", urut_by="nilai"):
     def run():
         try:
             h = host if host.startswith("http") else f"https://{host}"
@@ -2141,7 +2141,7 @@ def tool_get_customer_terbanyak(host, chat_id, date_from, date_to, label="", uru
             msg += f"*👤 Customer Asli (Top 30):*\n"
             if urut_asli:
                 for i, (nama, d) in enumerate(urut_asli[:30], 1):
-                    msg += f"{i}. {nama} — {d['count']} order | Rp {d['total']:,.0f}\n"
+                    msg += f"{i}. {nama} — Rp {d['total']:,.0f} | {d['count']} order\n"
                 if len(urut_asli) > 30:
                     msg += f"_...dan {len(urut_asli)-30} customer lainnya_\n"
             else:
@@ -2150,7 +2150,7 @@ def tool_get_customer_terbanyak(host, chat_id, date_from, date_to, label="", uru
             if urut_channel:
                 msg += f"\n━━━━━━━━━━\n*🛒 Channel / Marketplace (terpisah):*\n"
                 for nama, d in urut_channel:
-                    msg += f"• {nama} — {d['count']} order | Rp {d['total']:,.0f}\n"
+                    msg += f"• {nama} — Rp {d['total']:,.0f} | {d['count']} order\n"
                 msg += "_Ini channel penjualan, bukan nama pelanggan, jadi dipisah dari ranking customer._"
             send_message(chat_id, msg)
         except Exception as e:
