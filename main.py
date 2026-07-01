@@ -966,6 +966,136 @@ def tool_get_product_profit(host, chat_id, keyword, date_from, date_to):
     return json.dumps({"status": "background_started"})
 
 
+def tool_get_profit_periode(host, chat_id, date_from, date_to, label=""):
+    def run():
+        try:
+            h = host if host.startswith("http") else f"https://{host}"
+            from datetime import datetime
+            # 1. Bangun cache modal (HPP) per item dari master item: id -> balanceUnitCost
+            #    Diisi lazy saat scan invoice supaya tidak perlu tarik seluruh master dulu.
+            modal_cache = {}
+            modal_lock = threading.Lock()
+            def get_modal(item_id):
+                if item_id is None:
+                    return 0.0
+                with modal_lock:
+                    if item_id in modal_cache:
+                        return modal_cache[item_id]
+                modal = 0.0
+                try:
+                    r2 = requests.get(f"{h}/accurate/api/item/detail.do", headers=accurate_headers(), params={"id": item_id}, timeout=12)
+                    det = r2.json().get("d", {})
+                    modal = float(det.get("balanceUnitCost") or det.get("defStandardCost") or 0)
+                except: pass
+                with modal_lock:
+                    modal_cache[item_id] = modal
+                return modal
+
+            # 2. Ambil semua invoice + tanggal
+            all_inv = []
+            page = 1
+            while True:
+                params = {"fields": "id,number,transDate", "sp.pageSize": 200, "sp.page": page,
+                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
+                r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+                data = r.json()
+                if not data.get("s"): break
+                all_inv.extend(data.get("d", []))
+                sp = data.get("sp", {})
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+
+            def parse_tgl(s):
+                for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                    try: return datetime.strptime((s or "").split(" ")[0], fmt)
+                    except: pass
+                return None
+
+            lock = threading.Lock()
+            # per hari: tgl(YYYY-MM-DD) -> {"jual":x,"modal":y}
+            harian = {}
+            # per bulan: bulan(YYYY-MM) -> {"jual":x,"modal":y}
+            bulanan = {}
+
+            def scan(inv):
+                try:
+                    r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=15)
+                    det = r2.json().get("d", {})
+                    tgl = parse_tgl(det.get("transDate") or inv.get("transDate"))
+                    if tgl is None: return
+                    hari_key = tgl.strftime("%Y-%m-%d")
+                    bulan_key = tgl.strftime("%Y-%m")
+                    items = det.get("detailItem", [])
+                    if not isinstance(items, list): return
+                    jual_inv = 0.0
+                    modal_inv = 0.0
+                    for item in items:
+                        if not isinstance(item, dict): continue
+                        item_obj = item.get("item", {})
+                        if isinstance(item_obj, list): item_obj = item_obj[0] if item_obj else {}
+                        item_id = item_obj.get("id") if isinstance(item_obj, dict) else None
+                        qty = float(item.get("quantity") or item.get("qty") or 0)
+                        unit_jual = float(item.get("unitPrice") or item.get("price") or 0)
+                        amount = float(item.get("amount") or item.get("totalAmount") or item.get("totalPrice") or 0)
+                        if amount <= 0 and unit_jual > 0:
+                            amount = unit_jual * qty
+                        modal_unit = get_modal(item_id)
+                        jual_inv += amount
+                        modal_inv += modal_unit * qty
+                    with lock:
+                        if hari_key not in harian: harian[hari_key] = {"jual": 0.0, "modal": 0.0}
+                        harian[hari_key]["jual"] += jual_inv
+                        harian[hari_key]["modal"] += modal_inv
+                        if bulan_key not in bulanan: bulanan[bulan_key] = {"jual": 0.0, "modal": 0.0}
+                        bulanan[bulan_key]["jual"] += jual_inv
+                        bulanan[bulan_key]["modal"] += modal_inv
+                except: pass
+
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                list(ex.map(scan, all_inv))
+
+            if not bulanan:
+                send_message(chat_id, f"❌ Tidak ada data penjualan di periode {date_from} - {date_to}.")
+                return
+
+            total_jual = sum(v["jual"] for v in bulanan.values())
+            total_modal = sum(v["modal"] for v in bulanan.values())
+            total_laba = total_jual - total_modal
+            margin = (total_laba / total_jual * 100) if total_jual > 0 else 0
+
+            judul = label or f"{date_from} - {date_to}"
+            msg = f"📊 *Profit per Periode - {judul}*\n"
+            msg += f"Dari {len(all_inv)} invoice\n\n"
+            msg += f"💵 Total penjualan: Rp {total_jual:,.0f}\n"
+            msg += f"🏭 Total modal (HPP): Rp {total_modal:,.0f}\n"
+            msg += f"✅ Laba kotor: Rp {total_laba:,.0f} (margin {margin:.1f}%)\n\n"
+
+            msg += f"*📅 Per Bulan:*\n"
+            for bk in sorted(bulanan):
+                v = bulanan[bk]
+                laba = v["jual"] - v["modal"]
+                m = (laba / v["jual"] * 100) if v["jual"] > 0 else 0
+                msg += f"• {bk}: laba Rp {laba:,.0f} (jual {v['jual']:,.0f} − modal {v['modal']:,.0f}, margin {m:.0f}%)\n"
+
+            # Per hari: tampilkan semua tanggal terurut. Kalau kebanyakan, kirim tetap (send_message auto pecah).
+            msg += f"\n*🗓️ Per Hari:*\n"
+            for hk in sorted(harian):
+                v = harian[hk]
+                laba = v["jual"] - v["modal"]
+                msg += f"• {hk}: laba Rp {laba:,.0f} (jual {v['jual']:,.0f} − modal {v['modal']:,.0f})\n"
+
+            msg += f"\n_Profit = penjualan − modal HPP (balanceUnitCost Accurate). Modal negatif/0 bisa terjadi jika item belum ada HPP di Accurate._"
+            send_message(chat_id, msg)
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal hitung profit periode: {str(e)[:120]}")
+            print(f"[PROFIT PERIODE ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
+
+
 def tool_get_sales_per_salesman(host, chat_id, date_from, date_to, label=""):
     def run():
         try:
@@ -1338,6 +1468,32 @@ TOOLS = [
         }
     },
     {
+        "name": "bukti_belum_ada_per_sales",
+        "description": "Cek invoice yang BELUM ADA file bukti bayarnya di Google Drive, lalu KELOMPOKKAN PER SALES (nama sales -> daftar nomor invoice + nilai). WAJIB pakai tool ini untuk 'bukti bayar yang belum ada dikelompokkan per sales', 'invoice belum ada bukti per salesman', 'sales mana yang paling banyak invoice belum ada buktinya'. Beda dengan cek_bukti_bayar_massal (itu tidak per sales) dan bukti_tidak_cocok_per_sales (itu yang nominalnya beda, bukan yang belum ada). Background beberapa menit, hasil ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD/MM/YYYY"},
+                "date_to": {"type": "string", "description": "DD/MM/YYYY"},
+                "label": {"type": "string", "description": "Label periode"}
+            },
+            "required": ["date_from", "date_to"]
+        }
+    },
+    {
+        "name": "get_profit_periode",
+        "description": "Hitung PROFIT/LABA (penjualan − modal HPP) untuk satu periode, ditampilkan rincian PER BULAN dan PER HARI sekaligus. WAJIB pakai tool ini untuk 'profit per hari', 'profit per bulan', 'laba harian dan bulanan', 'keuntungan tiap hari/bulan'. Beda dengan get_product_profit (itu profit per PRODUK tertentu, bukan per periode waktu). Background beberapa menit (buka detail tiap invoice + ambil modal item), hasil ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD/MM/YYYY"},
+                "date_to": {"type": "string", "description": "DD/MM/YYYY"},
+                "label": {"type": "string", "description": "Label periode, contoh 'Juni 2026'"}
+            },
+            "required": ["date_from", "date_to"]
+        }
+    },
+    {
         "name": "cek_bukti_bayar",
         "description": "Cek bukti bayar/pembayaran sebuah invoice dari Google Drive: cari file bukti (dinamai sesuai nomor invoice), baca nominal di foto, bandingkan dengan nilai invoice di Accurate. Untuk 'cek bukti bayar invoice X', 'apakah invoice X sudah ada bukti bayarnya', 'cocokkan pembayaran invoice X'. Background, hasil dikirim ke Telegram.",
         "input_schema": {
@@ -1385,6 +1541,8 @@ Tools background (hasilnya dikirim otomatis ke Telegram setelah selesai, beri ta
 - get_customer_terbanyak: rekap CUSTOMER dengan order terbanyak di satu periode (berapa kali order + total belanja), terurut dari terbanyak. WAJIB pakai ini untuk 'customer order terbanyak', 'pelanggan paling sering pesan', 'customer belanja terbesar', 'customer paling aktif'. Default urut_by='order' (jumlah order); pakai urut_by='nilai' kalau user minta yang nilai/belanjanya terbesar. Untuk '6 bulan terakhir' hitung date_from = tanggal 6 bulan lalu, date_to = hari ini.
 - get_rata_sales_per_bulan: RATA-RATA penjualan tiap sales PER BULAN (total sales dibagi jumlah bulan periode). WAJIB pakai ini untuk 'rata-rata penjualan tiap sales per bulan', 'penjualan masing-masing sales rata per bulan berapa'. JANGAN pakai get_sales_per_salesman (itu cuma total).
 - get_customer_reguler: customer yang RUTIN order produk tertentu (default stiker & kertas), dikelompokkan reguler bulanan & mingguan. WAJIB pakai ini untuk 'customer yang order stiker dan kertas reguler', 'pelanggan rutin tiap bulan/minggu', 'langganan tetap'. Kalau user sebut produk lain, isi keyword sesuai produk itu.
+- bukti_belum_ada_per_sales: invoice yang BELUM ADA bukti bayarnya di Drive, dikelompokkan PER SALES. WAJIB pakai ini untuk 'bukti bayar yang belum ada per sales', 'invoice belum ada bukti dikelompokkan salesman'. Beda dari cek_bukti_bayar_massal (tidak per sales).
+- get_profit_periode: PROFIT/LABA (penjualan − modal HPP) satu periode, rincian PER BULAN dan PER HARI sekaligus. WAJIB pakai ini untuk 'profit per hari', 'profit per bulan', 'laba harian bulanan'. Beda dari get_product_profit (itu per produk, bukan per periode).
 - get_piutang_summary: total piutang (2-3 menit)
 - get_low_stock: produk yang stoknya menipis di bawah ambang batas (perlu sebut kategori produk)
 - get_overdue_customers: customer yang nunggak lewat jatuh tempo > sekian hari
@@ -1485,6 +1643,10 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_get_rata_sales_per_bulan(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "get_customer_reguler":
                     result = tool_get_customer_reguler(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("keyword","stiker kertas"), tool_input.get("label",""))
+                elif tool_name == "bukti_belum_ada_per_sales":
+                    result = tool_bukti_belum_ada_per_sales(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
+                elif tool_name == "get_profit_periode":
+                    result = tool_get_profit_periode(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 else:
                     result = json.dumps({"error": f"Unknown tool: {tool_name}"})
 
@@ -2642,6 +2804,118 @@ def tool_cek_nominal_massal(host, chat_id, date_from, date_to, label=""):
         except Exception as e:
             send_message(chat_id, f"❌ Gagal cek nominal massal: {str(e)[:150]}")
             print(f"[NOMINAL MASSAL ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
+
+
+def tool_bukti_belum_ada_per_sales(host, chat_id, date_from, date_to, label=""):
+    def run():
+        try:
+            h = host if host.startswith("http") else f"https://{host}"
+            token = get_drive_token()
+            # 1. Kumpulkan semua nama file bukti di Drive (semua subfolder) -> set nomor invoice (UPPER)
+            nama_file_drive = set()
+            def daftar(folder_id):
+                page_token = None
+                while True:
+                    params = {"q": f"'{folder_id}' in parents and trashed=false",
+                              "fields": "nextPageToken,files(id,name,mimeType)", "pageSize": 1000,
+                              "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}
+                    if page_token: params["pageToken"] = page_token
+                    rs = requests.get("https://www.googleapis.com/drive/v3/files",
+                        headers={"Authorization": f"Bearer {token}"}, params=params, timeout=30)
+                    ds = rs.json()
+                    for x in ds.get("files", []):
+                        if x.get("mimeType") == "application/vnd.google-apps.folder":
+                            daftar(x["id"])
+                        else:
+                            nama_file_drive.add(x["name"].rsplit(".", 1)[0].strip().upper())
+                    page_token = ds.get("nextPageToken")
+                    if not page_token: break
+            r = requests.get("https://www.googleapis.com/drive/v3/files",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"q": f"'{GDRIVE_FOLDER_ID}' in parents and trashed=false", "fields": "files(id,name,mimeType)",
+                        "pageSize": 1000, "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}, timeout=30)
+            for f in r.json().get("files", []):
+                if f.get("mimeType") == "application/vnd.google-apps.folder":
+                    daftar(f["id"])
+                else:
+                    nama_file_drive.add(f["name"].rsplit(".", 1)[0].strip().upper())
+
+            # 2. Ambil semua invoice periode
+            all_inv = []
+            page = 1
+            while True:
+                params = {"fields": "id,number,totalAmount", "sp.pageSize": 200, "sp.page": page,
+                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
+                rr = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+                dd = rr.json()
+                if not dd.get("s"): break
+                all_inv.extend(dd.get("d", []))
+                sp = dd.get("sp", {})
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+
+            # 3. Cari yang BELUM ada bukti di Drive
+            belum = []
+            for inv in all_inv:
+                if not isinstance(inv, dict): continue
+                nomor = (inv.get("number") or "").strip().upper()
+                if nomor and nomor not in nama_file_drive:
+                    belum.append({"id": inv.get("id"), "number": inv.get("number")})
+
+            if not belum:
+                send_message(chat_id, f"✅ Semua invoice {label or (date_from + ' - ' + date_to)} sudah ada bukti bayarnya di Drive. Tidak ada yang belum.")
+                return
+
+            # 4. Ambil nama sales tiap invoice yang belum ada bukti (dari detail)
+            lock = threading.Lock()
+            def ambil_sales(b):
+                detail = None
+                for attempt in range(4):
+                    try:
+                        r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": b["id"]}, timeout=15)
+                        d = r2.json()
+                        if d.get("s") and d.get("d"):
+                            detail = d["d"]; break
+                    except Exception: pass
+                    import time as _t; _t.sleep(0.4 * (attempt + 1))
+                if detail is None:
+                    b["sales"] = "(gagal baca)"
+                    b["nilai"] = 0.0
+                    return
+                b["sales"] = detail.get("masterSalesmanName") or "Tanpa Sales"
+                b["nilai"] = float(detail.get("totalAmount") or detail.get("subTotal") or 0)
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                list(ex.map(ambil_sales, belum))
+
+            # 5. Kelompokkan per sales
+            per_sales = {}
+            for b in belum:
+                per_sales.setdefault(b.get("sales", "Tanpa Sales"), []).append(b)
+
+            total_nilai = sum(b.get("nilai", 0) for b in belum)
+            judul = label or f"{date_from} - {date_to}"
+            msg = f"📌 *Bukti Bayar BELUM ADA per Sales - {judul}*\n"
+            msg += f"Total invoice belum ada bukti: {len(belum)} | Nilai: Rp {total_nilai:,.0f}\n\n"
+            # urut sales dari jumlah invoice belum ada bukti terbanyak
+            for sales in sorted(per_sales, key=lambda s: len(per_sales[s]), reverse=True):
+                items = per_sales[sales]
+                subtotal = sum(x.get("nilai", 0) for x in items)
+                msg += f"━━━━━━━━━━\n👤 *{sales}* — {len(items)} invoice | Rp {subtotal:,.0f}\n"
+                # urut invoice dari nilai terbesar
+                for x in sorted(items, key=lambda i: i.get("nilai", 0), reverse=True)[:40]:
+                    msg += f"  • {x['number']} | Rp {x.get('nilai',0):,.0f}\n"
+                if len(items) > 40:
+                    msg += f"  _...dan {len(items)-40} invoice lagi_\n"
+            msg += "\n_Belum ada bukti = nomor invoice tidak ditemukan sebagai nama file di Google Drive._"
+            send_message(chat_id, msg)
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal cek bukti belum ada per sales: {str(e)[:150]}")
+            print(f"[BUKTI BELUM ADA PER SALES ERROR] {e}")
 
     t = threading.Thread(target=run)
     t.daemon = True
