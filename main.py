@@ -1656,6 +1656,19 @@ TOOLS = [
         }
     },
     {
+        "name": "sales_tinggi_rendah_per_bulan",
+        "description": "Untuk TIAP sales, tampilkan bulan penjualan TERTINGGI dan bulan TERENDAH-nya selama periode (contoh: 'Febby tertinggi Juni Rp 200jt, terendah Mei Rp 150jt'). WAJIB pakai tool ini untuk 'penjualan tiap sales tertinggi berapa dan terendah berapa', 'bulan tertinggi dan terendah masing-masing sales', 'naik turun penjualan per sales'. Beda dari get_sales_per_salesman (itu total) dan get_rata_sales_per_bulan (itu rata-rata). Bulan tanpa penjualan diabaikan. Background 3-5 menit, hasil ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD/MM/YYYY"},
+                "date_to": {"type": "string", "description": "DD/MM/YYYY"},
+                "label": {"type": "string", "description": "Label periode, contoh 'Jan-Jun 2026'"}
+            },
+            "required": ["date_from", "date_to"]
+        }
+    },
+    {
         "name": "cek_bukti_bayar",
         "description": "Cek bukti bayar/pembayaran sebuah invoice dari Google Drive: cari file bukti (dinamai sesuai nomor invoice), baca nominal di foto, bandingkan dengan nilai invoice di Accurate. Untuk 'cek bukti bayar invoice X', 'apakah invoice X sudah ada bukti bayarnya', 'cocokkan pembayaran invoice X'. Background, hasil dikirim ke Telegram.",
         "input_schema": {
@@ -1706,6 +1719,7 @@ Tools background (hasilnya dikirim otomatis ke Telegram setelah selesai, beri ta
 - bukti_belum_ada_per_sales: invoice yang BELUM ADA bukti bayarnya di Drive, dikelompokkan PER SALES. WAJIB pakai ini untuk 'bukti bayar yang belum ada per sales', 'invoice belum ada bukti dikelompokkan salesman'. Beda dari cek_bukti_bayar_massal (tidak per sales).
 - get_profit_periode: PROFIT/LABA (penjualan − modal HPP) satu periode, rincian PER BULAN dan PER HARI sekaligus. WAJIB pakai ini untuk 'profit per hari', 'profit per bulan', 'laba harian bulanan'. Beda dari get_product_profit (itu per produk, bukan per periode).
 - rekap_bulanan: rekap PENJUALAN + LABA per bulan dalam SATU pesan (tabel tiap bulan + sorotan bulan tertinggi penjualan & laba). WAJIB pakai ini (SATU KALI, rentang penuh) untuk 'penjualan dan laba tertinggi bulan apa', 'bulan mana omset/laba paling tinggi', 'rekap penjualan per bulan'. DILARANG memanggil get_omset_summary berkali-kali per bulan untuk pertanyaan seperti ini — itu boros dan hasilnya berserakan. Cukup rekap_bulanan sekali, mis. date_from=01/01/2026 date_to=30/06/2026.
+- sales_tinggi_rendah_per_bulan: untuk TIAP sales, bulan penjualan TERTINGGI & TERENDAH-nya (mis. 'Febby tertinggi Juni, terendah Mei'). WAJIB pakai ini untuk 'penjualan tiap sales tertinggi berapa terendah berapa', 'bulan tertinggi & terendah masing-masing sales'. Beda dari get_sales_per_salesman (total) dan get_rata_sales_per_bulan (rata-rata).
 - get_piutang_summary: total piutang (2-3 menit)
 - get_low_stock: produk yang stoknya menipis di bawah ambang batas (perlu sebut kategori produk)
 - get_overdue_customers: customer yang nunggak lewat jatuh tempo > sekian hari
@@ -1812,6 +1826,8 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_get_profit_periode(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "rekap_bulanan":
                     result = tool_rekap_bulanan(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
+                elif tool_name == "sales_tinggi_rendah_per_bulan":
+                    result = tool_sales_tinggi_rendah_per_bulan(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 else:
                     result = json.dumps({"error": f"Unknown tool: {tool_name}"})
 
@@ -2233,6 +2249,103 @@ def tool_get_rata_sales_per_bulan(host, chat_id, date_from, date_to, label=""):
         except Exception as e:
             send_message(chat_id, f"❌ Gagal hitung rata-rata sales: {str(e)[:120]}")
             print(f"[RATA SALES ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
+
+
+def tool_sales_tinggi_rendah_per_bulan(host, chat_id, date_from, date_to, label=""):
+    def run():
+        try:
+            h = host if host.startswith("http") else f"https://{host}"
+            from datetime import datetime
+            # Ambil semua invoice + tanggal
+            all_inv = []
+            page = 1
+            while True:
+                params = {"fields": "id,number,transDate", "sp.pageSize": 200, "sp.page": page,
+                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
+                r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+                data = r.json()
+                if not data.get("s"): break
+                all_inv.extend(data.get("d", []))
+                sp = data.get("sp", {})
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+
+            def parse_tgl(s):
+                for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                    try: return datetime.strptime((s or "").split(" ")[0], fmt)
+                    except: pass
+                return None
+
+            lock = threading.Lock()
+            # sales -> { bulan(YYYY-MM) -> total nilai }
+            sales_bulan = {}
+
+            def enrich(inv):
+                detail = None
+                for attempt in range(5):
+                    try:
+                        r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=20)
+                        d = r2.json()
+                        if d.get("s") and d.get("d"):
+                            detail = d["d"]; break
+                    except Exception: pass
+                    import time as _t; _t.sleep(0.4 * (attempt + 1))
+                if detail is None: return
+                sales_name = detail.get("masterSalesmanName")
+                if not sales_name or not str(sales_name).strip():
+                    sales_name = "Tanpa Sales"
+                tgl = parse_tgl(detail.get("transDate") or inv.get("transDate"))
+                if tgl is None: return
+                bulan_key = tgl.strftime("%Y-%m")
+                nilai = float(detail.get("totalAmount") or detail.get("subTotal") or 0)
+                with lock:
+                    if sales_name not in sales_bulan: sales_bulan[sales_name] = {}
+                    sales_bulan[sales_name][bulan_key] = sales_bulan[sales_name].get(bulan_key, 0.0) + nilai
+
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                list(ex.map(enrich, all_inv))
+
+            if not sales_bulan:
+                send_message(chat_id, f"❌ Tidak ada data penjualan untuk {label or (date_from + ' - ' + date_to)}.")
+                return
+
+            _NAMA_BLN = {"01":"Januari","02":"Februari","03":"Maret","04":"April","05":"Mei","06":"Juni",
+                         "07":"Juli","08":"Agustus","09":"September","10":"Oktober","11":"November","12":"Desember"}
+            def _fmt_bln(bk):
+                try:
+                    y, m = bk.split("-"); return f"{_NAMA_BLN.get(m, m)} {y}"
+                except: return bk
+
+            # Urutkan sales dari total penjualan terbesar
+            def total_sales(s):
+                return sum(sales_bulan[s].values())
+            urut_sales = sorted(sales_bulan, key=total_sales, reverse=True)
+
+            judul = label or f"{date_from} - {date_to}"
+            msg = f"📊 *Penjualan Tertinggi & Terendah per Sales - {judul}*\n"
+            msg += f"_(dari bulan yang ada penjualan saja)_\n\n"
+            for s in urut_sales:
+                bln = sales_bulan[s]  # dict bulan -> nilai
+                # bulan tertinggi & terendah (hanya bulan yang ada penjualan)
+                bln_top = max(bln, key=lambda b: bln[b])
+                bln_low = min(bln, key=lambda b: bln[b])
+                total = sum(bln.values())
+                msg += f"👤 *{s}* (total Rp {total:,.0f}, aktif {len(bln)} bln)\n"
+                msg += f"   📈 Tertinggi: {_fmt_bln(bln_top)} — Rp {bln[bln_top]:,.0f}\n"
+                if bln_top == bln_low:
+                    msg += f"   📉 Terendah: — (cuma 1 bulan ada penjualan)\n"
+                else:
+                    msg += f"   📉 Terendah: {_fmt_bln(bln_low)} — Rp {bln[bln_low]:,.0f}\n"
+            msg += f"\n_Bulan tanpa penjualan diabaikan (tidak dihitung sebagai terendah)._"
+            send_message(chat_id, msg)
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal hitung tinggi/rendah per sales: {str(e)[:120]}")
+            print(f"[SALES TINGGI RENDAH ERROR] {e}")
 
     t = threading.Thread(target=run)
     t.daemon = True
