@@ -1245,7 +1245,7 @@ def tool_get_sales_per_salesman(host, chat_id, date_from, date_to, label=""):
             page = 1
             total_invoice = 0
             while True:
-                params = {"fields": "id,number,transDate,totalAmount,salesAmount,subTotal,masterSalesmanName", "sp.pageSize": 200, "sp.page": page,
+                params = {"fields": "id,number,transDate,totalAmount,salesAmount,subTotal,masterSalesmanName,masterSalesmanId", "sp.pageSize": 200, "sp.page": page,
                     "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
                 r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
                 data = r.json()
@@ -1258,6 +1258,8 @@ def tool_get_sales_per_salesman(host, chat_id, date_from, date_to, label=""):
                 if page >= sp.get("pageCount", 1): break
                 page += 1
 
+            peta = _get_peta_salesman(h)
+
             def catat(sales_name, nilai):
                 if not sales_name or not str(sales_name).strip():
                     sales_name = "Tanpa Sales"
@@ -1267,12 +1269,41 @@ def tool_get_sales_per_salesman(host, chat_id, date_from, date_to, label=""):
                     sales_data[sales_name]["count"] += 1
                     sales_data[sales_name]["total"] += nilai
 
-            # Nilai (totalAmount/salesAmount) & nama sales (masterSalesmanName) SUDAH ada
-            # di endpoint list, jadi tidak perlu buka detail satu-satu (cepat & akurat).
+            # Nilai diambil dari LIST (akurat). Nama sales: coba masterSalesmanName di list,
+            # kalau kosong pakai masterSalesmanId diterjemahkan lewat peta salesman.
+            # Kalau dua-duanya kosong, invoice ditandai perlu buka detail.
+            perlu_detail = []
             for inv in all_invoices:
                 if not isinstance(inv, dict): continue
                 nilai = float(inv.get("totalAmount") or inv.get("salesAmount") or inv.get("subTotal") or 0)
-                catat(inv.get("masterSalesmanName"), nilai)
+                nama = inv.get("masterSalesmanName")
+                if (not nama or not str(nama).strip()):
+                    sid = inv.get("masterSalesmanId")
+                    if sid is not None and sid in peta:
+                        nama = peta[sid]
+                if nama and str(nama).strip():
+                    catat(nama, nilai)
+                else:
+                    perlu_detail.append((inv, nilai))
+
+            # Fallback detail hanya untuk invoice yang nama sales-nya benar-benar tak ketemu
+            if perlu_detail:
+                def enrich(item):
+                    inv, nilai = item
+                    detail = None
+                    for attempt in range(5):
+                        try:
+                            r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=20)
+                            d = r2.json()
+                            if d.get("s") and d.get("d"):
+                                detail = d["d"]; break
+                        except Exception: pass
+                        import time as _t; _t.sleep(0.4 * (attempt + 1))
+                    if detail is None:
+                        catat("Tanpa Sales", nilai); return
+                    catat(_resolve_sales_name(detail), nilai)
+                with ThreadPoolExecutor(max_workers=6) as ex:
+                    list(ex.map(enrich, perlu_detail))
 
             if not sales_data:
                 send_message(chat_id, f"❌ Tidak ada data penjualan untuk {label}.")
@@ -2135,6 +2166,35 @@ def _is_marketplace(nama):
     return any(kw in n for kw in _CHANNEL_MARKETPLACE)
 
 
+def _get_peta_salesman(h):
+    """Ambil peta masterSalesmanId -> nama dari master salesman Accurate.
+    Dipakai untuk menerjemahkan ID sales (yang ada di list) menjadi nama tanpa
+    perlu buka detail tiap invoice. Kembalikan dict {id: nama}."""
+    peta = {}
+    # Coba beberapa kemungkinan endpoint master salesman
+    for ep in ("salesman", "sales-man", "master-salesman"):
+        try:
+            page = 1
+            while True:
+                r = requests.get(f"{h}/accurate/api/{ep}/list.do", headers=accurate_headers(),
+                    params={"fields": "id,name", "sp.pageSize": 100, "sp.page": page}, timeout=15)
+                d = r.json()
+                if not d.get("s"):
+                    break
+                for row in d.get("d", []):
+                    if isinstance(row, dict) and row.get("id") is not None:
+                        peta[row["id"]] = row.get("name") or f"Sales #{row['id']}"
+                sp = d.get("sp", {})
+                if page >= sp.get("pageCount", 1):
+                    break
+                page += 1
+            if peta:
+                break  # endpoint ini berhasil, tidak perlu coba yang lain
+        except Exception:
+            continue
+    return peta
+
+
 def _resolve_nilai_invoice(detail):
     """Ambil nilai penjualan invoice dari detail. Accurate PTM ternyata TIDAK punya
     field totalAmount di detail; nilai sebenarnya ada di salesAmount (atau
@@ -2211,7 +2271,7 @@ def tool_get_rata_sales_per_bulan(host, chat_id, date_from, date_to, label=""):
             page = 1
             total_invoice = 0
             while True:
-                params = {"fields": "id,number,totalAmount,salesAmount,subTotal,masterSalesmanName", "sp.pageSize": 200, "sp.page": page,
+                params = {"fields": "id,number,totalAmount,salesAmount,subTotal,masterSalesmanName,masterSalesmanId", "sp.pageSize": 200, "sp.page": page,
                     "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
                 r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
                 data = r.json()
@@ -2224,6 +2284,8 @@ def tool_get_rata_sales_per_bulan(host, chat_id, date_from, date_to, label=""):
                 if page >= sp.get("pageCount", 1): break
                 page += 1
 
+            peta = _get_peta_salesman(h)
+
             def catat(sales_name, nilai):
                 if not sales_name or not str(sales_name).strip():
                     sales_name = "Tanpa Sales"
@@ -2233,11 +2295,38 @@ def tool_get_rata_sales_per_bulan(host, chat_id, date_from, date_to, label=""):
                     sales_data[sales_name]["count"] += 1
                     sales_data[sales_name]["total"] += nilai
 
-            # Nilai & nama sales sudah ada di list -> pakai langsung (cepat & akurat).
+            # Nilai dari list; nama sales dari list-name atau peta(ID); fallback detail.
+            perlu_detail = []
             for inv in all_invoices:
                 if not isinstance(inv, dict): continue
                 nilai = float(inv.get("totalAmount") or inv.get("salesAmount") or inv.get("subTotal") or 0)
-                catat(inv.get("masterSalesmanName"), nilai)
+                nama = inv.get("masterSalesmanName")
+                if (not nama or not str(nama).strip()):
+                    sid = inv.get("masterSalesmanId")
+                    if sid is not None and sid in peta:
+                        nama = peta[sid]
+                if nama and str(nama).strip():
+                    catat(nama, nilai)
+                else:
+                    perlu_detail.append((inv, nilai))
+
+            if perlu_detail:
+                def enrich(item):
+                    inv, nilai = item
+                    detail = None
+                    for attempt in range(5):
+                        try:
+                            r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=20)
+                            d = r2.json()
+                            if d.get("s") and d.get("d"):
+                                detail = d["d"]; break
+                        except Exception: pass
+                        import time as _t; _t.sleep(0.4 * (attempt + 1))
+                    if detail is None:
+                        catat("Tanpa Sales", nilai); return
+                    catat(_resolve_sales_name(detail), nilai)
+                with ThreadPoolExecutor(max_workers=6) as ex:
+                    list(ex.map(enrich, perlu_detail))
 
             if not sales_data:
                 send_message(chat_id, f"❌ Tidak ada data penjualan untuk {label or (date_from + ' - ' + date_to)}.")
@@ -2278,7 +2367,7 @@ def tool_sales_tinggi_rendah_per_bulan(host, chat_id, date_from, date_to, label=
             all_inv = []
             page = 1
             while True:
-                params = {"fields": "id,number,transDate,totalAmount,salesAmount,subTotal,masterSalesmanName",
+                params = {"fields": "id,number,transDate,totalAmount,salesAmount,subTotal,masterSalesmanName,masterSalesmanId",
                     "sp.pageSize": 200, "sp.page": page,
                     "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
                 r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
@@ -2309,15 +2398,44 @@ def tool_sales_tinggi_rendah_per_bulan(host, chat_id, date_from, date_to, label=
                     if sales_name not in sales_bulan: sales_bulan[sales_name] = {}
                     sales_bulan[sales_name][bulan_key] = sales_bulan[sales_name].get(bulan_key, 0.0) + nilai
 
-            # Nilai, nama sales, dan tanggal SEMUA sudah ada di endpoint list.
-            # Tidak perlu buka detail (cepat & akurat).
+            peta = _get_peta_salesman(h)
+
+            # Nilai & tanggal dari list; nama sales dari list-name atau peta(ID); fallback detail.
+            perlu_detail = []
             for inv in all_inv:
                 if not isinstance(inv, dict): continue
-                sales_name = inv.get("masterSalesmanName")
                 tgl = parse_tgl(inv.get("transDate"))
                 nilai = float(inv.get("totalAmount") or inv.get("salesAmount") or inv.get("subTotal") or 0)
-                catat(sales_name, tgl, nilai)
-                with lock: stat["dari_list"] += 1
+                nama = inv.get("masterSalesmanName")
+                if (not nama or not str(nama).strip()):
+                    sid = inv.get("masterSalesmanId")
+                    if sid is not None and sid in peta:
+                        nama = peta[sid]
+                if nama and str(nama).strip():
+                    catat(nama, tgl, nilai)
+                    with lock: stat["dari_list"] += 1
+                else:
+                    perlu_detail.append((inv, tgl, nilai))
+
+            if perlu_detail:
+                def enrich(item):
+                    inv, tgl, nilai = item
+                    detail = None
+                    for attempt in range(5):
+                        try:
+                            r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=20)
+                            d = r2.json()
+                            if d.get("s") and d.get("d"):
+                                detail = d["d"]; break
+                        except Exception: pass
+                        import time as _t; _t.sleep(0.4 * (attempt + 1))
+                    if detail is None:
+                        with lock: stat["gagal"] += 1
+                        catat("Tanpa Sales", tgl, nilai); return
+                    catat(_resolve_sales_name(detail), tgl, nilai)
+                    with lock: stat["dari_detail"] += 1
+                with ThreadPoolExecutor(max_workers=6) as ex:
+                    list(ex.map(enrich, perlu_detail))
 
             if not sales_bulan:
                 send_message(chat_id, f"❌ Tidak ada data penjualan untuk {label or (date_from + ' - ' + date_to)}.")
@@ -3475,6 +3593,32 @@ def debug_nosales():
             "daftar_nomor_tanpa_sales": sorted(no_sales),
             "daftar_nomor_gagal_baca": sorted(error_baca)
         }
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+
+@app.route("/debug-list-fields", methods=["GET"])
+def debug_list_fields():
+    try:
+        host = get_host()
+        if not host: return {"error": "Gagal dapat host"}, 500
+        h = host if host.startswith("http") else f"https://{host}"
+        # Minta banyak field di LIST, lihat mana yang benar-benar terkirim
+        r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(),
+            params={"fields": "id,number,transDate,totalAmount,salesAmount,subTotal,masterSalesmanName,masterSalesmanId,statusName",
+                "sp.pageSize": 3, "sp.page": 1,
+                "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": "01/01/2026", "filter.transDate.val[1]": "31/01/2026"}, timeout=15)
+        data = r.json()
+        rows = data.get("d", [])
+        hasil = []
+        for inv in rows:
+            if isinstance(inv, dict):
+                hasil.append({
+                    "number": inv.get("number"),
+                    "SEMUA_FIELD_YANG_TERKIRIM": sorted(list(inv.keys())),
+                    "isi": inv
+                })
+        return {"jumlah": len(rows), "hasil": hasil}
     except Exception as e:
         return {"error": str(e)}, 500
 
