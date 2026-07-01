@@ -1255,7 +1255,7 @@ def tool_get_sales_per_salesman(host, chat_id, date_from, date_to, label=""):
             page = 1
             total_invoice = 0
             while True:
-                params = {"fields": "id,number", "sp.pageSize": 200, "sp.page": page,
+                params = {"fields": "id,number,transDate,totalAmount,subTotal,masterSalesmanName", "sp.pageSize": 200, "sp.page": page,
                     "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
                 r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
                 data = r.json()
@@ -1268,8 +1268,26 @@ def tool_get_sales_per_salesman(host, chat_id, date_from, date_to, label=""):
                 if page >= sp.get("pageCount", 1): break
                 page += 1
 
+            def catat(sales_name, nilai):
+                if not sales_name or not str(sales_name).strip():
+                    sales_name = "Tanpa Sales"
+                with lock:
+                    if sales_name not in sales_data:
+                        sales_data[sales_name] = {"count": 0, "total": 0.0}
+                    sales_data[sales_name]["count"] += 1
+                    sales_data[sales_name]["total"] += nilai
+
+            # Ambil nilai + sales dari LIST bila lengkap; kalau tidak, buka detail
+            perlu_detail = []
+            for inv in all_invoices:
+                if not isinstance(inv, dict): continue
+                nilai_list = float(inv.get("totalAmount") or 0)
+                if nilai_list > 0:
+                    catat(inv.get("masterSalesmanName"), nilai_list)
+                else:
+                    perlu_detail.append(inv)
+
             def enrich(inv):
-                # Coba baca detail sampai 5x dengan jeda kalau gagal/timeout
                 detail = None
                 for attempt in range(5):
                     try:
@@ -1287,18 +1305,13 @@ def tool_get_sales_per_salesman(host, chat_id, date_from, date_to, label=""):
                         sales_data.setdefault("(Gagal dibaca)", {"count": 0, "total": 0.0})
                         sales_data["(Gagal dibaca)"]["count"] += 1
                     return
-                sales_name = detail.get("masterSalesmanName")
-                if not sales_name or not str(sales_name).strip():
-                    sales_name = "Tanpa Sales"
-                nilai = float(detail.get("totalAmount") or detail.get("subTotal") or inv.get("totalAmount") or 0)
-                with lock:
-                    if sales_name not in sales_data:
-                        sales_data[sales_name] = {"count": 0, "total": 0.0}
-                    sales_data[sales_name]["count"] += 1
-                    sales_data[sales_name]["total"] += nilai
+                sales_name = detail.get("masterSalesmanName") or inv.get("masterSalesmanName")
+                nilai = float(detail.get("totalAmount") or detail.get("subTotal") or 0)
+                catat(sales_name, nilai)
 
-            with ThreadPoolExecutor(max_workers=5) as ex:
-                list(ex.map(enrich, all_invoices))
+            if perlu_detail:
+                with ThreadPoolExecutor(max_workers=5) as ex:
+                    list(ex.map(enrich, perlu_detail))
 
             if not sales_data:
                 send_message(chat_id, f"❌ Tidak ada data penjualan untuk {label}.")
@@ -2189,7 +2202,7 @@ def tool_get_rata_sales_per_bulan(host, chat_id, date_from, date_to, label=""):
             page = 1
             total_invoice = 0
             while True:
-                params = {"fields": "id,number", "sp.pageSize": 200, "sp.page": page,
+                params = {"fields": "id,number,totalAmount,subTotal,masterSalesmanName", "sp.pageSize": 200, "sp.page": page,
                     "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
                 r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
                 data = r.json()
@@ -2201,6 +2214,24 @@ def tool_get_rata_sales_per_bulan(host, chat_id, date_from, date_to, label=""):
                 print(f"[RATA SALES] list {page}/{sp.get('pageCount',1)} loaded={len(all_invoices)}")
                 if page >= sp.get("pageCount", 1): break
                 page += 1
+
+            def catat(sales_name, nilai):
+                if not sales_name or not str(sales_name).strip():
+                    sales_name = "Tanpa Sales"
+                with lock:
+                    if sales_name not in sales_data:
+                        sales_data[sales_name] = {"count": 0, "total": 0.0}
+                    sales_data[sales_name]["count"] += 1
+                    sales_data[sales_name]["total"] += nilai
+
+            perlu_detail = []
+            for inv in all_invoices:
+                if not isinstance(inv, dict): continue
+                nilai_list = float(inv.get("totalAmount") or 0)
+                if nilai_list > 0:
+                    catat(inv.get("masterSalesmanName"), nilai_list)
+                else:
+                    perlu_detail.append(inv)
 
             def enrich(inv):
                 detail = None
@@ -2214,18 +2245,13 @@ def tool_get_rata_sales_per_bulan(host, chat_id, date_from, date_to, label=""):
                     import time as _t; _t.sleep(0.5 * (attempt + 1))
                 if detail is None:
                     return
-                sales_name = detail.get("masterSalesmanName")
-                if not sales_name or not str(sales_name).strip():
-                    sales_name = "Tanpa Sales"
-                nilai = float(detail.get("totalAmount") or detail.get("subTotal") or inv.get("totalAmount") or 0)
-                with lock:
-                    if sales_name not in sales_data:
-                        sales_data[sales_name] = {"count": 0, "total": 0.0}
-                    sales_data[sales_name]["count"] += 1
-                    sales_data[sales_name]["total"] += nilai
+                sales_name = detail.get("masterSalesmanName") or inv.get("masterSalesmanName")
+                nilai = float(detail.get("totalAmount") or detail.get("subTotal") or 0)
+                catat(sales_name, nilai)
 
-            with ThreadPoolExecutor(max_workers=5) as ex:
-                list(ex.map(enrich, all_invoices))
+            if perlu_detail:
+                with ThreadPoolExecutor(max_workers=5) as ex:
+                    list(ex.map(enrich, perlu_detail))
 
             if not sales_data:
                 send_message(chat_id, f"❌ Tidak ada data penjualan untuk {label or (date_from + ' - ' + date_to)}.")
@@ -2261,11 +2287,13 @@ def tool_sales_tinggi_rendah_per_bulan(host, chat_id, date_from, date_to, label=
         try:
             h = host if host.startswith("http") else f"https://{host}"
             from datetime import datetime
-            # Ambil semua invoice + tanggal
+            # Ambil invoice + nama sales + nilai + tanggal LANGSUNG dari list (andal & cepat).
+            # Detail hanya dibuka untuk invoice yang totalAmount-nya 0/kosong di list.
             all_inv = []
             page = 1
             while True:
-                params = {"fields": "id,number,transDate", "sp.pageSize": 200, "sp.page": page,
+                params = {"fields": "id,number,transDate,totalAmount,subTotal,masterSalesmanName",
+                    "sp.pageSize": 200, "sp.page": page,
                     "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
                 r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
                 data = r.json()
@@ -2284,7 +2312,32 @@ def tool_sales_tinggi_rendah_per_bulan(host, chat_id, date_from, date_to, label=
             lock = threading.Lock()
             # sales -> { bulan(YYYY-MM) -> total nilai }
             sales_bulan = {}
+            stat = {"dari_list": 0, "dari_detail": 0, "gagal": 0}
 
+            def catat(sales_name, tgl, nilai):
+                if not sales_name or not str(sales_name).strip():
+                    sales_name = "Tanpa Sales"
+                if tgl is None: return
+                bulan_key = tgl.strftime("%Y-%m")
+                with lock:
+                    if sales_name not in sales_bulan: sales_bulan[sales_name] = {}
+                    sales_bulan[sales_name][bulan_key] = sales_bulan[sales_name].get(bulan_key, 0.0) + nilai
+
+            # Pisahkan: yang nilainya sudah ada di list vs yang perlu buka detail
+            perlu_detail = []
+            for inv in all_inv:
+                if not isinstance(inv, dict): continue
+                nilai_list = float(inv.get("totalAmount") or 0)
+                sales_list = inv.get("masterSalesmanName")
+                tgl = parse_tgl(inv.get("transDate"))
+                # kalau nilai & sales & tgl lengkap dari list, langsung catat
+                if nilai_list > 0 and tgl is not None:
+                    catat(sales_list, tgl, nilai_list)
+                    with lock: stat["dari_list"] += 1
+                else:
+                    perlu_detail.append(inv)
+
+            # Untuk invoice yang nilai/tanggalnya kurang di list -> buka detail
             def enrich(inv):
                 detail = None
                 for attempt in range(5):
@@ -2295,20 +2348,18 @@ def tool_sales_tinggi_rendah_per_bulan(host, chat_id, date_from, date_to, label=
                             detail = d["d"]; break
                     except Exception: pass
                     import time as _t; _t.sleep(0.4 * (attempt + 1))
-                if detail is None: return
-                sales_name = detail.get("masterSalesmanName")
-                if not sales_name or not str(sales_name).strip():
-                    sales_name = "Tanpa Sales"
+                if detail is None:
+                    with lock: stat["gagal"] += 1
+                    return
+                sales_name = detail.get("masterSalesmanName") or inv.get("masterSalesmanName")
                 tgl = parse_tgl(detail.get("transDate") or inv.get("transDate"))
-                if tgl is None: return
-                bulan_key = tgl.strftime("%Y-%m")
                 nilai = float(detail.get("totalAmount") or detail.get("subTotal") or 0)
-                with lock:
-                    if sales_name not in sales_bulan: sales_bulan[sales_name] = {}
-                    sales_bulan[sales_name][bulan_key] = sales_bulan[sales_name].get(bulan_key, 0.0) + nilai
+                catat(sales_name, tgl, nilai)
+                with lock: stat["dari_detail"] += 1
 
-            with ThreadPoolExecutor(max_workers=5) as ex:
-                list(ex.map(enrich, all_inv))
+            if perlu_detail:
+                with ThreadPoolExecutor(max_workers=5) as ex:
+                    list(ex.map(enrich, perlu_detail))
 
             if not sales_bulan:
                 send_message(chat_id, f"❌ Tidak ada data penjualan untuk {label or (date_from + ' - ' + date_to)}.")
@@ -2342,6 +2393,10 @@ def tool_sales_tinggi_rendah_per_bulan(host, chat_id, date_from, date_to, label=
                 else:
                     msg += f"   📉 Terendah: {_fmt_bln(bln_low)} — Rp {bln[bln_low]:,.0f}\n"
             msg += f"\n_Bulan tanpa penjualan diabaikan (tidak dihitung sebagai terendah)._"
+            grand = sum(sum(b.values()) for b in sales_bulan.values())
+            msg += f"\n_Total semua sales: Rp {grand:,.0f} dari {len(all_inv)} invoice_"
+            if stat["gagal"] > 0:
+                msg += f"\n⚠️ _{stat['gagal']} invoice gagal dibaca dan tidak masuk hitungan._"
             send_message(chat_id, msg)
         except Exception as e:
             send_message(chat_id, f"❌ Gagal hitung tinggi/rendah per sales: {str(e)[:120]}")
