@@ -1114,6 +1114,137 @@ def tool_get_profit_periode(host, chat_id, date_from, date_to, label=""):
     return json.dumps({"status": "background_started"})
 
 
+def tool_rekap_bulanan(host, chat_id, date_from, date_to, label=""):
+    def run():
+        try:
+            h = host if host.startswith("http") else f"https://{host}"
+            from datetime import datetime
+            # Cache modal HPP per item id
+            modal_cache = {}
+            modal_lock = threading.Lock()
+            def get_modal(item_id):
+                if item_id is None:
+                    return 0.0
+                with modal_lock:
+                    if item_id in modal_cache:
+                        return modal_cache[item_id]
+                modal = 0.0
+                try:
+                    r2 = requests.get(f"{h}/accurate/api/item/detail.do", headers=accurate_headers(), params={"id": item_id}, timeout=12)
+                    det = r2.json().get("d", {})
+                    modal = float(det.get("balanceUnitCost") or det.get("defStandardCost") or 0)
+                except: pass
+                with modal_lock:
+                    modal_cache[item_id] = modal
+                return modal
+
+            # Ambil semua invoice + tanggal
+            all_inv = []
+            page = 1
+            while True:
+                params = {"fields": "id,number,transDate", "sp.pageSize": 200, "sp.page": page,
+                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
+                r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+                data = r.json()
+                if not data.get("s"): break
+                all_inv.extend(data.get("d", []))
+                sp = data.get("sp", {})
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+
+            def parse_tgl(s):
+                for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                    try: return datetime.strptime((s or "").split(" ")[0], fmt)
+                    except: pass
+                return None
+
+            lock = threading.Lock()
+            # bulan(YYYY-MM) -> {"jual","modal","inv"}
+            bulanan = {}
+
+            def scan(inv):
+                try:
+                    r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=15)
+                    det = r2.json().get("d", {})
+                    tgl = parse_tgl(det.get("transDate") or inv.get("transDate"))
+                    if tgl is None: return
+                    bulan_key = tgl.strftime("%Y-%m")
+                    items = det.get("detailItem", [])
+                    jual_inv = 0.0
+                    modal_inv = 0.0
+                    if isinstance(items, list):
+                        for item in items:
+                            if not isinstance(item, dict): continue
+                            item_obj = item.get("item", {})
+                            if isinstance(item_obj, list): item_obj = item_obj[0] if item_obj else {}
+                            item_id = item_obj.get("id") if isinstance(item_obj, dict) else None
+                            qty = float(item.get("quantity") or item.get("qty") or 0)
+                            unit_jual = float(item.get("unitPrice") or item.get("price") or 0)
+                            amount = float(item.get("amount") or item.get("totalAmount") or item.get("totalPrice") or 0)
+                            if amount <= 0 and unit_jual > 0:
+                                amount = unit_jual * qty
+                            jual_inv += amount
+                            modal_inv += get_modal(item_id) * qty
+                    # kalau detailItem kosong, pakai totalAmount invoice sebagai penjualan
+                    if jual_inv <= 0:
+                        jual_inv = float(det.get("totalAmount") or det.get("subTotal") or 0)
+                    with lock:
+                        if bulan_key not in bulanan: bulanan[bulan_key] = {"jual": 0.0, "modal": 0.0, "inv": 0}
+                        bulanan[bulan_key]["jual"] += jual_inv
+                        bulanan[bulan_key]["modal"] += modal_inv
+                        bulanan[bulan_key]["inv"] += 1
+                except: pass
+
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                list(ex.map(scan, all_inv))
+
+            if not bulanan:
+                send_message(chat_id, f"❌ Tidak ada data penjualan di periode {date_from} - {date_to}.")
+                return
+
+            _NAMA_BLN = {"01":"Januari","02":"Februari","03":"Maret","04":"April","05":"Mei","06":"Juni",
+                         "07":"Juli","08":"Agustus","09":"September","10":"Oktober","11":"November","12":"Desember"}
+            def _fmt_bln(bk):
+                try:
+                    y, m = bk.split("-"); return f"{_NAMA_BLN.get(m, m)} {y}"
+                except: return bk
+
+            total_jual = sum(v["jual"] for v in bulanan.values())
+            total_modal = sum(v["modal"] for v in bulanan.values())
+            total_laba = total_jual - total_modal
+
+            bln_jual_top = max(bulanan, key=lambda b: bulanan[b]["jual"])
+            bln_laba_top = max(bulanan, key=lambda b: (bulanan[b]["jual"] - bulanan[b]["modal"]))
+
+            judul = label or f"{date_from} - {date_to}"
+            msg = f"📊 *Rekap Bulanan (Penjualan & Laba) - {judul}*\n"
+            msg += f"Dari {len(all_inv)} invoice\n\n"
+            msg += f"⭐ *Sorotan:*\n"
+            msg += f"📈 Penjualan tertinggi: *{_fmt_bln(bln_jual_top)}* (Rp {bulanan[bln_jual_top]['jual']:,.0f})\n"
+            msg += f"🏆 Laba tertinggi: *{_fmt_bln(bln_laba_top)}* (Rp {bulanan[bln_laba_top]['jual'] - bulanan[bln_laba_top]['modal']:,.0f})\n\n"
+
+            # Tabel per bulan (urut kronologis)
+            msg += f"*Rincian per bulan:*\n"
+            for bk in sorted(bulanan):
+                v = bulanan[bk]
+                laba = v["jual"] - v["modal"]
+                m = (laba / v["jual"] * 100) if v["jual"] > 0 else 0
+                msg += f"• {_fmt_bln(bk)}: jual Rp {v['jual']:,.0f} | laba Rp {laba:,.0f} ({m:.0f}%) | {v['inv']} inv\n"
+
+            msg += f"\n*Total periode:*\n"
+            msg += f"Penjualan Rp {total_jual:,.0f} | Modal Rp {total_modal:,.0f} | Laba Rp {total_laba:,.0f}\n"
+            msg += f"\n_Laba = penjualan − modal HPP (balanceUnitCost). Penjualan tertinggi selalu akurat; laba tergantung HPP item di Accurate sudah terisi._"
+            send_message(chat_id, msg)
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal rekap bulanan: {str(e)[:120]}")
+            print(f"[REKAP BULANAN ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
+
+
 def tool_get_sales_per_salesman(host, chat_id, date_from, date_to, label=""):
     def run():
         try:
@@ -1512,6 +1643,19 @@ TOOLS = [
         }
     },
     {
+        "name": "rekap_bulanan",
+        "description": "Rekap PENJUALAN dan LABA per bulan dalam SATU pesan untuk satu rentang periode: tabel tiap bulan (penjualan, laba, margin, jumlah invoice) plus sorotan bulan penjualan tertinggi dan bulan laba tertinggi. WAJIB pakai tool ini (SATU KALI saja) untuk pertanyaan seperti 'penjualan dan laba tertinggi bulan apa', 'bulan mana omset/laba paling tinggi', 'rekap penjualan per bulan 2026', 'bandingkan penjualan tiap bulan'. JANGAN memanggil get_omset_summary berkali-kali per bulan untuk ini — cukup panggil rekap_bulanan sekali dengan rentang penuh (mis. 01/01/2026 - 30/06/2026). Background 5-10 menit, hasil ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD/MM/YYYY, awal periode (mis. 01/01/2026)"},
+                "date_to": {"type": "string", "description": "DD/MM/YYYY, akhir periode"},
+                "label": {"type": "string", "description": "Label periode, contoh '2026' atau 'Jan-Jun 2026'"}
+            },
+            "required": ["date_from", "date_to"]
+        }
+    },
+    {
         "name": "cek_bukti_bayar",
         "description": "Cek bukti bayar/pembayaran sebuah invoice dari Google Drive: cari file bukti (dinamai sesuai nomor invoice), baca nominal di foto, bandingkan dengan nilai invoice di Accurate. Untuk 'cek bukti bayar invoice X', 'apakah invoice X sudah ada bukti bayarnya', 'cocokkan pembayaran invoice X'. Background, hasil dikirim ke Telegram.",
         "input_schema": {
@@ -1561,6 +1705,7 @@ Tools background (hasilnya dikirim otomatis ke Telegram setelah selesai, beri ta
 - get_customer_reguler: customer yang RUTIN order produk tertentu, dikelompokkan reguler bulanan & mingguan. WAJIB pakai ini untuk 'customer yang order stiker dan kertas reguler', 'pelanggan rutin tiap bulan/minggu', 'langganan tetap'. CATATAN: 'stiker'=chromo/vinyl, 'kertas'=art paper/art carton/ivory (itu bahannya di Accurate). Untuk stiker&kertas biarkan keyword default. Kalau produk lain, isi keyword dipisah KOMA.
 - bukti_belum_ada_per_sales: invoice yang BELUM ADA bukti bayarnya di Drive, dikelompokkan PER SALES. WAJIB pakai ini untuk 'bukti bayar yang belum ada per sales', 'invoice belum ada bukti dikelompokkan salesman'. Beda dari cek_bukti_bayar_massal (tidak per sales).
 - get_profit_periode: PROFIT/LABA (penjualan − modal HPP) satu periode, rincian PER BULAN dan PER HARI sekaligus. WAJIB pakai ini untuk 'profit per hari', 'profit per bulan', 'laba harian bulanan'. Beda dari get_product_profit (itu per produk, bukan per periode).
+- rekap_bulanan: rekap PENJUALAN + LABA per bulan dalam SATU pesan (tabel tiap bulan + sorotan bulan tertinggi penjualan & laba). WAJIB pakai ini (SATU KALI, rentang penuh) untuk 'penjualan dan laba tertinggi bulan apa', 'bulan mana omset/laba paling tinggi', 'rekap penjualan per bulan'. DILARANG memanggil get_omset_summary berkali-kali per bulan untuk pertanyaan seperti ini — itu boros dan hasilnya berserakan. Cukup rekap_bulanan sekali, mis. date_from=01/01/2026 date_to=30/06/2026.
 - get_piutang_summary: total piutang (2-3 menit)
 - get_low_stock: produk yang stoknya menipis di bawah ambang batas (perlu sebut kategori produk)
 - get_overdue_customers: customer yang nunggak lewat jatuh tempo > sekian hari
@@ -1665,6 +1810,8 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_bukti_belum_ada_per_sales(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "get_profit_periode":
                     result = tool_get_profit_periode(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
+                elif tool_name == "rekap_bulanan":
+                    result = tool_rekap_bulanan(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 else:
                     result = json.dumps({"error": f"Unknown tool: {tool_name}"})
 
