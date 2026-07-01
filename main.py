@@ -1297,7 +1297,7 @@ def tool_get_sales_per_salesman(host, chat_id, date_from, date_to, label=""):
                         sales_data.setdefault("(Gagal dibaca)", {"count": 0, "total": 0.0})
                         sales_data["(Gagal dibaca)"]["count"] += 1
                     return
-                sales_name = detail.get("masterSalesmanName")
+                sales_name = _resolve_sales_name(detail)
                 nilai = float(detail.get("totalAmount") or detail.get("subTotal") or 0)
                 catat(sales_name, nilai)
 
@@ -2165,6 +2165,35 @@ def _is_marketplace(nama):
     return any(kw in n for kw in _CHANNEL_MARKETPLACE)
 
 
+def _resolve_sales_name(detail):
+    """Ambil nama sales dari detail invoice, dengan fallback ke objek bersarang.
+    Accurate kadang menaruh nama sales di masterSalesmanName, kadang di objek
+    'salesman' (dict/list), atau field lain. Kembalikan 'Tanpa Sales' jika benar
+    kosong."""
+    if not isinstance(detail, dict):
+        return "Tanpa Sales"
+    # 1. field langsung
+    nm = detail.get("masterSalesmanName")
+    if nm and str(nm).strip():
+        return str(nm).strip()
+    # 2. objek salesman bersarang
+    for key in ("salesman", "masterSalesman", "salesmanList", "detailSalesman"):
+        obj = detail.get(key)
+        if isinstance(obj, dict):
+            cand = obj.get("name") or obj.get("salesmanName") or obj.get("masterSalesmanName")
+            if cand and str(cand).strip():
+                return str(cand).strip()
+        elif isinstance(obj, list) and obj:
+            first = obj[0]
+            if isinstance(first, dict):
+                cand = first.get("name") or first.get("salesmanName") or first.get("masterSalesmanName")
+                if cand and str(cand).strip():
+                    return str(cand).strip()
+            elif first:
+                return str(first).strip()
+    return "Tanpa Sales"
+
+
 def _hitung_jumlah_bulan(date_from, date_to):
     """Hitung berapa bulan kalender tercakup antara date_from dan date_to (DD/MM/YYYY)."""
     from datetime import datetime
@@ -2229,7 +2258,7 @@ def tool_get_rata_sales_per_bulan(host, chat_id, date_from, date_to, label=""):
                     import time as _t; _t.sleep(0.5 * (attempt + 1))
                 if detail is None:
                     return
-                sales_name = detail.get("masterSalesmanName")
+                sales_name = _resolve_sales_name(detail)
                 nilai = float(detail.get("totalAmount") or detail.get("subTotal") or 0)
                 catat(sales_name, nilai)
 
@@ -2322,7 +2351,7 @@ def tool_sales_tinggi_rendah_per_bulan(host, chat_id, date_from, date_to, label=
                 if detail is None:
                     with lock: stat["gagal"] += 1
                     return
-                sales_name = detail.get("masterSalesmanName")
+                sales_name = _resolve_sales_name(detail)
                 tgl = parse_tgl(detail.get("transDate") or inv.get("transDate"))
                 nilai = float(detail.get("totalAmount") or detail.get("subTotal") or 0)
                 catat(sales_name, tgl, nilai)
@@ -3487,6 +3516,46 @@ def debug_nosales():
             "daftar_nomor_tanpa_sales": sorted(no_sales),
             "daftar_nomor_gagal_baca": sorted(error_baca)
         }
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+
+@app.route("/debug-sales-jan", methods=["GET"])
+def debug_sales_jan():
+    try:
+        host = get_host()
+        if not host: return {"error": "Gagal dapat host"}, 500
+        h = host if host.startswith("http") else f"https://{host}"
+        # Ambil 5 invoice Januari 2026
+        r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(),
+            params={"fields": "id,number", "sp.pageSize": 5, "sp.page": 1,
+                "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": "01/01/2026", "filter.transDate.val[1]": "31/01/2026"}, timeout=15)
+        list_data = r.json().get("d", [])
+        hasil = []
+        for inv in list_data:
+            r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(),
+                params={"id": inv["id"]}, timeout=15)
+            detail = r2.json().get("d", {})
+            if not isinstance(detail, dict):
+                continue
+            # Cari semua field yang mengandung 'sales' atau 'salesman' (huруф kecil)
+            field_sales = {}
+            for k, v in detail.items():
+                kl = k.lower()
+                if "sales" in kl or "salesman" in kl:
+                    # ringkas kalau value-nya objek besar
+                    if isinstance(v, (dict, list)):
+                        field_sales[k] = str(v)[:300]
+                    else:
+                        field_sales[k] = v
+            hasil.append({
+                "number": inv.get("number"),
+                "field_mengandung_sales": field_sales,
+                "detail_masterSalesmanName": detail.get("masterSalesmanName"),
+                "detail_salesman": str(detail.get("salesman"))[:300] if detail.get("salesman") is not None else None,
+                "semua_key_detail": sorted(list(detail.keys()))
+            })
+        return {"hasil": hasil}
     except Exception as e:
         return {"error": str(e)}, 500
 
