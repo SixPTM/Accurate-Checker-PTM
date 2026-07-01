@@ -1455,13 +1455,13 @@ TOOLS = [
     },
     {
         "name": "get_customer_reguler",
-        "description": "Cari CUSTOMER yang RUTIN/REGULER order produk tertentu (default stiker & kertas) selama periode: bukan sekadar pernah beli, tapi ordernya konsisten muncul hampir tiap bulan (reguler bulanan) dan hampir tiap minggu (reguler mingguan). Hasil menampilkan dua kelompok terpisah. WAJIB pakai tool ini untuk 'customer yang order stiker dan kertas reguler', 'pelanggan rutin order tiap bulan/minggu', 'siapa yang langganan tetap'. Background 5-10 menit (scan detail invoice), hasil ke Telegram.",
+        "description": "Cari CUSTOMER yang RUTIN/REGULER order produk tertentu selama periode: bukan sekadar pernah beli, tapi ordernya konsisten muncul hampir tiap bulan (reguler bulanan) dan hampir tiap minggu (reguler mingguan). Hasil menampilkan dua kelompok terpisah. WAJIB pakai tool ini untuk 'customer yang order stiker dan kertas reguler', 'pelanggan rutin order tiap bulan/minggu', 'siapa yang langganan tetap'. PENTING soal keyword: 'stiker' dan 'kertas' adalah KATEGORI, bukan nama produk. Di Accurate, STIKER = bahan chromo, vinyl; KERTAS = art paper, art carton, ivory. Untuk 'stiker dan kertas reguler' BIARKAN keyword default (chromo,vinyl,art paper,art carton,ivory). Kalau user sebut produk lain, isi keyword dengan nama/bahan produk itu, dipisah KOMA (bukan spasi) supaya frasa multi-kata seperti 'art paper' utuh. Background 5-10 menit (scan detail invoice), hasil ke Telegram.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "date_from": {"type": "string", "description": "DD/MM/YYYY"},
                 "date_to": {"type": "string", "description": "DD/MM/YYYY"},
-                "keyword": {"type": "string", "description": "Kata kunci produk dipisah spasi, default 'stiker kertas'. Cocok jika nama item mengandung salah satu kata."},
+                "keyword": {"type": "string", "description": "Frasa produk dipisah KOMA, default 'chromo,vinyl,art paper,art carton,ivory' (stiker=chromo/vinyl, kertas=art paper/art carton/ivory). Cocok jika nama item mengandung salah satu frasa."},
                 "label": {"type": "string", "description": "Label periode, contoh '6 Bulan Terakhir'"}
             },
             "required": ["date_from", "date_to"]
@@ -1540,7 +1540,7 @@ Tools background (hasilnya dikirim otomatis ke Telegram setelah selesai, beri ta
 - get_produk_terlaku: rekap SEMUA produk terlaku di rentang tanggal, terurut dari qty tertinggi ke terendah, menampilkan qty + jumlah invoice + nilai Rp, tanpa perlu keyword. WAJIB pakai ini untuk SEMUA pertanyaan 'produk terlaku/terlaris/paling laku' baik harian, mingguan, MAUPUN BULANAN. Untuk 'produk terlaku hari ini' panggil date_from=date_to=tanggal hari ini. Untuk 'produk terlaku bulan ini' panggil date_from=01/bulan, date_to=tanggal hari ini.
 - get_customer_terbanyak: rekap CUSTOMER dengan order terbanyak di satu periode (berapa kali order + total belanja), terurut dari terbanyak. WAJIB pakai ini untuk 'customer order terbanyak', 'pelanggan paling sering pesan', 'customer belanja terbesar', 'customer paling aktif'. Default urut_by='order' (jumlah order); pakai urut_by='nilai' kalau user minta yang nilai/belanjanya terbesar. Untuk '6 bulan terakhir' hitung date_from = tanggal 6 bulan lalu, date_to = hari ini.
 - get_rata_sales_per_bulan: RATA-RATA penjualan tiap sales PER BULAN (total sales dibagi jumlah bulan periode). WAJIB pakai ini untuk 'rata-rata penjualan tiap sales per bulan', 'penjualan masing-masing sales rata per bulan berapa'. JANGAN pakai get_sales_per_salesman (itu cuma total).
-- get_customer_reguler: customer yang RUTIN order produk tertentu (default stiker & kertas), dikelompokkan reguler bulanan & mingguan. WAJIB pakai ini untuk 'customer yang order stiker dan kertas reguler', 'pelanggan rutin tiap bulan/minggu', 'langganan tetap'. Kalau user sebut produk lain, isi keyword sesuai produk itu.
+- get_customer_reguler: customer yang RUTIN order produk tertentu, dikelompokkan reguler bulanan & mingguan. WAJIB pakai ini untuk 'customer yang order stiker dan kertas reguler', 'pelanggan rutin tiap bulan/minggu', 'langganan tetap'. CATATAN: 'stiker'=chromo/vinyl, 'kertas'=art paper/art carton/ivory (itu bahannya di Accurate). Untuk stiker&kertas biarkan keyword default. Kalau produk lain, isi keyword dipisah KOMA.
 - bukti_belum_ada_per_sales: invoice yang BELUM ADA bukti bayarnya di Drive, dikelompokkan PER SALES. WAJIB pakai ini untuk 'bukti bayar yang belum ada per sales', 'invoice belum ada bukti dikelompokkan salesman'. Beda dari cek_bukti_bayar_massal (tidak per sales).
 - get_profit_periode: PROFIT/LABA (penjualan − modal HPP) satu periode, rincian PER BULAN dan PER HARI sekaligus. WAJIB pakai ini untuk 'profit per hari', 'profit per bulan', 'laba harian bulanan'. Beda dari get_product_profit (itu per produk, bukan per periode).
 - get_piutang_summary: total piutang (2-3 menit)
@@ -1642,7 +1642,7 @@ def handle_with_claude(chat_id, user_text, host):
                 elif tool_name == "get_rata_sales_per_bulan":
                     result = tool_get_rata_sales_per_bulan(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "get_customer_reguler":
-                    result = tool_get_customer_reguler(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("keyword","stiker kertas"), tool_input.get("label",""))
+                    result = tool_get_customer_reguler(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("keyword","chromo,vinyl,art paper,art carton,ivory"), tool_input.get("label",""))
                 elif tool_name == "bukti_belum_ada_per_sales":
                     result = tool_bukti_belum_ada_per_sales(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "get_profit_periode":
@@ -2075,15 +2075,18 @@ def tool_get_rata_sales_per_bulan(host, chat_id, date_from, date_to, label=""):
     return json.dumps({"status": "background_started"})
 
 
-def tool_get_customer_reguler(host, chat_id, date_from, date_to, keyword="stiker kertas", label=""):
+def tool_get_customer_reguler(host, chat_id, date_from, date_to, keyword="chromo,vinyl,art paper,art carton,ivory", label=""):
     def run():
         try:
             h = host if host.startswith("http") else f"https://{host}"
             from datetime import datetime
-            # Keyword bisa beberapa kata dipisah spasi/koma; cocok jika nama item mengandung SALAH SATU kata.
-            kws = [k.strip().lower() for k in keyword.replace(",", " ").split() if k.strip()]
+            # Keyword adalah daftar frasa dipisah KOMA (bukan spasi), supaya frasa
+            # multi-kata seperti "art paper" tetap utuh. Cocok jika nama item
+            # mengandung SALAH SATU frasa.
+            kws = [k.strip().lower() for k in keyword.split(",") if k.strip()]
             if not kws:
-                kws = ["stiker", "kertas"]
+                # default: jenis stiker (chromo, vinyl) + kertas (art paper, art carton, ivory)
+                kws = ["chromo", "vinyl", "art paper", "art carton", "ivory"]
 
             # 1. Ambil semua invoice + tanggalnya
             all_inv = []
@@ -2158,13 +2161,14 @@ def tool_get_customer_reguler(host, chat_id, date_from, date_to, keyword="stiker
                 return
 
             jml_bulan = _hitung_jumlah_bulan(date_from, date_to)
-            # ambang reguler: bulanan minimal 5 dari 6 (>=83% bulan), mingguan >=75% minggu
-            ambang_bulan = max(1, round(jml_bulan * 5 / 6)) if jml_bulan >= 6 else max(1, jml_bulan - 1)
+            # ambang reguler bulanan: minimal ~70% dari jumlah bulan (mis. 7 bln -> 5)
+            ambang_bulan = max(2, round(jml_bulan * 0.7)) if jml_bulan >= 3 else max(1, jml_bulan)
             # perkiraan jumlah minggu dalam periode
             from datetime import datetime as _dt
             d1 = parse_tgl(date_from); d2 = parse_tgl(date_to)
             jml_minggu = max(1, round(((d2 - d1).days + 1) / 7)) if (d1 and d2) else jml_bulan * 4
-            ambang_minggu = max(1, round(jml_minggu * 0.75))
+            # ambang mingguan: minimal ~60% minggu (order hampir tiap minggu tapi tidak harus sempurna)
+            ambang_minggu = max(2, round(jml_minggu * 0.6))
 
             reguler_bulanan = []
             for nama, bset in cust_bulan.items():
