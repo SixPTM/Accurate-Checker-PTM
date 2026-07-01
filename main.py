@@ -1063,9 +1063,27 @@ def tool_get_profit_periode(host, chat_id, date_from, date_to, label=""):
             total_laba = total_jual - total_modal
             margin = (total_laba / total_jual * 100) if total_jual > 0 else 0
 
+            # Sorotan: bulan penjualan tertinggi & bulan laba tertinggi
+            _NAMA_BLN = {"01":"Januari","02":"Februari","03":"Maret","04":"April","05":"Mei","06":"Juni",
+                         "07":"Juli","08":"Agustus","09":"September","10":"Oktober","11":"November","12":"Desember"}
+            def _fmt_bln(bk):
+                # bk format 'YYYY-MM' -> 'Juni 2026'
+                try:
+                    y, m = bk.split("-")
+                    return f"{_NAMA_BLN.get(m, m)} {y}"
+                except:
+                    return bk
+            bln_jual_top = max(bulanan, key=lambda b: bulanan[b]["jual"])
+            bln_laba_top = max(bulanan, key=lambda b: (bulanan[b]["jual"] - bulanan[b]["modal"]))
+            jual_top = bulanan[bln_jual_top]["jual"]
+            laba_top = bulanan[bln_laba_top]["jual"] - bulanan[bln_laba_top]["modal"]
+
             judul = label or f"{date_from} - {date_to}"
             msg = f"📊 *Profit per Periode - {judul}*\n"
             msg += f"Dari {len(all_inv)} invoice\n\n"
+            msg += f"⭐ *Sorotan:*\n"
+            msg += f"📈 Penjualan tertinggi: *{_fmt_bln(bln_jual_top)}* (Rp {jual_top:,.0f})\n"
+            msg += f"🏆 Laba tertinggi: *{_fmt_bln(bln_laba_top)}* (Rp {laba_top:,.0f})\n\n"
             msg += f"💵 Total penjualan: Rp {total_jual:,.0f}\n"
             msg += f"🏭 Total modal (HPP): Rp {total_modal:,.0f}\n"
             msg += f"✅ Laba kotor: Rp {total_laba:,.0f} (margin {margin:.1f}%)\n\n"
