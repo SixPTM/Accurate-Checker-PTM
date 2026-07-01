@@ -1269,41 +1269,47 @@ def tool_get_sales_per_salesman(host, chat_id, date_from, date_to, label=""):
                     sales_data[sales_name]["count"] += 1
                     sales_data[sales_name]["total"] += nilai
 
-            # Nilai diambil dari LIST (akurat). Nama sales: coba masterSalesmanName di list,
-            # kalau kosong pakai masterSalesmanId diterjemahkan lewat peta salesman.
-            # Kalau dua-duanya kosong, invoice ditandai perlu buka detail.
-            perlu_detail = []
-            for inv in all_invoices:
-                if not isinstance(inv, dict): continue
-                nilai = float(inv.get("totalAmount") or inv.get("salesAmount") or inv.get("subTotal") or 0)
-                nama = inv.get("masterSalesmanName")
-                if (not nama or not str(nama).strip()):
-                    sid = inv.get("masterSalesmanId")
-                    if sid is not None and sid in peta:
-                        nama = peta[sid]
-                if nama and str(nama).strip():
-                    catat(nama, nilai)
-                else:
-                    perlu_detail.append((inv, nilai))
+            # PENTING (sudah dipastikan lewat debug): endpoint LIST hanya mengirim
+            # id, number, transDate, totalAmount, subTotal, statusName — TIDAK ada nama/ID sales.
+            # Jadi: nilai diambil dari list (dijamin lengkap), nama sales diambil dari
+            # detail tiap invoice. Nilai TIDAK PERNAH hilang walau detail gagal dibaca.
 
-            # Fallback detail hanya untuk invoice yang nama sales-nya benar-benar tak ketemu
-            if perlu_detail:
-                def enrich(item):
-                    inv, nilai = item
-                    detail = None
-                    for attempt in range(5):
-                        try:
-                            r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=20)
-                            d = r2.json()
-                            if d.get("s") and d.get("d"):
-                                detail = d["d"]; break
-                        except Exception: pass
-                        import time as _t; _t.sleep(0.4 * (attempt + 1))
-                    if detail is None:
-                        catat("Tanpa Sales", nilai); return
-                    catat(_resolve_sales_name(detail), nilai)
-                with ThreadPoolExecutor(max_workers=6) as ex:
-                    list(ex.map(enrich, perlu_detail))
+            # 1. Petakan id invoice -> nama sales (dari detail). Proses ulang yang gagal.
+            id_sales = {}     # invoice_id -> nama sales
+            gagal_baca = []
+            sales_lock = threading.Lock()
+
+            def baca_sales(inv):
+                iid = inv.get("id")
+                detail = None
+                for attempt in range(4):
+                    try:
+                        r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": iid}, timeout=20)
+                        d = r2.json()
+                        if d.get("s") and d.get("d"):
+                            detail = d["d"]; break
+                    except Exception: pass
+                    import time as _t; _t.sleep(0.4 * (attempt + 1))
+                if detail is None:
+                    with sales_lock: gagal_baca.append(inv)
+                    return
+                with sales_lock:
+                    id_sales[iid] = _resolve_sales_name(detail)
+
+            valid = [inv for inv in all_invoices if isinstance(inv, dict) and inv.get("id") is not None]
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                list(ex.map(baca_sales, valid))
+            # proses ulang yang gagal (satu putaran lagi, worker lebih sedikit)
+            if gagal_baca:
+                ulang = list(gagal_baca); gagal_baca.clear()
+                with ThreadPoolExecutor(max_workers=3) as ex:
+                    list(ex.map(baca_sales, ulang))
+
+            # 2. Akumulasi: nilai dari list (SELALU masuk), nama dari peta id_sales
+            for inv in valid:
+                nilai = float(inv.get("totalAmount") or inv.get("subTotal") or 0)
+                nama = id_sales.get(inv.get("id")) or "Tanpa Sales"
+                catat(nama, nilai)
 
             if not sales_data:
                 send_message(chat_id, f"❌ Tidak ada data penjualan untuk {label}.")
@@ -2295,38 +2301,41 @@ def tool_get_rata_sales_per_bulan(host, chat_id, date_from, date_to, label=""):
                     sales_data[sales_name]["count"] += 1
                     sales_data[sales_name]["total"] += nilai
 
-            # Nilai dari list; nama sales dari list-name atau peta(ID); fallback detail.
-            perlu_detail = []
-            for inv in all_invoices:
-                if not isinstance(inv, dict): continue
-                nilai = float(inv.get("totalAmount") or inv.get("salesAmount") or inv.get("subTotal") or 0)
-                nama = inv.get("masterSalesmanName")
-                if (not nama or not str(nama).strip()):
-                    sid = inv.get("masterSalesmanId")
-                    if sid is not None and sid in peta:
-                        nama = peta[sid]
-                if nama and str(nama).strip():
-                    catat(nama, nilai)
-                else:
-                    perlu_detail.append((inv, nilai))
+            # Endpoint LIST tidak mengirim nama sales. Nilai dari list (lengkap),
+            # nama sales dari detail. Nilai tidak pernah hilang walau detail gagal.
+            id_sales = {}
+            gagal_baca = []
+            sales_lock = threading.Lock()
 
-            if perlu_detail:
-                def enrich(item):
-                    inv, nilai = item
-                    detail = None
-                    for attempt in range(5):
-                        try:
-                            r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=20)
-                            d = r2.json()
-                            if d.get("s") and d.get("d"):
-                                detail = d["d"]; break
-                        except Exception: pass
-                        import time as _t; _t.sleep(0.4 * (attempt + 1))
-                    if detail is None:
-                        catat("Tanpa Sales", nilai); return
-                    catat(_resolve_sales_name(detail), nilai)
-                with ThreadPoolExecutor(max_workers=6) as ex:
-                    list(ex.map(enrich, perlu_detail))
+            def baca_sales(inv):
+                iid = inv.get("id")
+                detail = None
+                for attempt in range(4):
+                    try:
+                        r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": iid}, timeout=20)
+                        d = r2.json()
+                        if d.get("s") and d.get("d"):
+                            detail = d["d"]; break
+                    except Exception: pass
+                    import time as _t; _t.sleep(0.4 * (attempt + 1))
+                if detail is None:
+                    with sales_lock: gagal_baca.append(inv)
+                    return
+                with sales_lock:
+                    id_sales[iid] = _resolve_sales_name(detail)
+
+            valid = [inv for inv in all_invoices if isinstance(inv, dict) and inv.get("id") is not None]
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                list(ex.map(baca_sales, valid))
+            if gagal_baca:
+                ulang = list(gagal_baca); gagal_baca.clear()
+                with ThreadPoolExecutor(max_workers=3) as ex:
+                    list(ex.map(baca_sales, ulang))
+
+            for inv in valid:
+                nilai = float(inv.get("totalAmount") or inv.get("subTotal") or 0)
+                nama = id_sales.get(inv.get("id")) or "Tanpa Sales"
+                catat(nama, nilai)
 
             if not sales_data:
                 send_message(chat_id, f"❌ Tidak ada data penjualan untuk {label or (date_from + ' - ' + date_to)}.")
@@ -2398,44 +2407,42 @@ def tool_sales_tinggi_rendah_per_bulan(host, chat_id, date_from, date_to, label=
                     if sales_name not in sales_bulan: sales_bulan[sales_name] = {}
                     sales_bulan[sales_name][bulan_key] = sales_bulan[sales_name].get(bulan_key, 0.0) + nilai
 
-            peta = _get_peta_salesman(h)
+            # Endpoint LIST tidak mengirim nama sales. Nilai & tanggal dari list (lengkap),
+            # nama sales dari detail. Nilai tidak pernah hilang walau detail gagal.
+            id_sales = {}
+            gagal_baca = []
+            sales_lock = threading.Lock()
 
-            # Nilai & tanggal dari list; nama sales dari list-name atau peta(ID); fallback detail.
-            perlu_detail = []
-            for inv in all_inv:
-                if not isinstance(inv, dict): continue
+            def baca_sales(inv):
+                iid = inv.get("id")
+                detail = None
+                for attempt in range(4):
+                    try:
+                        r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": iid}, timeout=20)
+                        d = r2.json()
+                        if d.get("s") and d.get("d"):
+                            detail = d["d"]; break
+                    except Exception: pass
+                    import time as _t; _t.sleep(0.4 * (attempt + 1))
+                if detail is None:
+                    with sales_lock: gagal_baca.append(inv)
+                    return
+                with sales_lock:
+                    id_sales[iid] = _resolve_sales_name(detail)
+
+            valid = [inv for inv in all_inv if isinstance(inv, dict) and inv.get("id") is not None]
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                list(ex.map(baca_sales, valid))
+            if gagal_baca:
+                ulang = list(gagal_baca); gagal_baca.clear()
+                with ThreadPoolExecutor(max_workers=3) as ex:
+                    list(ex.map(baca_sales, ulang))
+
+            for inv in valid:
                 tgl = parse_tgl(inv.get("transDate"))
-                nilai = float(inv.get("totalAmount") or inv.get("salesAmount") or inv.get("subTotal") or 0)
-                nama = inv.get("masterSalesmanName")
-                if (not nama or not str(nama).strip()):
-                    sid = inv.get("masterSalesmanId")
-                    if sid is not None and sid in peta:
-                        nama = peta[sid]
-                if nama and str(nama).strip():
-                    catat(nama, tgl, nilai)
-                    with lock: stat["dari_list"] += 1
-                else:
-                    perlu_detail.append((inv, tgl, nilai))
-
-            if perlu_detail:
-                def enrich(item):
-                    inv, tgl, nilai = item
-                    detail = None
-                    for attempt in range(5):
-                        try:
-                            r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": inv["id"]}, timeout=20)
-                            d = r2.json()
-                            if d.get("s") and d.get("d"):
-                                detail = d["d"]; break
-                        except Exception: pass
-                        import time as _t; _t.sleep(0.4 * (attempt + 1))
-                    if detail is None:
-                        with lock: stat["gagal"] += 1
-                        catat("Tanpa Sales", tgl, nilai); return
-                    catat(_resolve_sales_name(detail), tgl, nilai)
-                    with lock: stat["dari_detail"] += 1
-                with ThreadPoolExecutor(max_workers=6) as ex:
-                    list(ex.map(enrich, perlu_detail))
+                nilai = float(inv.get("totalAmount") or inv.get("subTotal") or 0)
+                nama = id_sales.get(inv.get("id")) or "Tanpa Sales"
+                catat(nama, tgl, nilai)
 
             if not sales_bulan:
                 send_message(chat_id, f"❌ Tidak ada data penjualan untuk {label or (date_from + ' - ' + date_to)}.")
