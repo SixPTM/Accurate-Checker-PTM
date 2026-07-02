@@ -1602,13 +1602,14 @@ TOOLS = [
     },
     {
         "name": "bukti_belum_ada_per_sales",
-        "description": "Cek invoice yang BELUM ADA file bukti bayarnya di Google Drive, lalu KELOMPOKKAN PER SALES (nama sales -> daftar nomor invoice + nilai). WAJIB pakai tool ini untuk 'bukti bayar yang belum ada dikelompokkan per sales', 'invoice belum ada bukti per salesman', 'sales mana yang paling banyak invoice belum ada buktinya'. Beda dengan cek_bukti_bayar_massal (itu tidak per sales) dan bukti_tidak_cocok_per_sales (itu yang nominalnya beda, bukan yang belum ada). Background beberapa menit, hasil ke Telegram.",
+        "description": "Cek invoice yang BELUM ADA file bukti bayarnya di Google Drive, dikelompokkan PER SALES (nama sales -> daftar nomor invoice + nilai). Secara DEFAULT hanya menampilkan invoice berstatus LUNAS (hanya_lunas=true) — karena itu yang paling relevan: sudah lunas tapi bukti belum diupload. WAJIB pakai tool ini untuk 'sales mana yang customernya sudah lunas tapi belum ada bukti bayar', 'invoice lunas belum ada bukti per sales', 'bukti bayar yang belum ada per sales'. Kalau user mau SEMUA invoice (termasuk yang belum lunas), set hanya_lunas=false. Beda dengan cek_bukti_bayar_massal (tidak per sales) dan bukti_tidak_cocok_per_sales (yang nominalnya beda). Background beberapa menit, hasil ke Telegram.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "date_from": {"type": "string", "description": "DD/MM/YYYY"},
                 "date_to": {"type": "string", "description": "DD/MM/YYYY"},
-                "label": {"type": "string", "description": "Label periode"}
+                "label": {"type": "string", "description": "Label periode"},
+                "hanya_lunas": {"type": "boolean", "description": "true (default) = hanya invoice LUNAS yang belum ada bukti. false = semua invoice belum ada bukti."}
             },
             "required": ["date_from", "date_to"]
         }
@@ -1714,7 +1715,7 @@ Tools background (hasilnya dikirim otomatis ke Telegram setelah selesai, beri ta
 - get_customer_terbanyak: rekap CUSTOMER dengan order terbanyak di satu periode (berapa kali order + total belanja), terurut dari terbanyak. WAJIB pakai ini untuk 'customer order terbanyak', 'pelanggan paling sering pesan', 'customer belanja terbesar', 'customer paling aktif'. Default urut_by='order' (jumlah order); pakai urut_by='nilai' kalau user minta yang nilai/belanjanya terbesar. Untuk '6 bulan terakhir' hitung date_from = tanggal 6 bulan lalu, date_to = hari ini.
 - get_rata_sales_per_bulan: RATA-RATA penjualan tiap sales PER BULAN (total sales dibagi jumlah bulan periode). WAJIB pakai ini untuk 'rata-rata penjualan tiap sales per bulan', 'penjualan masing-masing sales rata per bulan berapa'. JANGAN pakai get_sales_per_salesman (itu cuma total).
 - get_customer_reguler: customer yang RUTIN order produk tertentu, dikelompokkan reguler bulanan & mingguan. WAJIB pakai ini untuk 'customer yang order stiker dan kertas reguler', 'pelanggan rutin tiap bulan/minggu', 'langganan tetap'. CATATAN: 'stiker'=chromo/vinyl, 'kertas'=art paper/art carton/ivory (itu bahannya di Accurate). Untuk stiker&kertas biarkan keyword default. Kalau produk lain, isi keyword dipisah KOMA.
-- bukti_belum_ada_per_sales: invoice yang BELUM ADA bukti bayarnya di Drive, dikelompokkan PER SALES. WAJIB pakai ini untuk 'bukti bayar yang belum ada per sales', 'invoice belum ada bukti dikelompokkan salesman'. Beda dari cek_bukti_bayar_massal (tidak per sales).
+- bukti_belum_ada_per_sales: invoice yang BELUM ADA bukti bayarnya di Drive, dikelompokkan PER SALES. DEFAULT hanya invoice LUNAS (hanya_lunas=true). WAJIB pakai ini untuk 'sales mana yang customernya sudah lunas tapi belum ada bukti', 'invoice lunas belum ada bukti per sales', 'bukti bayar belum ada per sales'. Kalau user minta semua (termasuk belum lunas), set hanya_lunas=false. Beda dari cek_bukti_bayar_massal (tidak per sales).
 - get_profit_periode: PROFIT/LABA (penjualan − modal HPP) satu periode, rincian PER BULAN dan PER HARI sekaligus. WAJIB pakai ini untuk 'profit per hari', 'profit per bulan', 'laba harian bulanan'. Beda dari get_product_profit (itu per produk, bukan per periode).
 - rekap_bulanan: rekap PENJUALAN + LABA per bulan dalam SATU pesan (tabel tiap bulan + sorotan bulan tertinggi penjualan & laba). WAJIB pakai ini (SATU KALI, rentang penuh) untuk 'penjualan dan laba tertinggi bulan apa', 'bulan mana omset/laba paling tinggi', 'rekap penjualan per bulan'. DILARANG memanggil get_omset_summary berkali-kali per bulan untuk pertanyaan seperti ini — itu boros dan hasilnya berserakan. Cukup rekap_bulanan sekali, mis. date_from=01/01/2026 date_to=30/06/2026.
 - sales_tinggi_rendah_per_bulan: untuk TIAP sales, bulan penjualan TERTINGGI & TERENDAH-nya (mis. 'Febby tertinggi Juni, terendah Mei'). WAJIB pakai ini untuk 'penjualan tiap sales tertinggi berapa terendah berapa', 'bulan tertinggi & terendah masing-masing sales'. Beda dari get_sales_per_salesman (total) dan get_rata_sales_per_bulan (rata-rata).
@@ -1821,7 +1822,7 @@ def handle_with_claude(chat_id, user_text, host):
                 elif tool_name == "get_customer_reguler":
                     result = tool_get_customer_reguler(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("keyword","chromo,vinyl,art paper,art carton,ivory"), tool_input.get("label",""))
                 elif tool_name == "bukti_belum_ada_per_sales":
-                    result = tool_bukti_belum_ada_per_sales(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
+                    result = tool_bukti_belum_ada_per_sales(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""), tool_input.get("hanya_lunas", True))
                 elif tool_name == "get_profit_periode":
                     result = tool_get_profit_periode(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "rekap_bulanan":
@@ -3356,7 +3357,7 @@ def tool_cek_nominal_massal(host, chat_id, date_from, date_to, label=""):
     return json.dumps({"status": "background_started"})
 
 
-def tool_bukti_belum_ada_per_sales(host, chat_id, date_from, date_to, label=""):
+def tool_bukti_belum_ada_per_sales(host, chat_id, date_from, date_to, label="", hanya_lunas=True):
     def run():
         try:
             h = host if host.startswith("http") else f"https://{host}"
@@ -3394,7 +3395,7 @@ def tool_bukti_belum_ada_per_sales(host, chat_id, date_from, date_to, label=""):
             all_inv = []
             page = 1
             while True:
-                params = {"fields": "id,number,totalAmount", "sp.pageSize": 200, "sp.page": page,
+                params = {"fields": "id,number,totalAmount,statusName", "sp.pageSize": 200, "sp.page": page,
                     "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
                 rr = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
                 dd = rr.json()
@@ -3404,16 +3405,26 @@ def tool_bukti_belum_ada_per_sales(host, chat_id, date_from, date_to, label=""):
                 if page >= sp.get("pageCount", 1): break
                 page += 1
 
-            # 3. Cari yang BELUM ada bukti di Drive
+            # 3. Cari yang BELUM ada bukti di Drive. Kalau hanya_lunas, ambil yang status Lunas saja.
             belum = []
+            n_lunas_total = 0
             for inv in all_inv:
                 if not isinstance(inv, dict): continue
+                status = (inv.get("statusName") or "").upper()
+                is_lunas = ("LUNAS" in status or "PAID" in status or "CLOSE" in status)
+                if hanya_lunas and not is_lunas:
+                    continue
+                if is_lunas:
+                    n_lunas_total += 1
                 nomor = (inv.get("number") or "").strip().upper()
                 if nomor and nomor not in nama_file_drive:
                     belum.append({"id": inv.get("id"), "number": inv.get("number")})
 
             if not belum:
-                send_message(chat_id, f"✅ Semua invoice {label or (date_from + ' - ' + date_to)} sudah ada bukti bayarnya di Drive. Tidak ada yang belum.")
+                if hanya_lunas:
+                    send_message(chat_id, f"✅ Semua invoice LUNAS di {label or (date_from + ' - ' + date_to)} sudah ada bukti bayarnya di Drive. Tidak ada yang belum.")
+                else:
+                    send_message(chat_id, f"✅ Semua invoice {label or (date_from + ' - ' + date_to)} sudah ada bukti bayarnya di Drive. Tidak ada yang belum.")
                 return
 
             # 4. Ambil nama sales tiap invoice yang belum ada bukti (dari detail)
@@ -3432,7 +3443,7 @@ def tool_bukti_belum_ada_per_sales(host, chat_id, date_from, date_to, label=""):
                     b["sales"] = "(gagal baca)"
                     b["nilai"] = 0.0
                     return
-                b["sales"] = detail.get("masterSalesmanName") or "Tanpa Sales"
+                b["sales"] = _resolve_sales_name(detail)
                 b["nilai"] = _resolve_nilai_invoice(detail)
             with ThreadPoolExecutor(max_workers=8) as ex:
                 list(ex.map(ambil_sales, belum))
@@ -3444,8 +3455,12 @@ def tool_bukti_belum_ada_per_sales(host, chat_id, date_from, date_to, label=""):
 
             total_nilai = sum(b.get("nilai", 0) for b in belum)
             judul = label or f"{date_from} - {date_to}"
-            msg = f"📌 *Bukti Bayar BELUM ADA per Sales - {judul}*\n"
-            msg += f"Total invoice belum ada bukti: {len(belum)} | Nilai: Rp {total_nilai:,.0f}\n\n"
+            if hanya_lunas:
+                msg = f"📌 *Invoice LUNAS Tapi Belum Ada Bukti - {judul}*\n"
+                msg += f"Invoice lunas belum ada bukti: {len(belum)} dari {n_lunas_total} invoice lunas | Nilai: Rp {total_nilai:,.0f}\n\n"
+            else:
+                msg = f"📌 *Bukti Bayar BELUM ADA per Sales - {judul}*\n"
+                msg += f"Total invoice belum ada bukti: {len(belum)} | Nilai: Rp {total_nilai:,.0f}\n\n"
             # urut sales dari jumlah invoice belum ada bukti terbanyak
             for sales in sorted(per_sales, key=lambda s: len(per_sales[s]), reverse=True):
                 items = per_sales[sales]
@@ -3456,7 +3471,10 @@ def tool_bukti_belum_ada_per_sales(host, chat_id, date_from, date_to, label=""):
                     msg += f"  • {x['number']} | Rp {x.get('nilai',0):,.0f}\n"
                 if len(items) > 40:
                     msg += f"  _...dan {len(items)-40} invoice lagi_\n"
-            msg += "\n_Belum ada bukti = nomor invoice tidak ditemukan sebagai nama file di Google Drive._"
+            if hanya_lunas:
+                msg += "\n_Yang ditampilkan: invoice berstatus LUNAS tapi nomornya tidak ditemukan sebagai nama file bukti di Google Drive. Ini yang perlu ditagih buktinya ke sales._"
+            else:
+                msg += "\n_Belum ada bukti = nomor invoice tidak ditemukan sebagai nama file di Google Drive._"
             send_message(chat_id, msg)
         except Exception as e:
             send_message(chat_id, f"❌ Gagal cek bukti belum ada per sales: {str(e)[:150]}")
