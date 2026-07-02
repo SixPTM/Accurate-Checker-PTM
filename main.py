@@ -1307,7 +1307,7 @@ def tool_get_sales_per_salesman(host, chat_id, date_from, date_to, label=""):
 
             # 2. Akumulasi: nilai dari list (SELALU masuk), nama dari peta id_sales
             for inv in valid:
-                nilai = float(inv.get("totalAmount") or inv.get("subTotal") or 0)
+                nilai = float(inv.get("totalAmount") or inv.get("salesAmount") or inv.get("subTotal") or 0)
                 nama = id_sales.get(inv.get("id")) or "Tanpa Sales"
                 catat(nama, nilai)
 
@@ -2349,7 +2349,7 @@ def tool_get_rata_sales_per_bulan(host, chat_id, date_from, date_to, label=""):
                     list(ex.map(baca_sales, ulang))
 
             for inv in valid:
-                nilai = float(inv.get("totalAmount") or inv.get("subTotal") or 0)
+                nilai = float(inv.get("totalAmount") or inv.get("salesAmount") or inv.get("subTotal") or 0)
                 nama = id_sales.get(inv.get("id")) or "Tanpa Sales"
                 catat(nama, nilai)
 
@@ -2456,7 +2456,7 @@ def tool_sales_tinggi_rendah_per_bulan(host, chat_id, date_from, date_to, label=
 
             for inv in valid:
                 tgl = parse_tgl(inv.get("transDate"))
-                nilai = float(inv.get("totalAmount") or inv.get("subTotal") or 0)
+                nilai = float(inv.get("totalAmount") or inv.get("salesAmount") or inv.get("subTotal") or 0)
                 nama = id_sales.get(inv.get("id")) or "Tanpa Sales"
                 catat(nama, tgl, nilai)
 
@@ -3762,6 +3762,61 @@ def debug_nosales():
             "jumlah_gagal_baca_detail": len(error_baca),
             "daftar_nomor_tanpa_sales": sorted(no_sales),
             "daftar_nomor_gagal_baca": sorted(error_baca)
+        }
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+
+@app.route("/debug-total-jan", methods=["GET"])
+def debug_total_jan():
+    """Bandingkan total nilai Januari 2026 dengan beberapa cara ambil nilai,
+    untuk cari tahu kenapa total tool sales beda dari total omset."""
+    try:
+        host = get_host()
+        if not host: return {"error": "Gagal dapat host"}, 500
+        h = host if host.startswith("http") else f"https://{host}"
+        all_inv = []
+        page = 1
+        while True:
+            params = {"fields": "id,number,totalAmount,salesAmount,subTotal", "sp.pageSize": 200, "sp.page": page,
+                "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": "01/01/2026", "filter.transDate.val[1]": "31/01/2026"}
+            r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+            data = r.json()
+            if not data.get("s"): break
+            all_inv.extend(data.get("d", []))
+            sp = data.get("sp", {})
+            if page >= sp.get("pageCount", 1): break
+            page += 1
+
+        jumlah = len(all_inv)
+        total_totalAmount = 0.0
+        total_subTotal = 0.0
+        total_salesAmount = 0.0
+        n_totalAmount_kosong = 0
+        n_semua_kosong = 0
+        contoh_kosong = []
+        for inv in all_inv:
+            if not isinstance(inv, dict): continue
+            ta = float(inv.get("totalAmount") or 0)
+            st = float(inv.get("subTotal") or 0)
+            sa = float(inv.get("salesAmount") or 0)
+            total_totalAmount += ta
+            total_subTotal += st
+            total_salesAmount += sa
+            if ta == 0:
+                n_totalAmount_kosong += 1
+            if ta == 0 and st == 0 and sa == 0:
+                n_semua_kosong += 1
+                if len(contoh_kosong) < 5:
+                    contoh_kosong.append(inv.get("number"))
+        return {
+            "jumlah_invoice": jumlah,
+            "SUM_totalAmount": total_totalAmount,
+            "SUM_subTotal": total_subTotal,
+            "SUM_salesAmount": total_salesAmount,
+            "invoice_totalAmount_0": n_totalAmount_kosong,
+            "invoice_semua_nilai_0": n_semua_kosong,
+            "contoh_invoice_semua_0": contoh_kosong
         }
     except Exception as e:
         return {"error": str(e)}, 500
