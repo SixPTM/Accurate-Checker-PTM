@@ -1274,38 +1274,11 @@ def tool_get_sales_per_salesman(host, chat_id, date_from, date_to, label=""):
             # Jadi: nilai diambil dari list (dijamin lengkap), nama sales diambil dari
             # detail tiap invoice. Nilai TIDAK PERNAH hilang walau detail gagal dibaca.
 
-            # 1. Petakan id invoice -> nama sales (dari detail). Proses ulang yang gagal.
-            id_sales = {}     # invoice_id -> nama sales
-            gagal_baca = []
-            sales_lock = threading.Lock()
-
-            def baca_sales(inv):
-                iid = inv.get("id")
-                detail = None
-                for attempt in range(4):
-                    try:
-                        r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": iid}, timeout=20)
-                        d = r2.json()
-                        if d.get("s") and d.get("d"):
-                            detail = d["d"]; break
-                    except Exception: pass
-                    import time as _t; _t.sleep(0.4 * (attempt + 1))
-                if detail is None:
-                    with sales_lock: gagal_baca.append(inv)
-                    return
-                with sales_lock:
-                    id_sales[iid] = _resolve_sales_name(detail)
-
+            # 1. Baca nama sales dari detail dengan beban RINGAN (hemat koneksi).
             valid = [inv for inv in all_invoices if isinstance(inv, dict) and inv.get("id") is not None]
-            with ThreadPoolExecutor(max_workers=6) as ex:
-                list(ex.map(baca_sales, valid))
-            # proses ulang yang gagal (satu putaran lagi, worker lebih sedikit)
-            if gagal_baca:
-                ulang = list(gagal_baca); gagal_baca.clear()
-                with ThreadPoolExecutor(max_workers=3) as ex:
-                    list(ex.map(baca_sales, ulang))
+            id_sales = _baca_nama_sales_massal(h, valid, max_workers=3)
 
-            # 2. Akumulasi: nilai dari list (SELALU masuk), nama dari peta id_sales
+            # 2. Akumulasi: nilai dari list (SELALU masuk, akurat), nama dari peta id_sales
             for inv in valid:
                 nilai = float(inv.get("totalAmount") or inv.get("salesAmount") or inv.get("subTotal") or 0)
                 nama = id_sales.get(inv.get("id")) or "Tanpa Sales"
@@ -2188,6 +2161,49 @@ def _is_marketplace(nama):
     return any(kw in n for kw in _CHANNEL_MARKETPLACE)
 
 
+def _baca_nama_sales_massal(h, invoices, max_workers=3):
+    """Baca nama sales dari detail untuk banyak invoice, dengan beban RINGAN supaya
+    Accurate tidak memutus koneksi (connection reset/timeout). Worker sedikit + jeda.
+    Nilai TIDAK diambil di sini (nilai dari list saja). Kembalikan dict {id: nama}.
+    Yang gagal dibaca tidak masuk dict (nanti dianggap 'Tanpa Sales' oleh pemanggil)."""
+    import time as _t
+    id_sales = {}
+    lock = threading.Lock()
+    gagal = []
+
+    def baca(inv):
+        iid = inv.get("id")
+        if iid is None:
+            return
+        detail = None
+        for attempt in range(3):
+            try:
+                r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do",
+                    headers=accurate_headers(), params={"id": iid}, timeout=25)
+                d = r2.json()
+                if d.get("s") and d.get("d"):
+                    detail = d["d"]; break
+            except Exception:
+                pass
+            _t.sleep(0.6 * (attempt + 1))  # jeda naik tiap gagal
+        if detail is None:
+            with lock: gagal.append(inv)
+            return
+        with lock:
+            id_sales[iid] = _resolve_sales_name(detail)
+        _t.sleep(0.05)  # jeda kecil tiap sukses agar tidak membanjiri server
+
+    valid = [inv for inv in invoices if isinstance(inv, dict) and inv.get("id") is not None]
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        list(ex.map(baca, valid))
+    # satu putaran ulang untuk yang gagal, worker lebih kecil lagi
+    if gagal:
+        ulang = list(gagal); gagal.clear()
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            list(ex.map(baca, ulang))
+    return id_sales
+
+
 def _get_peta_salesman(h):
     """Ambil peta masterSalesmanId -> nama dari master salesman Accurate.
     Dipakai untuk menerjemahkan ID sales (yang ada di list) menjadi nama tanpa
@@ -2317,36 +2333,9 @@ def tool_get_rata_sales_per_bulan(host, chat_id, date_from, date_to, label=""):
                     sales_data[sales_name]["count"] += 1
                     sales_data[sales_name]["total"] += nilai
 
-            # Endpoint LIST tidak mengirim nama sales. Nilai dari list (lengkap),
-            # nama sales dari detail. Nilai tidak pernah hilang walau detail gagal.
-            id_sales = {}
-            gagal_baca = []
-            sales_lock = threading.Lock()
-
-            def baca_sales(inv):
-                iid = inv.get("id")
-                detail = None
-                for attempt in range(4):
-                    try:
-                        r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": iid}, timeout=20)
-                        d = r2.json()
-                        if d.get("s") and d.get("d"):
-                            detail = d["d"]; break
-                    except Exception: pass
-                    import time as _t; _t.sleep(0.4 * (attempt + 1))
-                if detail is None:
-                    with sales_lock: gagal_baca.append(inv)
-                    return
-                with sales_lock:
-                    id_sales[iid] = _resolve_sales_name(detail)
-
+            # Nilai dari list (lengkap & akurat); nama sales dari detail dengan beban RINGAN.
             valid = [inv for inv in all_invoices if isinstance(inv, dict) and inv.get("id") is not None]
-            with ThreadPoolExecutor(max_workers=6) as ex:
-                list(ex.map(baca_sales, valid))
-            if gagal_baca:
-                ulang = list(gagal_baca); gagal_baca.clear()
-                with ThreadPoolExecutor(max_workers=3) as ex:
-                    list(ex.map(baca_sales, ulang))
+            id_sales = _baca_nama_sales_massal(h, valid, max_workers=3)
 
             for inv in valid:
                 nilai = float(inv.get("totalAmount") or inv.get("salesAmount") or inv.get("subTotal") or 0)
@@ -2423,36 +2412,9 @@ def tool_sales_tinggi_rendah_per_bulan(host, chat_id, date_from, date_to, label=
                     if sales_name not in sales_bulan: sales_bulan[sales_name] = {}
                     sales_bulan[sales_name][bulan_key] = sales_bulan[sales_name].get(bulan_key, 0.0) + nilai
 
-            # Endpoint LIST tidak mengirim nama sales. Nilai & tanggal dari list (lengkap),
-            # nama sales dari detail. Nilai tidak pernah hilang walau detail gagal.
-            id_sales = {}
-            gagal_baca = []
-            sales_lock = threading.Lock()
-
-            def baca_sales(inv):
-                iid = inv.get("id")
-                detail = None
-                for attempt in range(4):
-                    try:
-                        r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(), params={"id": iid}, timeout=20)
-                        d = r2.json()
-                        if d.get("s") and d.get("d"):
-                            detail = d["d"]; break
-                    except Exception: pass
-                    import time as _t; _t.sleep(0.4 * (attempt + 1))
-                if detail is None:
-                    with sales_lock: gagal_baca.append(inv)
-                    return
-                with sales_lock:
-                    id_sales[iid] = _resolve_sales_name(detail)
-
+            # Nilai & tanggal dari list (lengkap); nama sales dari detail beban RINGAN.
             valid = [inv for inv in all_inv if isinstance(inv, dict) and inv.get("id") is not None]
-            with ThreadPoolExecutor(max_workers=6) as ex:
-                list(ex.map(baca_sales, valid))
-            if gagal_baca:
-                ulang = list(gagal_baca); gagal_baca.clear()
-                with ThreadPoolExecutor(max_workers=3) as ex:
-                    list(ex.map(baca_sales, ulang))
+            id_sales = _baca_nama_sales_massal(h, valid, max_workers=3)
 
             for inv in valid:
                 tgl = parse_tgl(inv.get("transDate"))
