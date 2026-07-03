@@ -1681,6 +1681,20 @@ TOOLS = [
         }
     },
     {
+        "name": "customer_rutin_bulanan",
+        "description": "Cari CUSTOMER yang order RUTIN hampir tiap bulan (produk apa saja, bukan cuma stiker/kertas). Default kriteria: order di minimal ~5 dari 6 bulan. Menampilkan tiap customer rutin + di bulan mana saja mereka order + jumlah order. WAJIB pakai tool ini untuk 'customer yang order rutin', 'pelanggan rutin tiap bulan', 'siapa langganan tetap seperti Diri Care, Rico'. Marketplace (Shopee/Tokopedia) otomatis dilewati. Beda dari get_customer_reguler (itu khusus produk stiker/kertas). Kalau user minta kriteria lebih longgar/ketat, isi min_bulan. Background beberapa menit, hasil ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD/MM/YYYY"},
+                "date_to": {"type": "string", "description": "DD/MM/YYYY"},
+                "label": {"type": "string", "description": "Label periode, contoh 'Jan-Jun 2026'"},
+                "min_bulan": {"type": "integer", "description": "Opsional. Minimal jumlah bulan berbeda customer harus order agar dianggap rutin. Kosongkan untuk default (~5 dari 6 bulan)."}
+            },
+            "required": ["date_from", "date_to"]
+        }
+    },
+    {
         "name": "cek_bukti_bayar",
         "description": "Cek bukti bayar/pembayaran sebuah invoice dari Google Drive: cari file bukti (dinamai sesuai nomor invoice), baca nominal di foto, bandingkan dengan nilai invoice di Accurate. Untuk 'cek bukti bayar invoice X', 'apakah invoice X sudah ada bukti bayarnya', 'cocokkan pembayaran invoice X'. Background, hasil dikirim ke Telegram.",
         "input_schema": {
@@ -1729,6 +1743,7 @@ Tools background (hasilnya dikirim otomatis ke Telegram setelah selesai, beri ta
 - get_customer_terbanyak: rekap CUSTOMER dengan order terbanyak di satu periode (berapa kali order + total belanja), terurut dari terbanyak. WAJIB pakai ini untuk 'customer order terbanyak', 'pelanggan paling sering pesan', 'customer belanja terbesar', 'customer paling aktif'. Default urut_by='order' (jumlah order); pakai urut_by='nilai' kalau user minta yang nilai/belanjanya terbesar. Untuk '6 bulan terakhir' hitung date_from = tanggal 6 bulan lalu, date_to = hari ini.
 - get_rata_sales_per_bulan: RATA-RATA penjualan tiap sales PER BULAN (total sales dibagi jumlah bulan periode). WAJIB pakai ini untuk 'rata-rata penjualan tiap sales per bulan', 'penjualan masing-masing sales rata per bulan berapa'. JANGAN pakai get_sales_per_salesman (itu cuma total).
 - get_customer_reguler: customer yang RUTIN order produk tertentu, dikelompokkan reguler bulanan & mingguan. WAJIB pakai ini untuk 'customer yang order stiker dan kertas reguler', 'pelanggan rutin tiap bulan/minggu', 'langganan tetap'. CATATAN: 'stiker'=chromo/vinyl, 'kertas'=art paper/art carton/ivory (itu bahannya di Accurate). Untuk stiker&kertas biarkan keyword default. Kalau produk lain, isi keyword dipisah KOMA.
+- customer_rutin_bulanan: customer yang order RUTIN hampir tiap bulan (produk APA SAJA, bukan cuma stiker/kertas), default ≥5 dari 6 bulan. WAJIB pakai ini untuk 'customer yang order rutin', 'pelanggan rutin tiap bulan seperti Diri Care/Rico', 'langganan tetap' TANPA sebut produk tertentu. Marketplace dilewati. Beda dari get_customer_reguler (itu khusus produk stiker/kertas).
 - bukti_belum_ada_per_sales: invoice yang BELUM ADA bukti bayarnya di Drive, dikelompokkan PER SALES. DEFAULT hanya invoice LUNAS (hanya_lunas=true). WAJIB pakai ini untuk 'sales mana yang customernya sudah lunas tapi belum ada bukti', 'invoice lunas belum ada bukti per sales', 'bukti bayar belum ada per sales'. Kalau user minta semua (termasuk belum lunas), set hanya_lunas=false. Beda dari cek_bukti_bayar_massal (tidak per sales).
 - get_profit_periode: PROFIT/LABA (penjualan − modal HPP) satu periode, rincian PER BULAN dan PER HARI sekaligus. WAJIB pakai ini untuk 'profit per hari', 'profit per bulan', 'laba harian bulanan'. Beda dari get_product_profit (itu per produk, bukan per periode).
 - rekap_bulanan: rekap PENJUALAN + LABA per bulan dalam SATU pesan (tabel tiap bulan + sorotan bulan tertinggi penjualan & laba). WAJIB pakai ini (SATU KALI, rentang penuh) untuk 'penjualan dan laba tertinggi bulan apa', 'bulan mana omset/laba paling tinggi', 'rekap penjualan per bulan'. DILARANG memanggil get_omset_summary berkali-kali per bulan untuk pertanyaan seperti ini — itu boros dan hasilnya berserakan. Cukup rekap_bulanan sekali, mis. date_from=01/01/2026 date_to=30/06/2026.
@@ -1836,6 +1851,8 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_get_rata_sales_per_bulan(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "get_customer_reguler":
                     result = tool_get_customer_reguler(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("keyword","chromo,vinyl,art paper,art carton,ivory"), tool_input.get("label",""))
+                elif tool_name == "customer_rutin_bulanan":
+                    result = tool_customer_rutin_bulanan(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""), tool_input.get("min_bulan"))
                 elif tool_name == "bukti_belum_ada_per_sales":
                     result = tool_bukti_belum_ada_per_sales(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""), tool_input.get("hanya_lunas", True))
                 elif tool_name == "get_profit_periode":
@@ -2567,6 +2584,145 @@ def tool_penjualan_sales_per_bulan(host, chat_id, date_from, date_to, label="", 
         except Exception as e:
             send_message(chat_id, f"❌ Gagal rincian bulanan per sales: {str(e)[:120]}")
             print(f"[SALES PER BULAN ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
+
+
+def _baca_nama_customer_massal(h, invoices, max_workers=3):
+    """Baca nama customer dari detail untuk invoice yang namanya kosong di list.
+    Beban ringan (worker sedikit + jeda) agar Accurate tidak memutus koneksi.
+    Kembalikan dict {id: nama_customer}."""
+    import time as _t
+    id_cust = {}
+    lock = threading.Lock()
+    gagal = []
+
+    def baca(inv):
+        iid = inv.get("id")
+        if iid is None: return
+        detail = None
+        for attempt in range(3):
+            try:
+                r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do",
+                    headers=accurate_headers(), params={"id": iid}, timeout=25)
+                d = r2.json()
+                if d.get("s") and d.get("d"):
+                    detail = d["d"]; break
+            except Exception: pass
+            _t.sleep(0.6 * (attempt + 1))
+        if detail is None:
+            with lock: gagal.append(inv)
+            return
+        customer = detail.get("customer")
+        if isinstance(customer, dict): cname = customer.get("name")
+        elif isinstance(customer, list) and customer: cname = customer[0].get("name") if isinstance(customer[0], dict) else None
+        else: cname = None
+        nama = detail.get("retailWpName") or detail.get("customerName") or cname or "Tanpa Nama"
+        with lock:
+            id_cust[iid] = nama
+        _t.sleep(0.05)
+
+    valid = [inv for inv in invoices if isinstance(inv, dict) and inv.get("id") is not None]
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        list(ex.map(baca, valid))
+    if gagal:
+        ulang = list(gagal); gagal.clear()
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            list(ex.map(baca, ulang))
+    return id_cust
+
+
+def tool_customer_rutin_bulanan(host, chat_id, date_from, date_to, label="", min_bulan=None):
+    def run():
+        try:
+            h = host if host.startswith("http") else f"https://{host}"
+            from datetime import datetime
+            # Ambil semua invoice + tanggal + nama customer dari list
+            all_inv = []
+            page = 1
+            while True:
+                params = {"fields": "id,number,transDate,retailWpName", "sp.pageSize": 200, "sp.page": page,
+                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
+                r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+                data = r.json()
+                if not data.get("s"): break
+                all_inv.extend(data.get("d", []))
+                sp = data.get("sp", {})
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+
+            def parse_tgl(s):
+                for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                    try: return datetime.strptime((s or "").split(" ")[0], fmt)
+                    except: pass
+                return None
+
+            valid = [inv for inv in all_inv if isinstance(inv, dict) and inv.get("id") is not None]
+
+            # Nama customer: pakai retailWpName dari list; yang kosong baru baca detail
+            perlu_detail = [inv for inv in valid if not (inv.get("retailWpName") and str(inv.get("retailWpName")).strip())]
+            id_cust_extra = {}
+            if perlu_detail:
+                id_cust_extra = _baca_nama_customer_massal(h, perlu_detail, max_workers=3)
+
+            # Kumpulkan: customer -> { set bulan, jumlah order, total nilai(dari list bila ada) }
+            cust_bulan = {}   # nama -> set(bulan)
+            cust_order = {}   # nama -> jumlah invoice
+            for inv in valid:
+                tgl = parse_tgl(inv.get("transDate"))
+                if tgl is None: continue
+                nama = inv.get("retailWpName")
+                if not (nama and str(nama).strip()):
+                    nama = id_cust_extra.get(inv.get("id")) or "Tanpa Nama"
+                bulan_key = tgl.strftime("%Y-%m")
+                cust_bulan.setdefault(nama, set()).add(bulan_key)
+                cust_order[nama] = cust_order.get(nama, 0) + 1
+
+            if not cust_bulan:
+                send_message(chat_id, f"❌ Tidak ada data order untuk {label or (date_from + ' - ' + date_to)}.")
+                return
+
+            jml_bulan = _hitung_jumlah_bulan(date_from, date_to)
+            # ambang default: minimal 5 dari 6 bulan (>=83%), skala ke periode lain
+            if min_bulan is None:
+                ambang = max(2, round(jml_bulan * 5 / 6)) if jml_bulan >= 3 else jml_bulan
+            else:
+                ambang = int(min_bulan)
+
+            # Customer rutin = muncul di >= ambang bulan berbeda
+            rutin = []
+            for nama, bset in cust_bulan.items():
+                if nama == "Tanpa Nama": continue
+                if _is_marketplace(nama): continue  # lewati channel marketplace
+                if len(bset) >= ambang:
+                    rutin.append((nama, len(bset), cust_order.get(nama, 0)))
+
+            rutin.sort(key=lambda x: (x[1], x[2]), reverse=True)
+
+            _NAMA_BLN = {"01":"Jan","02":"Feb","03":"Mar","04":"Apr","05":"Mei","06":"Jun",
+                         "07":"Jul","08":"Agu","09":"Sep","10":"Okt","11":"Nov","12":"Des"}
+            judul = label or f"{date_from} - {date_to}"
+            msg = f"🔁 *Customer Rutin Order Bulanan - {judul}*\n"
+            msg += f"Kriteria: order di ≥{ambang} dari {jml_bulan} bulan\n"
+            msg += f"Total customer memenuhi: {len(rutin)}\n\n"
+            if not rutin:
+                msg += "_Tidak ada customer yang memenuhi kriteria rutin. Coba longgarkan (mis. minimal 4 bulan)._"
+            else:
+                for i, (nama, n_bln, n_order) in enumerate(rutin[:40], 1):
+                    # tampilkan bulan mana saja customer ini order
+                    blns = sorted(cust_bulan[nama])
+                    bln_txt = ", ".join(_NAMA_BLN.get(b.split("-")[1], b) for b in blns)
+                    msg += f"{i}. *{nama}* — {n_bln}/{jml_bulan} bln | {n_order} order\n   ({bln_txt})\n"
+                if len(rutin) > 40:
+                    msg += f"\n_...dan {len(rutin)-40} customer lainnya_"
+            msg += "\n\n_Rutin = customer yang ordernya muncul di hampir tiap bulan. Marketplace (Shopee/Tokopedia) dilewati._"
+            send_message(chat_id, msg)
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal cek customer rutin: {str(e)[:120]}")
+            print(f"[CUST RUTIN ERROR] {e}")
 
     t = threading.Thread(target=run)
     t.daemon = True
