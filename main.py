@@ -4007,6 +4007,54 @@ def debug_nosales():
         return {"error": str(e)}, 500
 
 
+@app.route("/debug-metode-bayar", methods=["GET"])
+def debug_metode_bayar():
+    """Cek apakah metode pembayaran (tunai/transfer) sebuah invoice lunas bisa dibaca API.
+    Menampilkan field pembayaran di detail invoice + coba baca sales-receipt terkait."""
+    try:
+        host = get_host()
+        if not host: return {"error": "Gagal dapat host"}, 500
+        h = host if host.startswith("http") else f"https://{host}"
+        # Ambil 3 invoice LUNAS Juli 2026
+        r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(),
+            params={"fields": "id,number,statusName", "sp.pageSize": 30, "sp.page": 1,
+                "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": "01/07/2026", "filter.transDate.val[1]": "31/07/2026"}, timeout=15)
+        lst = r.json().get("d", [])
+        lunas = [x for x in lst if isinstance(x, dict) and "LUNAS" in (x.get("statusName") or "").upper()][:3]
+        hasil = []
+        for inv in lunas:
+            r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(),
+                params={"id": inv["id"]}, timeout=15)
+            det = r2.json().get("d", {})
+            if not isinstance(det, dict): continue
+            # field yang mungkin berkaitan dengan metode/penerimaan bayar
+            kandidat = {}
+            for k, v in det.items():
+                kl = k.lower()
+                if any(t in kl for t in ["payment", "receipt", "bank", "cash", "tunai", "bayar", "transfer", "epayment", "paid"]):
+                    if isinstance(v, (dict, list)):
+                        kandidat[k] = str(v)[:250]
+                    else:
+                        kandidat[k] = v
+            # coba ambil sales-receipt yang terkait invoice ini
+            receipt_info = None
+            try:
+                rr = requests.get(f"{h}/accurate/api/sales-receipt/list.do", headers=accurate_headers(),
+                    params={"fields": "id,number,bankName,paymentMethod,chequeAmount", "sp.pageSize": 5,
+                            "filter.keywords": inv.get("number")}, timeout=15)
+                receipt_info = rr.json().get("d", [])
+            except Exception as e:
+                receipt_info = f"gagal: {str(e)[:100]}"
+            hasil.append({
+                "number": inv.get("number"),
+                "field_terkait_bayar": kandidat,
+                "sales_receipt_terkait": receipt_info
+            })
+        return {"hasil": hasil}
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+
 @app.route("/debug-total-jan", methods=["GET"])
 def debug_total_jan():
     """Bandingkan total nilai Januari 2026 dengan beberapa cara ambil nilai,
