@@ -4007,6 +4007,58 @@ def debug_nosales():
         return {"error": str(e)}, 500
 
 
+@app.route("/debug-coba-cepat", methods=["GET"])
+def debug_coba_cepat():
+    """Uji beberapa cara agar nama sales ikut di LIST invoice (tanpa buka detail),
+    supaya rekap sales bisa cepat. Coba variasi nama field & parameter."""
+    try:
+        host = get_host()
+        if not host: return {"error": "Gagal dapat host"}, 500
+        h = host if host.startswith("http") else f"https://{host}"
+        base_filter = {
+            "sp.pageSize": 3, "sp.page": 1,
+            "filter.transDate.op": "BETWEEN",
+            "filter.transDate.val[0]": "01/07/2026", "filter.transDate.val[1]": "31/07/2026"
+        }
+        percobaan = {}
+
+        # 1. Minta field salesman versi objek/relasi (beberapa API Accurate pakai nama ini)
+        variasi_fields = [
+            "id,number,salesmanName",
+            "id,number,salesman",
+            "id,number,salesmanId",
+            "id,number,detailSalesman",
+            "id,number,salesmanList",
+            "id,number,employee",
+            "id,number,employeeName",
+        ]
+        for fld in variasi_fields:
+            try:
+                r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(),
+                    params={**base_filter, "fields": fld}, timeout=15)
+                d = r.json()
+                rows = d.get("d", [])
+                contoh = rows[0] if rows and isinstance(rows[0], dict) else {}
+                percobaan[fld] = {"berhasil": d.get("s"), "field_kembali": sorted(list(contoh.keys())), "contoh": contoh}
+            except Exception as e:
+                percobaan[fld] = {"error": str(e)[:100]}
+
+        # 2. Coba endpoint list TANPA batasi fields (mungkin default kirim lebih lengkap)
+        try:
+            r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(),
+                params=base_filter, timeout=15)
+            d = r.json()
+            rows = d.get("d", [])
+            contoh = rows[0] if rows and isinstance(rows[0], dict) else {}
+            percobaan["TANPA_fields"] = {"berhasil": d.get("s"), "field_kembali": sorted(list(contoh.keys())), "contoh": contoh}
+        except Exception as e:
+            percobaan["TANPA_fields"] = {"error": str(e)[:100]}
+
+        return {"percobaan": percobaan}
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+
 @app.route("/debug-metode-bayar", methods=["GET"])
 def debug_metode_bayar():
     """Cek apakah metode pembayaran (tunai/transfer) sebuah invoice lunas bisa dibaca API.
