@@ -3727,10 +3727,8 @@ def tool_bukti_belum_ada_per_sales(host, chat_id, date_from, date_to, label="", 
                 subtotal = sum(x.get("nilai", 0) for x in items)
                 msg += f"━━━━━━━━━━\n👤 *{sales}* — {len(items)} invoice | Rp {subtotal:,.0f}\n"
                 # urut invoice dari nilai terbesar
-                for x in sorted(items, key=lambda i: i.get("nilai", 0), reverse=True)[:40]:
+                for x in sorted(items, key=lambda i: i.get("nilai", 0), reverse=True):
                     msg += f"  • {x['number']} | Rp {x.get('nilai',0):,.0f}\n"
-                if len(items) > 40:
-                    msg += f"  _...dan {len(items)-40} invoice lagi_\n"
             if hanya_lunas:
                 msg += "\n_Yang ditampilkan: invoice berstatus LUNAS tapi nomornya tidak ditemukan sebagai nama file bukti di Google Drive. Ini yang perlu ditagih buktinya ke sales._"
             else:
