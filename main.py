@@ -3705,6 +3705,7 @@ def tool_bukti_belum_ada_per_sales(host, chat_id, date_from, date_to, label="", 
                     return
                 b["sales"] = _resolve_sales_name(detail)
                 b["nilai"] = _resolve_nilai_invoice(detail)
+                b["cust"] = detail.get("retailWpName") or detail.get("customerName") or "Tanpa Nama"
             with ThreadPoolExecutor(max_workers=8) as ex:
                 list(ex.map(ambil_sales, belum))
 
@@ -3728,7 +3729,7 @@ def tool_bukti_belum_ada_per_sales(host, chat_id, date_from, date_to, label="", 
                 msg += f"━━━━━━━━━━\n👤 *{sales}* — {len(items)} invoice | Rp {subtotal:,.0f}\n"
                 # urut invoice dari nilai terbesar
                 for x in sorted(items, key=lambda i: i.get("nilai", 0), reverse=True):
-                    msg += f"  • {x['number']} | Rp {x.get('nilai',0):,.0f}\n"
+                  msg += f"  • {x['number']} | {x.get('cust','-')} | Rp {x.get('nilai',0):,.0f}\n"
             if hanya_lunas:
                 msg += "\n_Yang ditampilkan: invoice berstatus LUNAS tapi nomornya tidak ditemukan sebagai nama file bukti di Google Drive. Ini yang perlu ditagih buktinya ke sales._"
             else:
