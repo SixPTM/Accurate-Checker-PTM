@@ -3843,12 +3843,13 @@ def tool_hitung_lunas_metode(host, chat_id, date_from, date_to, label=""):
                     return "transfer"
                 return None
 
-            def klasifikasi_metode(iid):
+            def klasifikasi_metode(item):
+                iid = item["id"]
                 detail = None
-                for attempt in range(3):
+                for attempt in range(5):
                     try:
                         rr = requests.get(f"{h}/accurate/api/sales-invoice/detail.do",
-                            headers=accurate_headers(), params={"id": iid}, timeout=25)
+                            headers=accurate_headers(), params={"id": iid}, timeout=30)
                         dj = rr.json()
                         if dj.get("s") and dj.get("d"):
                             detail = dj["d"]; break
@@ -3856,7 +3857,16 @@ def tool_hitung_lunas_metode(host, chat_id, date_from, date_to, label=""):
                         pass
                     _t.sleep(0.6 * (attempt + 1))
                 if detail is None:
+                    item["gagal_baca"] = True
                     return "tidak_diketahui"
+
+                # simpan customer & sales dari detail yang sama (tanpa call tambahan)
+                cust = detail.get("customer")
+                cname = None
+                if isinstance(cust, dict): cname = cust.get("name")
+                elif isinstance(cust, list) and cust and isinstance(cust[0], dict): cname = cust[0].get("name")
+                item["customer"] = detail.get("retailWpName") or detail.get("customerName") or cname or "Tanpa Nama"
+                item["sales"] = _resolve_sales_name(detail)
 
                 histori = _parse_receipt_history(detail.get("receiptHistory"))
 
@@ -3883,22 +3893,32 @@ def tool_hitung_lunas_metode(host, chat_id, date_from, date_to, label=""):
                 return "campuran"
 
             def proses(item):
-                item["metode"] = klasifikasi_metode(item["id"])
+                item["metode"] = klasifikasi_metode(item)
                 _t.sleep(0.05)
 
             gagal_retry = []
             def proses_safe(item):
                 try:
                     proses(item)
+                    if item.get("metode") == "tidak_diketahui" and item.get("gagal_baca"):
+                        with lock: gagal_retry.append(item)
                 except Exception:
                     with lock: gagal_retry.append(item)
 
             with ThreadPoolExecutor(max_workers=3) as ex:
                 list(ex.map(proses_safe, lunas))
+            # putaran ke-2 untuk yang gagal baca detail, 2 worker
             if gagal_retry:
                 ulang = list(gagal_retry); gagal_retry.clear()
+                for it in ulang: it.pop("gagal_baca", None)
                 with ThreadPoolExecutor(max_workers=2) as ex:
                     list(ex.map(proses_safe, ulang))
+            # putaran ke-3 (terakhir) untuk yang MASIH gagal, 1 worker berurutan
+            if gagal_retry:
+                ulang = list(gagal_retry); gagal_retry.clear()
+                for it in ulang:
+                    it.pop("gagal_baca", None)
+                    proses(it)
 
             # 4. Rekap per metode
             grup = {"tunai": [], "transfer": [], "campuran": [], "tidak_diketahui": []}
@@ -3923,10 +3943,38 @@ def tool_hitung_lunas_metode(host, chat_id, date_from, date_to, label=""):
             if n_cmp: msg += s_cmp
             if n_tt: msg += s_tt
             if n_tt:
-                msg += "\n_'Tidak diketahui' = detail/receiptHistory invoice gagal dibaca. Kalau jumlahnya banyak, coba ulang atau buka /debug-metode-bayar._"
+                msg += "\n_'Tidak diketahui' = detail/receiptHistory invoice gagal dibaca / metode di luar Tunai & Transfer. Lihat daftar di bawah._"
             else:
                 msg += "\n_Metode dibaca dari receiptHistory (historyPaymentName) tiap invoice._"
             send_message(chat_id, msg)
+
+            # Kirim daftar rinci secara bertahap (hindari batas panjang Telegram)
+            def kirim_daftar(judul_blok, items, with_sales):
+                if not items:
+                    return
+                items_sorted = sorted(items, key=lambda x: x.get("nilai", 0), reverse=True)
+                baris = [judul_blok]
+                for it in items_sorted:
+                    cust = it.get("customer", "?")
+                    line = f"• {it.get('number','?')} | {cust} | Rp {it.get('nilai',0):,.0f}"
+                    if with_sales:
+                        line += f" | sales: {it.get('sales','?')}"
+                    baris.append(line)
+                # potong per ~40 baris supaya muat
+                blok_kirim = []
+                for b in baris:
+                    blok_kirim.append(b)
+                    if len(blok_kirim) >= 41:
+                        send_message(chat_id, "\n".join(blok_kirim))
+                        blok_kirim = [judul_blok + " (lanjutan)"]
+                if len(blok_kirim) > 1:
+                    send_message(chat_id, "\n".join(blok_kirim))
+
+            kirim_daftar(f"💵 *Daftar Tunai/Cash ({n_tunai} invoice)*", grup["tunai"], with_sales=True)
+            if n_cmp:
+                kirim_daftar(f"🔀 *Daftar Campuran ({n_cmp} invoice)*", grup["campuran"], with_sales=True)
+            if n_tt:
+                kirim_daftar(f"❓ *Daftar Tidak Diketahui ({n_tt} invoice)*", grup["tidak_diketahui"], with_sales=True)
         except Exception as e:
             send_message(chat_id, f"❌ Gagal hitung lunas per metode: {str(e)[:150]}")
             print(f"[LUNAS METODE ERROR] {e}")
