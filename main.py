@@ -3763,9 +3763,12 @@ def tool_bukti_belum_ada_per_sales(host, chat_id, date_from, date_to, label="", 
 
 def tool_hitung_lunas_metode(host, chat_id, date_from, date_to, label=""):
     """Hitung invoice LUNAS satu periode, dipisah metode bayar Tunai/Cash vs Transfer.
-    Metode dibaca dari sales-receipt (penerimaan penjualan) tiap invoice: field
-    paymentMethod + bankName. Kalau mengandung tunai/cash/kas -> Tunai, selain itu
-    (ada bank) -> Transfer. Invoice tanpa receipt yang terbaca masuk 'tidak diketahui'."""
+    Metode dibaca dari DETAIL invoice, field receiptHistory -> historyPaymentName.
+    Nilainya: 'Tunai' -> Tunai, 'Transfer Bank' -> Transfer. receiptHistory di Accurate
+    PTM berbentuk STRING gaya Python (kutip tunggal, True/False/None) sehingga di-parse
+    pakai ast.literal_eval, bukan json.loads. Invoice tanpa histori terbaca masuk
+    'tidak diketahui'. Perlu 1 detail call per invoice (mirip tool sales), jadi lambat
+    untuk periode besar -> worker sedikit + jeda supaya Accurate tidak memutus koneksi."""
     def run():
         try:
             import time as _t
@@ -3812,41 +3815,90 @@ def tool_hitung_lunas_metode(host, chat_id, date_from, date_to, label=""):
                 send_message(chat_id, f"Tidak ada invoice LUNAS di {label or (date_from + ' - ' + date_to)}.")
                 return
 
-            # 3. Untuk tiap invoice lunas, baca metode bayar dari sales-receipt
+            # 3. Untuk tiap invoice lunas, baca metode bayar dari DETAIL invoice
+            #    (receiptHistory -> historyPaymentName). Beban ringan: worker sedikit + jeda.
+            import ast as _ast
             lock = threading.Lock()
-            def klasifikasi_metode(number):
-                recs = []
+
+            def _parse_receipt_history(raw):
+                """receiptHistory di PTM = STRING gaya Python. Parse -> list dict.
+                Kalau parse gagal (mis. string ke-truncate), fallback deteksi substring."""
+                if not raw:
+                    return []
+                if isinstance(raw, list):
+                    return raw
+                if isinstance(raw, str):
+                    try:
+                        val = _ast.literal_eval(raw)
+                        return val if isinstance(val, list) else []
+                    except (ValueError, SyntaxError):
+                        return raw  # kembalikan string mentah utk fallback substring
+                return []
+
+            def _metode_dari_nama(nama):
+                n = (nama or "").lower()
+                if any(k in n for k in ("tunai", "cash", "kas")):
+                    return "tunai"
+                if "transfer" in n or "bank" in n:
+                    return "transfer"
+                return None
+
+            def klasifikasi_metode(iid):
+                detail = None
                 for attempt in range(3):
                     try:
-                        rr = requests.get(f"{h}/accurate/api/sales-receipt/list.do", headers=accurate_headers(),
-                            params={"fields": "id,number,bankName,paymentMethod,chequeAmount",
-                                    "sp.pageSize": 20, "filter.keywords": number}, timeout=20)
+                        rr = requests.get(f"{h}/accurate/api/sales-invoice/detail.do",
+                            headers=accurate_headers(), params={"id": iid}, timeout=25)
                         dj = rr.json()
-                        if dj.get("s"):
-                            recs = dj.get("d", []) or []
-                            break
+                        if dj.get("s") and dj.get("d"):
+                            detail = dj["d"]; break
                     except Exception:
                         pass
-                    _t.sleep(0.4 * (attempt + 1))
+                    _t.sleep(0.6 * (attempt + 1))
+                if detail is None:
+                    return "tidak_diketahui"
+
+                histori = _parse_receipt_history(detail.get("receiptHistory"))
+
+                # Fallback: parse gagal, histori masih berupa string -> cek substring
+                if isinstance(histori, str):
+                    m = _metode_dari_nama(histori)
+                    return m if m else "tidak_diketahui"
+
                 metode = set()
-                for rc in recs:
-                    if not isinstance(rc, dict): continue
-                    teks = f"{rc.get('paymentMethod') or ''} {rc.get('bankName') or ''}".lower()
-                    if any(k in teks for k in ("tunai", "cash", "kas")):
-                        metode.add("tunai")
-                    elif teks.strip():
-                        metode.add("transfer")
+                for hh_ in histori:
+                    if not isinstance(hh_, dict):
+                        continue
+                    if hh_.get("historyIsVoidReceipt"):
+                        continue
+                    if hh_.get("approvalStatus") not in (None, "APPROVED"):
+                        continue
+                    m = _metode_dari_nama(hh_.get("historyPaymentName"))
+                    if m:
+                        metode.add(m)
+
                 if not metode: return "tidak_diketahui"
                 if metode == {"tunai"}: return "tunai"
                 if metode == {"transfer"}: return "transfer"
                 return "campuran"
 
             def proses(item):
-                item["metode"] = klasifikasi_metode(item["number"])
+                item["metode"] = klasifikasi_metode(item["id"])
                 _t.sleep(0.05)
 
-            with ThreadPoolExecutor(max_workers=5) as ex:
-                list(ex.map(proses, lunas))
+            gagal_retry = []
+            def proses_safe(item):
+                try:
+                    proses(item)
+                except Exception:
+                    with lock: gagal_retry.append(item)
+
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                list(ex.map(proses_safe, lunas))
+            if gagal_retry:
+                ulang = list(gagal_retry); gagal_retry.clear()
+                with ThreadPoolExecutor(max_workers=2) as ex:
+                    list(ex.map(proses_safe, ulang))
 
             # 4. Rekap per metode
             grup = {"tunai": [], "transfer": [], "campuran": [], "tidak_diketahui": []}
@@ -3871,9 +3923,9 @@ def tool_hitung_lunas_metode(host, chat_id, date_from, date_to, label=""):
             if n_cmp: msg += s_cmp
             if n_tt: msg += s_tt
             if n_tt:
-                msg += "\n_'Tidak diketahui' = sales-receipt invoice tidak ketemu saat dicari. Kalau jumlahnya banyak, buka /debug-metode-bayar dan kirim hasilnya supaya deteksi metode diperbaiki._"
+                msg += "\n_'Tidak diketahui' = detail/receiptHistory invoice gagal dibaca. Kalau jumlahnya banyak, coba ulang atau buka /debug-metode-bayar._"
             else:
-                msg += "\n_Metode dibaca dari penerimaan penjualan (sales-receipt) tiap invoice._"
+                msg += "\n_Metode dibaca dari receiptHistory (historyPaymentName) tiap invoice._"
             send_message(chat_id, msg)
         except Exception as e:
             send_message(chat_id, f"❌ Gagal hitung lunas per metode: {str(e)[:150]}")
