@@ -1614,6 +1614,19 @@ TOOLS = [
         }
     },
     {
+        "name": "rekap_bayar_sales",
+        "description": "Laporan/rekap pembayaran invoice LUNAS dikelompokkan PER BULAN lalu PER NAMA SALES, dipisah metode bayar (Tunai vs Transfer), LENGKAP dengan daftar nomor invoice tiap sales. WAJIB pakai tool ini untuk 'rekap pembayaran tiap sales', 'laporan pembayaran per bulan masing-masing sales', 'invoice tunai dan transfer per nama sales', 'kelompokkan invoice lunas per sales dan metode'. Bisa satu bulan atau beberapa bulan sekaligus (otomatis dipisah per bulan). Beda dengan hitung_lunas_metode (itu total tanpa per sales). Background beberapa menit (buka detail tiap invoice), hasil dikirim bertahap ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD/MM/YYYY"},
+                "date_to": {"type": "string", "description": "DD/MM/YYYY"},
+                "label": {"type": "string", "description": "Label periode, contoh 'Juli 2026' atau 'Jan-Jun 2026'"}
+            },
+            "required": ["date_from", "date_to"]
+        }
+    },
+    {
         "name": "bukti_belum_ada_per_sales",
         "description": "Cek invoice yang BELUM ADA file bukti bayarnya di Google Drive, dikelompokkan PER SALES (nama sales -> daftar nomor invoice + nilai). Secara DEFAULT hanya menampilkan invoice berstatus LUNAS (hanya_lunas=true) — karena itu yang paling relevan: sudah lunas tapi bukti belum diupload. WAJIB pakai tool ini untuk 'sales mana yang customernya sudah lunas tapi belum ada bukti bayar', 'invoice lunas belum ada bukti per sales', 'bukti bayar yang belum ada per sales'. Kalau user mau SEMUA invoice (termasuk yang belum lunas), set hanya_lunas=false. Beda dengan cek_bukti_bayar_massal (tidak per sales) dan bukti_tidak_cocok_per_sales (yang nominalnya beda). Background beberapa menit, hasil ke Telegram.",
         "input_schema": {
@@ -1871,6 +1884,8 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_bukti_belum_ada_per_sales(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""), tool_input.get("hanya_lunas", True))
                 elif tool_name == "hitung_lunas_metode":
                     result = tool_hitung_lunas_metode(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
+                elif tool_name == "rekap_bayar_sales":
+                    result = tool_rekap_bayar_sales(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "get_profit_periode":
                     result = tool_get_profit_periode(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "rekap_bulanan":
@@ -3978,6 +3993,208 @@ def tool_hitung_lunas_metode(host, chat_id, date_from, date_to, label=""):
         except Exception as e:
             send_message(chat_id, f"❌ Gagal hitung lunas per metode: {str(e)[:150]}")
             print(f"[LUNAS METODE ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
+
+
+def tool_rekap_bayar_sales(host, chat_id, date_from, date_to, label=""):
+    """Rekap pembayaran invoice LUNAS, dikelompokkan PER BULAN -> PER SALES -> per metode
+    (Tunai vs Transfer), lengkap daftar nomor invoice. Metode dibaca dari receiptHistory
+    (historyPaymentName), sales dari _resolve_sales_name, keduanya dari 1 detail call."""
+    def run():
+        try:
+            import time as _t
+            import ast as _ast
+            from datetime import datetime as _dt
+            h = host if host.startswith("http") else f"https://{host}"
+
+            def parse_tgl(s):
+                for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                    try: return _dt.strptime((s or "").split(" ")[0], fmt)
+                    except: pass
+                return None
+
+            NAMA_BULAN = ["", "Januari", "Februari", "Maret", "April", "Mei", "Juni",
+                          "Juli", "Agustus", "September", "Oktober", "November", "Desember"]
+            def label_bulan(bkey):  # bkey = "YYYY-MM"
+                try:
+                    th, bl = bkey.split("-")
+                    return f"{NAMA_BULAN[int(bl)]} {th}"
+                except: return bkey
+
+            def _parse_receipt_history(raw):
+                if not raw: return []
+                if isinstance(raw, list): return raw
+                if isinstance(raw, str):
+                    try:
+                        val = _ast.literal_eval(raw)
+                        return val if isinstance(val, list) else []
+                    except (ValueError, SyntaxError):
+                        return raw
+                return []
+
+            def _metode_dari_nama(nama):
+                n = (nama or "").lower()
+                if any(k in n for k in ("tunai", "cash", "kas")): return "tunai"
+                if "transfer" in n or "bank" in n: return "transfer"
+                return None
+
+            # 1. Ambil semua invoice periode
+            all_inv = []
+            page = 1
+            while True:
+                params = {"fields": "id,number,totalAmount,salesAmount,subTotal,statusName,transDate",
+                    "sp.pageSize": 200, "sp.page": page,
+                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
+                rr = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+                dd = rr.json()
+                if not dd.get("s"): break
+                all_inv.extend(dd.get("d", []))
+                sp = dd.get("sp", {})
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+
+            def nilai_dari_list(inv):
+                for k in ("totalAmount", "salesAmount", "subTotal"):
+                    try:
+                        fv = float(inv.get(k))
+                        if fv != 0: return fv
+                    except: pass
+                return 0.0
+
+            lunas = []
+            for inv in all_inv:
+                if not isinstance(inv, dict): continue
+                status = (inv.get("statusName") or "").upper()
+                if "LUNAS" in status or "PAID" in status or "CLOSE" in status:
+                    lunas.append({"id": inv.get("id"), "number": inv.get("number"),
+                                  "nilai": nilai_dari_list(inv), "transDate": inv.get("transDate")})
+
+            if not lunas:
+                send_message(chat_id, f"Tidak ada invoice LUNAS di {label or (date_from + ' - ' + date_to)}.")
+                return
+
+            send_message(chat_id, f"⏳ Memproses {len(lunas)} invoice lunas untuk rekap per sales & metode... (bisa beberapa menit)")
+
+            lock = threading.Lock()
+
+            def proses(item):
+                iid = item["id"]
+                detail = None
+                for attempt in range(5):
+                    try:
+                        rr = requests.get(f"{h}/accurate/api/sales-invoice/detail.do",
+                            headers=accurate_headers(), params={"id": iid}, timeout=30)
+                        dj = rr.json()
+                        if dj.get("s") and dj.get("d"):
+                            detail = dj["d"]; break
+                    except Exception:
+                        pass
+                    _t.sleep(0.6 * (attempt + 1))
+                if detail is None:
+                    item["gagal_baca"] = True
+                    item["sales"] = "Tanpa Sales"; item["metode"] = "tidak_diketahui"
+                    return
+                item["sales"] = _resolve_sales_name(detail)
+                tgl = parse_tgl(detail.get("transDate") or item.get("transDate"))
+                item["bulan"] = tgl.strftime("%Y-%m") if tgl else "????-??"
+                histori = _parse_receipt_history(detail.get("receiptHistory"))
+                if isinstance(histori, str):
+                    m = _metode_dari_nama(histori)
+                    item["metode"] = m or "tidak_diketahui"; return
+                metode = set()
+                for hh_ in histori:
+                    if not isinstance(hh_, dict): continue
+                    if hh_.get("historyIsVoidReceipt"): continue
+                    if hh_.get("approvalStatus") not in (None, "APPROVED"): continue
+                    m = _metode_dari_nama(hh_.get("historyPaymentName"))
+                    if m: metode.add(m)
+                if not metode: item["metode"] = "tidak_diketahui"
+                elif metode == {"tunai"}: item["metode"] = "tunai"
+                elif metode == {"transfer"}: item["metode"] = "transfer"
+                else: item["metode"] = "campuran"
+                _t.sleep(0.05)
+
+            gagal_retry = []
+            def proses_safe(item):
+                try:
+                    proses(item)
+                    if item.get("gagal_baca"):
+                        with lock: gagal_retry.append(item)
+                except Exception:
+                    with lock: gagal_retry.append(item)
+
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                list(ex.map(proses_safe, lunas))
+            if gagal_retry:
+                ulang = list(gagal_retry); gagal_retry.clear()
+                for it in ulang: it.pop("gagal_baca", None)
+                with ThreadPoolExecutor(max_workers=2) as ex:
+                    list(ex.map(proses_safe, ulang))
+            if gagal_retry:
+                ulang = list(gagal_retry); gagal_retry.clear()
+                for it in ulang:
+                    it.pop("gagal_baca", None)
+                    proses(it)
+
+            # 2. Kelompokkan: bulan -> sales -> metode -> list item
+            data = {}  # bulan -> sales -> {"tunai":[], "transfer":[], "campuran":[], "tidak_diketahui":[]}
+            for it in lunas:
+                b = it.get("bulan", "????-??")
+                s = it.get("sales", "Tanpa Sales")
+                m = it.get("metode", "tidak_diketahui")
+                data.setdefault(b, {}).setdefault(s, {"tunai": [], "transfer": [], "campuran": [], "tidak_diketahui": []})
+                data[b][s][m].append(it)
+
+            judul = label or f"{date_from} - {date_to}"
+            n_bulan = len(data)
+            head = f"📊 *Rekap Pembayaran per Sales - {judul}*\n"
+            head += f"Total invoice lunas: {len(lunas)} | {n_bulan} bulan\n"
+            send_message(chat_id, head)
+
+            EMO = {"tunai": "💵", "transfer": "🏦", "campuran": "🔀", "tidak_diketahui": "❓"}
+            LBL = {"tunai": "Tunai", "transfer": "Transfer", "campuran": "Campuran", "tidak_diketahui": "Tidak diketahui"}
+
+            # 3. Kirim per bulan (tiap bulan bisa jadi beberapa pesan)
+            for bkey in sorted(data.keys()):
+                sales_map = data[bkey]
+                # ringkasan bulan
+                ring = [f"🗓️ *{label_bulan(bkey)}*"]
+                for sname in sorted(sales_map.keys()):
+                    g = sales_map[sname]
+                    nt = len(g["tunai"]); tt = sum(x["nilai"] for x in g["tunai"])
+                    ntf = len(g["transfer"]); ttf = sum(x["nilai"] for x in g["transfer"])
+                    extra = len(g["campuran"]) + len(g["tidak_diketahui"])
+                    baris = f"• *{sname}*: 💵 {nt} inv Rp {tt:,.0f} | 🏦 {ntf} inv Rp {ttf:,.0f}"
+                    if extra: baris += f" | +{extra} lainnya"
+                    ring.append(baris)
+                send_message(chat_id, "\n".join(ring))
+
+                # rincian nomor invoice per sales
+                for sname in sorted(sales_map.keys()):
+                    g = sales_map[sname]
+                    baris = [f"🧾 *{label_bulan(bkey)} — {sname}*"]
+                    for mkey in ("tunai", "transfer", "campuran", "tidak_diketahui"):
+                        items = g[mkey]
+                        if not items: continue
+                        subtot = sum(x["nilai"] for x in items)
+                        baris.append(f"{EMO[mkey]} _{LBL[mkey]}_ ({len(items)} inv | Rp {subtot:,.0f}):")
+                        for it in sorted(items, key=lambda x: x["nilai"], reverse=True):
+                            baris.append(f"   {it.get('number','?')} — Rp {it.get('nilai',0):,.0f}")
+                        # potong tiap ~40 baris
+                        if len(baris) >= 40:
+                            send_message(chat_id, "\n".join(baris))
+                            baris = [f"🧾 *{label_bulan(bkey)} — {sname}* (lanjutan)"]
+                    if len(baris) > 1:
+                        send_message(chat_id, "\n".join(baris))
+
+            send_message(chat_id, "✅ Rekap selesai.")
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal rekap bayar per sales: {str(e)[:150]}")
+            print(f"[REKAP BAYAR SALES ERROR] {e}")
 
     t = threading.Thread(target=run)
     t.daemon = True
