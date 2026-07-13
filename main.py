@@ -650,12 +650,48 @@ def tool_get_low_stock(host, chat_id, keyword, threshold=30):
                 send_message(chat_id, f"✅ Tidak ada produk '{keyword}' dengan stok di bawah {threshold:.0f} pcs. Semua aman!")
                 return
 
-            low_items.sort(key=lambda x: x["stock"])
-            msg = f"⚠️ *Stok Menipis '{keyword}' (di bawah {threshold:.0f} pcs)*\n\n"
-            msg += f"Ditemukan {len(low_items)} produk:\n\n"
+            # Kelompokkan per MODEL (bagian sebelum tanda '-' terakhir), warna digabung
+            def pecah_model(nama):
+                if " - " in nama:
+                    model, warna = nama.rsplit(" - ", 1)
+                elif "-" in nama:
+                    model, warna = nama.rsplit("-", 1)
+                else:
+                    model, warna = nama, ""
+                return model.strip(), warna.strip()
+
+            grup = {}
             for it in low_items:
-                msg += f"• {it['name']}: {it['stock']:,.0f} pcs\n"
-            send_message(chat_id, msg)
+                model, warna = pecah_model(it["name"])
+                grup.setdefault(model, []).append({"warna": warna or "(tanpa varian)", "stock": it["stock"]})
+
+            # urutkan model: total stok paling kritis (kecil) dulu
+            def total_model(m):
+                return sum(x["stock"] for x in grup[m])
+            urut_model = sorted(grup, key=lambda m: (total_model(m), m))
+
+            total_semua = sum(x["stock"] for x in low_items)
+            head = f"⚠️ *Stok Menipis '{keyword}' (di bawah {threshold:.0f} pcs)*\n\n"
+            head += f"{len(low_items)} varian dari {len(grup)} model | Total stok: {total_semua:,.0f} pcs\n"
+            head += "_Diurutkan dari model paling kritis._"
+            send_message(chat_id, head)
+
+            baris = []
+            for model in urut_model:
+                varian = sorted(grup[model], key=lambda x: x["stock"])
+                tot = sum(x["stock"] for x in varian)
+                baris.append(f"━━━━━━━━━━\n📦 *{model}*\n   Total: {tot:,.0f} pcs | {len(varian)} varian")
+                for v in varian:
+                    tanda = "🔴" if v["stock"] < 0 else ("⚫" if v["stock"] == 0 else "🟠")
+                    baris.append(f"   {tanda} {v['warna']}: {v['stock']:,.0f} pcs")
+                # potong tiap ~40 baris supaya tidak kena batas panjang Telegram
+                if len(baris) >= 40:
+                    send_message(chat_id, "\n".join(baris))
+                    baris = []
+            if baris:
+                send_message(chat_id, "\n".join(baris))
+
+            send_message(chat_id, "🔴 minus | ⚫ habis (0) | 🟠 menipis")
         except Exception as e:
             send_message(chat_id, f"❌ Gagal cek stok: {str(e)[:100]}")
             print(f"[LOW STOCK BG ERROR] {e}")
