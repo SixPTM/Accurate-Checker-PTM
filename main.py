@@ -1689,6 +1689,20 @@ TOOLS = [
         }
     },
     {
+        "name": "customer_rutin",
+        "description": "Daftar CUSTOMER RUTIN — pelanggan yang order berulang (default minimal 5x) dalam periode tertentu, untuk bahan FOLLOW UP tim. Menampilkan nama customer, jumlah order, total nilai, rata-rata per order, kapan order terakhir, berapa hari sejak order terakhir (jeda), dan sales penanggung jawab. Mencakup SEMUA jenis barang. WAJIB pakai tool ini untuk 'customer yang order rutin', 'pelanggan langganan', 'customer untuk di-follow up', 'siapa yang sering order'. Bisa periode panjang (mis. 6 bulan). Background beberapa menit, hasil ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD/MM/YYYY"},
+                "date_to": {"type": "string", "description": "DD/MM/YYYY"},
+                "min_order": {"type": "integer", "description": "Minimal jumlah order agar dianggap rutin. Default 5."},
+                "label": {"type": "string", "description": "Label periode, contoh '6 Bulan Terakhir' atau 'Feb-Jul 2026'"}
+            },
+            "required": ["date_from", "date_to"]
+        }
+    },
+    {
         "name": "bukti_belum_ada_per_sales",
         "description": "Cek invoice yang BELUM ADA file bukti bayarnya di Google Drive, dikelompokkan PER SALES (nama sales -> daftar nomor invoice + nilai). Secara DEFAULT hanya menampilkan invoice berstatus LUNAS (hanya_lunas=true) — karena itu yang paling relevan: sudah lunas tapi bukti belum diupload. WAJIB pakai tool ini untuk 'sales mana yang customernya sudah lunas tapi belum ada bukti bayar', 'invoice lunas belum ada bukti per sales', 'bukti bayar yang belum ada per sales'. Kalau user mau SEMUA invoice (termasuk yang belum lunas), set hanya_lunas=false. Beda dengan cek_bukti_bayar_massal (tidak per sales) dan bukti_tidak_cocok_per_sales (yang nominalnya beda). Background beberapa menit, hasil ke Telegram.",
         "input_schema": {
@@ -1952,6 +1966,8 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_rekap_cash(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "rekap_transfer_bukti":
                     result = tool_rekap_transfer_bukti(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
+                elif tool_name == "customer_rutin":
+                    result = tool_customer_rutin(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("min_order", 5), tool_input.get("label",""))
                 elif tool_name == "get_profit_periode":
                     result = tool_get_profit_periode(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "rekap_bulanan":
@@ -4559,6 +4575,176 @@ def tool_rekap_transfer_bukti(host, chat_id, date_from, date_to, label=""):
         except Exception as e:
             send_message(chat_id, f"❌ Gagal rekap transfer & bukti: {str(e)[:150]}")
             print(f"[REKAP TRANSFER BUKTI ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
+
+
+def tool_customer_rutin(host, chat_id, date_from, date_to, min_order=5, label=""):
+    """Daftar customer RUTIN (order >= min_order kali) dalam periode, untuk bahan follow-up.
+    Menampilkan: nama customer, jumlah order, total nilai, rata-rata per order,
+    order terakhir kapan, dan sudah berapa lama tidak order (untuk prioritas follow-up)."""
+    def run():
+        try:
+            import time as _t
+            from datetime import datetime as _dt
+            h = host if host.startswith("http") else f"https://{host}"
+
+            def parse_tgl(s):
+                for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                    try: return _dt.strptime((s or "").split(" ")[0], fmt)
+                    except: pass
+                return None
+
+            # 1. Ambil semua invoice periode (semua status, semua jenis barang)
+            all_inv = []
+            page = 1
+            while True:
+                params = {"fields": "id,number,totalAmount,salesAmount,subTotal,statusName,transDate",
+                    "sp.pageSize": 200, "sp.page": page,
+                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
+                rr = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+                dd = rr.json()
+                if not dd.get("s"): break
+                all_inv.extend(dd.get("d", []))
+                sp = dd.get("sp", {})
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+
+            if not all_inv:
+                send_message(chat_id, f"Tidak ada invoice di {label or (date_from + ' - ' + date_to)}.")
+                return
+
+            def nilai_dari_list(inv):
+                for k in ("totalAmount", "salesAmount", "subTotal"):
+                    try:
+                        fv = float(inv.get(k))
+                        if fv != 0: return fv
+                    except: pass
+                return 0.0
+
+            valid = [{"id": x.get("id"), "number": x.get("number"),
+                      "nilai": nilai_dari_list(x), "transDate": x.get("transDate")}
+                     for x in all_inv if isinstance(x, dict) and x.get("id")]
+
+            send_message(chat_id, f"⏳ Menganalisa {len(valid)} invoice untuk cari customer rutin (min {min_order}x order)... bisa beberapa menit.")
+
+            # 2. Ambil nama customer + sales dari detail (retry 3 lapis)
+            lock = threading.Lock()
+            def proses(item):
+                detail = None
+                for attempt in range(5):
+                    try:
+                        rr = requests.get(f"{h}/accurate/api/sales-invoice/detail.do",
+                            headers=accurate_headers(), params={"id": item["id"]}, timeout=30)
+                        dj = rr.json()
+                        if dj.get("s") and dj.get("d"):
+                            detail = dj["d"]; break
+                    except Exception:
+                        pass
+                    _t.sleep(0.6 * (attempt + 1))
+                if detail is None:
+                    item["gagal_baca"] = True
+                    item["cust"] = None
+                    return
+                cust = detail.get("customer")
+                cname = None
+                if isinstance(cust, dict): cname = cust.get("name")
+                elif isinstance(cust, list) and cust and isinstance(cust[0], dict): cname = cust[0].get("name")
+                item["cust"] = detail.get("retailWpName") or detail.get("customerName") or cname or None
+                item["sales"] = _resolve_sales_name(detail)
+                tgl = parse_tgl(detail.get("transDate") or item.get("transDate"))
+                item["tgl"] = tgl
+                _t.sleep(0.05)
+
+            gagal_retry = []
+            def proses_safe(item):
+                try:
+                    proses(item)
+                    if item.get("gagal_baca"):
+                        with lock: gagal_retry.append(item)
+                except Exception:
+                    with lock: gagal_retry.append(item)
+
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                list(ex.map(proses_safe, valid))
+            if gagal_retry:
+                ulang = list(gagal_retry); gagal_retry.clear()
+                for it in ulang: it.pop("gagal_baca", None)
+                with ThreadPoolExecutor(max_workers=2) as ex:
+                    list(ex.map(proses_safe, ulang))
+            if gagal_retry:
+                ulang = list(gagal_retry); gagal_retry.clear()
+                for it in ulang:
+                    it.pop("gagal_baca", None)
+                    proses(it)
+
+            # 3. Kelompokkan per customer (abaikan yang nama customernya kosong)
+            per_cust = {}
+            tanpa_nama = 0
+            for it in valid:
+                nama = (it.get("cust") or "").strip()
+                if not nama:
+                    tanpa_nama += 1
+                    continue
+                per_cust.setdefault(nama, []).append(it)
+
+            # 4. Saring yang rutin (>= min_order)
+            rutin = {k: v for k, v in per_cust.items() if len(v) >= min_order}
+            if not rutin:
+                send_message(chat_id, f"Tidak ada customer dengan order ≥ {min_order}x di {label or 'periode ini'}.")
+                return
+
+            hari_ini = _dt.now()
+            baris_cust = []
+            for nama, items in rutin.items():
+                total = sum(x["nilai"] for x in items)
+                tgl_list = [x["tgl"] for x in items if x.get("tgl")]
+                terakhir = max(tgl_list) if tgl_list else None
+                jeda = (hari_ini - terakhir).days if terakhir else None
+                baris_cust.append({
+                    "nama": nama, "n": len(items), "total": total,
+                    "rata": total / len(items) if items else 0,
+                    "terakhir": terakhir, "jeda": jeda,
+                    "sales": (items[-1].get("sales") or "-")
+                })
+
+            # urutkan: paling sering order dulu, lalu nilai terbesar
+            baris_cust.sort(key=lambda x: (x["n"], x["total"]), reverse=True)
+
+            judul = label or f"{date_from} - {date_to}"
+            total_nilai = sum(x["total"] for x in baris_cust)
+            head = f"🔁 *Customer Rutin (≥{min_order}x order) - {judul}*\n\n"
+            head += f"Ditemukan *{len(baris_cust)} customer rutin*\n"
+            head += f"Total order: {sum(x['n'] for x in baris_cust)} invoice | Rp {total_nilai:,.0f}\n"
+            if tanpa_nama:
+                head += f"_({tanpa_nama} invoice tanpa nama customer, tidak dihitung)_\n"
+            head += "\n_Urut dari paling sering order. 'Jeda' = sudah berapa hari sejak order terakhir — makin besar, makin perlu di-follow up._"
+            send_message(chat_id, head)
+
+            blok = []
+            for i, c in enumerate(baris_cust, 1):
+                tgl_s = c["terakhir"].strftime("%d/%m/%Y") if c["terakhir"] else "-"
+                jeda_s = f"{c['jeda']} hari lalu" if c["jeda"] is not None else "-"
+                tanda = "🔥" if (c["jeda"] is not None and c["jeda"] <= 30) else ("⚠️" if (c["jeda"] is not None and c["jeda"] <= 60) else "❗")
+                blok.append(
+                    f"━━━━━━━━━━\n{i}. {tanda} *{c['nama']}*\n"
+                    f"   📦 {c['n']}x order | Rp {c['total']:,.0f}\n"
+                    f"   📊 Rata-rata: Rp {c['rata']:,.0f}/order\n"
+                    f"   🗓️ Terakhir: {tgl_s} ({jeda_s})\n"
+                    f"   👤 Sales: {c['sales']}"
+                )
+                if len(blok) >= 8:
+                    send_message(chat_id, "\n".join(blok)); blok = []
+            if blok:
+                send_message(chat_id, "\n".join(blok))
+
+            send_message(chat_id, "🔥 aktif (≤30 hari) | ⚠️ mulai jauh (31-60 hari) | ❗ lama tidak order (>60 hari) — prioritaskan yang ❗ dan ⚠️ untuk follow-up.")
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal cari customer rutin: {str(e)[:150]}")
+            print(f"[CUSTOMER RUTIN ERROR] {e}")
 
     t = threading.Thread(target=run)
     t.daemon = True
