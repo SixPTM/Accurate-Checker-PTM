@@ -2050,6 +2050,57 @@ def get_drive_token():
     return creds.token
 
 
+def _kumpulkan_nomor_bukti_drive(token):
+    """Telusuri semua file bukti di Drive (rekursif ke subfolder) dan kembalikan SET
+    berisi SEMUA nomor invoice yang muncul di nama file (UPPER).
+    Mendukung: 1 file utk banyak invoice (gabungan) DAN 1 invoice banyak file
+    (mis. 'SI.2026.07.00123 (DP).jpg' + 'SI.2026.07.00123 (pelunasan).jpg').
+    Cara baca: ekstrak semua pola SI.YYYY.MM.NNNNN dari nama file — teks lain diabaikan."""
+    import re as _re
+    pola = _re.compile(r"SI\.\d{4}\.\d{2}\.\d+", _re.IGNORECASE)
+    nomor_set = set()
+
+    def tambah_dari_nama(nama):
+        ada = pola.findall(nama or "")
+        if ada:
+            for n in ada:
+                nomor_set.add(n.upper())
+        else:
+            # fallback: file tanpa pola nomor jelas -> pakai nama tanpa ekstensi (cocok-persis lama)
+            key = (nama or "").rsplit(".", 1)[0].strip().upper()
+            if key:
+                nomor_set.add(key)
+
+    def daftar(folder_id):
+        page_token = None
+        while True:
+            params = {"q": f"'{folder_id}' in parents and trashed=false",
+                      "fields": "nextPageToken,files(id,name,mimeType)", "pageSize": 1000,
+                      "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}
+            if page_token: params["pageToken"] = page_token
+            rs = requests.get("https://www.googleapis.com/drive/v3/files",
+                headers={"Authorization": f"Bearer {token}"}, params=params, timeout=30)
+            ds = rs.json()
+            for x in ds.get("files", []):
+                if x.get("mimeType") == "application/vnd.google-apps.folder":
+                    daftar(x["id"])
+                else:
+                    tambah_dari_nama(x.get("name"))
+            page_token = ds.get("nextPageToken")
+            if not page_token: break
+
+    r = requests.get("https://www.googleapis.com/drive/v3/files",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"q": f"'{GDRIVE_FOLDER_ID}' in parents and trashed=false", "fields": "files(id,name,mimeType)",
+                "pageSize": 1000, "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}, timeout=30)
+    for f in r.json().get("files", []):
+        if f.get("mimeType") == "application/vnd.google-apps.folder":
+            daftar(f["id"])
+        else:
+            tambah_dari_nama(f.get("name"))
+    return nomor_set
+
+
 def drive_list_files(name_contains=None, page_size=1000):
     """List file di folder GDRIVE_FOLDER_ID. Optional filter nama mengandung teks."""
     token = get_drive_token()
@@ -3735,34 +3786,9 @@ def tool_bukti_belum_ada_per_sales(host, chat_id, date_from, date_to, label="", 
         try:
             h = host if host.startswith("http") else f"https://{host}"
             token = get_drive_token()
-            # 1. Kumpulkan semua nama file bukti di Drive (semua subfolder) -> set nomor invoice (UPPER)
-            nama_file_drive = set()
-            def daftar(folder_id):
-                page_token = None
-                while True:
-                    params = {"q": f"'{folder_id}' in parents and trashed=false",
-                              "fields": "nextPageToken,files(id,name,mimeType)", "pageSize": 1000,
-                              "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}
-                    if page_token: params["pageToken"] = page_token
-                    rs = requests.get("https://www.googleapis.com/drive/v3/files",
-                        headers={"Authorization": f"Bearer {token}"}, params=params, timeout=30)
-                    ds = rs.json()
-                    for x in ds.get("files", []):
-                        if x.get("mimeType") == "application/vnd.google-apps.folder":
-                            daftar(x["id"])
-                        else:
-                            nama_file_drive.add(x["name"].rsplit(".", 1)[0].strip().upper())
-                    page_token = ds.get("nextPageToken")
-                    if not page_token: break
-            r = requests.get("https://www.googleapis.com/drive/v3/files",
-                headers={"Authorization": f"Bearer {token}"},
-                params={"q": f"'{GDRIVE_FOLDER_ID}' in parents and trashed=false", "fields": "files(id,name,mimeType)",
-                        "pageSize": 1000, "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}, timeout=30)
-            for f in r.json().get("files", []):
-                if f.get("mimeType") == "application/vnd.google-apps.folder":
-                    daftar(f["id"])
-                else:
-                    nama_file_drive.add(f["name"].rsplit(".", 1)[0].strip().upper())
+            # 1. Kumpulkan semua nomor invoice dari nama file bukti di Drive
+            #    (regex: dukung file gabungan & 1 invoice banyak bukti)
+            nama_file_drive = _kumpulkan_nomor_bukti_drive(token)
 
             # 2. Ambil semua invoice periode
             all_inv = []
@@ -4498,34 +4524,9 @@ def tool_rekap_transfer_bukti(host, chat_id, date_from, date_to, label=""):
             h = host if host.startswith("http") else f"https://{host}"
             token = get_drive_token()
 
-            # 1. Kumpulkan semua nama file bukti di Drive -> set nomor invoice (UPPER)
-            nama_file_drive = set()
-            def daftar(folder_id):
-                page_token = None
-                while True:
-                    params = {"q": f"'{folder_id}' in parents and trashed=false",
-                              "fields": "nextPageToken,files(id,name,mimeType)", "pageSize": 1000,
-                              "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}
-                    if page_token: params["pageToken"] = page_token
-                    rs = requests.get("https://www.googleapis.com/drive/v3/files",
-                        headers={"Authorization": f"Bearer {token}"}, params=params, timeout=30)
-                    ds = rs.json()
-                    for x in ds.get("files", []):
-                        if x.get("mimeType") == "application/vnd.google-apps.folder":
-                            daftar(x["id"])
-                        else:
-                            nama_file_drive.add(x["name"].rsplit(".", 1)[0].strip().upper())
-                    page_token = ds.get("nextPageToken")
-                    if not page_token: break
-            r = requests.get("https://www.googleapis.com/drive/v3/files",
-                headers={"Authorization": f"Bearer {token}"},
-                params={"q": f"'{GDRIVE_FOLDER_ID}' in parents and trashed=false", "fields": "files(id,name,mimeType)",
-                        "pageSize": 1000, "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}, timeout=30)
-            for f in r.json().get("files", []):
-                if f.get("mimeType") == "application/vnd.google-apps.folder":
-                    daftar(f["id"])
-                else:
-                    nama_file_drive.add(f["name"].rsplit(".", 1)[0].strip().upper())
+            # 1. Kumpulkan semua nomor invoice dari nama file bukti di Drive
+            #    (regex: dukung file gabungan & 1 invoice banyak bukti)
+            nama_file_drive = _kumpulkan_nomor_bukti_drive(token)
 
             # 2. Ambil invoice lunas + metode, ambil yang TRANSFER (campuran ikut dicek juga)
             lunas = _lunas_dengan_metode(h, date_from, date_to)
@@ -4756,33 +4757,10 @@ def tool_cek_bukti_bayar_massal(host, chat_id, date_from, date_to, label=""):
     def run():
         try:
             h = host if host.startswith("http") else f"https://{host}"
-            # 1. Ambil semua nama file di Drive (semua subfolder), kumpulkan nomor invoice yang ADA buktinya
+            # 1. Kumpulkan semua nomor invoice dari nama file bukti di Drive
+            #    (regex: dukung file gabungan & 1 invoice banyak bukti)
             token = get_drive_token()
-            nama_file_drive = set()
-            # folder utama
-            q_root = f"'{GDRIVE_FOLDER_ID}' in parents and trashed=false"
-            r = requests.get("https://www.googleapis.com/drive/v3/files",
-                headers={"Authorization": f"Bearer {token}"},
-                params={"q": q_root, "fields": "files(id,name,mimeType)", "pageSize": 1000,
-                        "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}, timeout=30)
-            for f in r.json().get("files", []):
-                if f.get("mimeType") == "application/vnd.google-apps.folder":
-                    # masuk subfolder
-                    qsub = f"'{f['id']}' in parents and trashed=false"
-                    page_token = None
-                    while True:
-                        params = {"q": qsub, "fields": "nextPageToken,files(name)", "pageSize": 1000,
-                                  "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}
-                        if page_token: params["pageToken"] = page_token
-                        rs = requests.get("https://www.googleapis.com/drive/v3/files",
-                            headers={"Authorization": f"Bearer {token}"}, params=params, timeout=30)
-                        ds = rs.json()
-                        for x in ds.get("files", []):
-                            nama_file_drive.add(x["name"].rsplit(".", 1)[0].strip().upper())
-                        page_token = ds.get("nextPageToken")
-                        if not page_token: break
-                else:
-                    nama_file_drive.add(f["name"].rsplit(".", 1)[0].strip().upper())
+            nama_file_drive = _kumpulkan_nomor_bukti_drive(token)
 
             # 2. Ambil semua invoice di periode
             all_inv = []
