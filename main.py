@@ -4836,29 +4836,59 @@ def tool_cek_bukti_bayar(host, chat_id, nomor_invoice):
                 send_message(chat_id, msg)
                 return
 
-            # 3. Download file pertama, baca nominal
-            f = files[0]
-            if not isinstance(f, dict) or not f.get("id"):
-                send_message(chat_id, f"❌ File bukti {nomor_invoice} ditemukan tapi formatnya tidak terbaca.")
-                return
-            img = drive_download_file(f["id"])
-            nominal_foto, penjelasan = baca_nominal_dari_gambar(img, f.get("mimeType", "image/png"))
+            # 3. Saring hanya file yang nomor invoicenya BENAR cocok (hindari 00515 vs 005150),
+            #    lalu baca nominal SEMUA file dan JUMLAHKAN (1 invoice bisa >1 bukti: DP + pelunasan)
+            import re as _re
+            nomor_up = nomor_invoice.strip().upper()
+            pola_nomor = _re.compile(r"SI\.\d{4}\.\d{2}\.\d+", _re.IGNORECASE)
+            files_cocok = []
+            for f in files:
+                if not isinstance(f, dict) or not f.get("id"):
+                    continue
+                ditemukan = [n.upper() for n in pola_nomor.findall(f.get("name", ""))]
+                if ditemukan:
+                    if nomor_up in ditemukan:
+                        files_cocok.append(f)
+                else:
+                    # nama file tanpa pola nomor -> pakai kecocokan longgar (nama mengandung nomor)
+                    if nomor_up in f.get("name", "").upper():
+                        files_cocok.append(f)
 
-            # 4. Bandingkan
+            if not files_cocok:
+                msg = f"❌ Bukti bayar untuk {nomor_invoice} TIDAK ditemukan di Google Drive."
+                if nilai_invoice is not None:
+                    msg += f"\nNilai invoice di Accurate: Rp {nilai_invoice:,.0f}"
+                send_message(chat_id, msg)
+                return
+
+            rincian = []
+            total_nominal = 0
+            for f in files_cocok:
+                try:
+                    img = drive_download_file(f["id"])
+                    nominal_foto, penjelasan = baca_nominal_dari_gambar(img, f.get("mimeType", "image/png"))
+                except Exception:
+                    nominal_foto, penjelasan = 0, "gagal baca file"
+                total_nominal += nominal_foto
+                rincian.append({"nama": f.get("name", "?"), "nominal": nominal_foto, "penjelasan": penjelasan})
+
+            # 4. Bandingkan TOTAL semua bukti dengan nilai invoice
             msg = f"📎 *Cek Bukti Bayar {nomor_invoice}*\n\n"
-            msg += f"File ditemukan: {f['name']}\n"
+            msg += f"Ditemukan {len(files_cocok)} file bukti:\n"
+            for r_ in rincian:
+                msg += f"• {r_['nama']}: Rp {r_['nominal']:,.0f}\n"
+                if r_.get("penjelasan"):
+                    msg += f"   _{r_['penjelasan']}_\n"
+            msg += f"\nTotal nominal terbaca: Rp {total_nominal:,.0f}\n"
             if nilai_invoice is not None:
                 msg += f"Nilai invoice (Accurate): Rp {nilai_invoice:,.0f}\n"
-            msg += f"Nominal terbaca di bukti: Rp {nominal_foto:,.0f}\n"
-            if penjelasan:
-                msg += f"_(yang dibaca: {penjelasan})_\n"
             msg += "\n"
-            if nilai_invoice is not None and nominal_foto > 0:
-                selisih = nominal_foto - nilai_invoice
+            if nilai_invoice is not None and total_nominal > 0:
+                selisih = total_nominal - nilai_invoice
                 if abs(selisih) < 1:
-                    msg += "✅ COCOK - nominal bukti sama dengan invoice."
+                    msg += "✅ COCOK - total bukti sama dengan invoice."
                 else:
-                    msg += f"⚠️ BERBEDA - selisih Rp {selisih:,.0f}.\n_Bisa karena bayar sebagian, digabung invoice lain, biaya admin, atau foto terbaca kurang akurat._"
+                    msg += f"⚠️ BERBEDA - selisih Rp {selisih:,.0f}.\n_Bisa karena bayar sebagian, ada bukti belum di-upload, biaya admin, atau foto terbaca kurang akurat._"
             else:
                 msg += "_Tidak bisa membandingkan (nilai invoice atau nominal foto tidak terbaca)._"
             send_message(chat_id, msg)
