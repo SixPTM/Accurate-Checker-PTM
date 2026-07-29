@@ -677,24 +677,41 @@ def tool_rekap_penjualan_bulanan(host, chat_id, date_from, date_to, date_from2="
             pb2 = _omset_per_bulan(h, date_from2, date_to2)
             L2 = label2 or f"{date_from2}–{date_to2}"
 
-            # samakan berdasar urutan bulan (bulan ke-1, ke-2, ...) supaya Jan vs Jan
-            b1 = sorted(pb1); b2 = sorted(pb2)
-            n = max(len(b1), len(b2))
+            # Tentukan mana LAMA (tahun/tanggal lebih awal) & BARU (lebih akhir) OTOMATIS,
+            # supaya arah naik/turun tidak tergantung urutan input user.
+            def tgl_awal(s):
+                for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                    try: return _dt.strptime((s or "").split(" ")[0], fmt)
+                    except: pass
+                return _dt(1900, 1, 1)
 
-            total1 = sum(v["nilai"] for v in pb1.values())
-            total2 = sum(v["nilai"] for v in pb2.values())
+            p1_awal = tgl_awal(date_from)   # periode utama input (arg date_from)
+            p2_awal = tgl_awal(date_from2)  # periode pembanding input (arg date_from2)
+
+            if p1_awal <= p2_awal:
+                pb_lama, L_lama = pb1, L1
+                pb_baru, L_baru = pb2, L2
+            else:
+                pb_lama, L_lama = pb2, L2
+                pb_baru, L_baru = pb1, L1
+
+            b_lama = sorted(pb_lama); b_baru = sorted(pb_baru)
+            n = max(len(b_lama), len(b_baru))
+
+            total_lama = sum(v["nilai"] for v in pb_lama.values())
+            total_baru = sum(v["nilai"] for v in pb_baru.values())
 
             msg = f"📊 *Perbandingan Penjualan per Bulan*\n"
-            msg += f"🅰️ {L1}  vs  🅱️ {L2}\n\n"
+            msg += f"{L_baru}  dibanding  {L_lama}\n\n"
             for i in range(n):
-                k1 = b1[i] if i < len(b1) else None
-                k2 = b2[i] if i < len(b2) else None
-                v1 = pb1[k1]["nilai"] if k1 else 0.0
-                v2 = pb2[k2]["nilai"] if k2 else 0.0
-                nama = lbl_bulan(k2) if k2 else (lbl_bulan(k1) if k1 else f"Bulan {i+1}")
-                # persentase perubahan B relatif ke A (B dibanding A)
-                if v1 > 0:
-                    pct = (v2 - v1) / v1 * 100
+                kL = b_lama[i] if i < len(b_lama) else None
+                kB = b_baru[i] if i < len(b_baru) else None
+                vL = pb_lama[kL]["nilai"] if kL else 0.0
+                vB = pb_baru[kB]["nilai"] if kB else 0.0
+                nama = lbl_bulan(kB) if kB else (lbl_bulan(kL) if kL else f"Bulan {i+1}")
+                # persentase: BARU dibanding LAMA
+                if vL > 0:
+                    pct = (vB - vL) / vL * 100
                     if pct < -0.05:
                         tanda = f"🔻 turun {abs(pct):.1f}%"
                     elif pct > 0.05:
@@ -702,18 +719,16 @@ def tool_rekap_penjualan_bulanan(host, chat_id, date_from, date_to, date_from2="
                     else:
                         tanda = "➡️ sama"
                 else:
-                    tanda = "—" if v2 == 0 else "🆕 baru"
-                bulan1_lbl = lbl_bulan(k1) if k1 else "-"
-                bulan2_lbl = lbl_bulan(k2) if k2 else "-"
+                    tanda = "—" if vB == 0 else "🆕 baru"
                 msg += (f"*{nama.split()[0]}*\n"
-                        f"  🅰️ {bulan1_lbl}: Rp {v1:,.0f}\n"
-                        f"  🅱️ {bulan2_lbl}: Rp {v2:,.0f}\n"
+                        f"  {lbl_bulan(kL) if kL else '-'}: Rp {vL:,.0f}\n"
+                        f"  {lbl_bulan(kB) if kB else '-'}: Rp {vB:,.0f}\n"
                         f"  {tanda}\n\n")
             send_message(chat_id, msg)
 
-            # ringkasan total
-            if total1 > 0:
-                pct_total = (total2 - total1) / total1 * 100
+            # ringkasan total: BARU dibanding LAMA
+            if total_lama > 0:
+                pct_total = (total_baru - total_lama) / total_lama * 100
                 if pct_total < -0.05:
                     arah = f"🔻 *TURUN {abs(pct_total):.1f}%*"
                 elif pct_total > 0.05:
@@ -722,13 +737,13 @@ def tool_rekap_penjualan_bulanan(host, chat_id, date_from, date_to, date_from2="
                     arah = "➡️ *SAMA*"
             else:
                 arah = "—"
-            selisih = total2 - total1
+            selisih = total_baru - total_lama
             msg2 = f"🧾 *Ringkasan Total*\n\n"
-            msg2 += f"🅰️ {L1}: Rp {total1:,.0f}\n"
-            msg2 += f"🅱️ {L2}: Rp {total2:,.0f}\n"
+            msg2 += f"{L_lama}: Rp {total_lama:,.0f}\n"
+            msg2 += f"{L_baru}: Rp {total_baru:,.0f}\n"
             msg2 += f"Selisih: Rp {selisih:,.0f}\n\n"
-            msg2 += f"{arah} (B dibanding A)\n"
-            msg2 += "\n_Nilai = totalAmount invoice (termasuk belum lunas). % dihitung: (B − A) / A._"
+            msg2 += f"{arah}\n"
+            msg2 += f"_{L_baru} dibanding {L_lama}. % = (baru − lama) / lama. Nilai = totalAmount invoice termasuk belum lunas._"
             send_message(chat_id, msg2)
         except Exception as e:
             send_message(chat_id, f"❌ Gagal rekap penjualan bulanan: {str(e)[:150]}")
@@ -738,6 +753,9 @@ def tool_rekap_penjualan_bulanan(host, chat_id, date_from, date_to, date_from2="
     t.daemon = True
     t.start()
     return json.dumps({"status": "background_started"})
+
+
+def tool_get_low_stock(host, chat_id, keyword, threshold=30):
     def run():
         try:
             h = host if host.startswith("http") else f"https://{host}"
