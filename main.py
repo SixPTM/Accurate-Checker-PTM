@@ -603,7 +603,141 @@ def tool_get_omset_summary(host, chat_id, date_from, date_to, label=""):
     return json.dumps({"status": "background_started"})
 
 
-def tool_get_low_stock(host, chat_id, keyword, threshold=30):
+def _omset_per_bulan(h, date_from, date_to):
+    """Ambil total penjualan per bulan (YYYY-MM) untuk satu rentang. Pakai totalAmount
+    dari LIST endpoint (paling andal utk agregat; salesAmount hanya andal di detail).
+    Kembalikan dict {‘YYYY-MM’: {‘nilai’: x, ‘count’: n}}."""
+    from datetime import datetime as _dt
+    def parse_tgl(s):
+        for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+            try: return _dt.strptime((s or "").split(" ")[0], fmt)
+            except: pass
+        return None
+
+    per_bulan = {}
+    page = 1
+    while True:
+        params = {"fields": "id,totalAmount,subTotal,statusName,transDate", "sp.pageSize": 200, "sp.page": page,
+            "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
+        r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+        data = r.json()
+        if not data.get("s"): break
+        for inv in data.get("d", []):
+            if not isinstance(inv, dict): continue
+            # totalAmount andal di list; hanya jatuh ke subTotal kalau totalAmount benar2 kosong/0
+            nilai = 0.0
+            for k in ("totalAmount", "subTotal"):
+                try:
+                    fv = float(inv.get(k))
+                    if fv != 0: nilai = fv; break
+                except: pass
+            tgl = parse_tgl(inv.get("transDate"))
+            bkey = tgl.strftime("%Y-%m") if tgl else "????-??"
+            per_bulan.setdefault(bkey, {"nilai": 0.0, "count": 0})
+            per_bulan[bkey]["nilai"] += nilai
+            per_bulan[bkey]["count"] += 1
+        sp = data.get("sp", {})
+        if page >= sp.get("pageCount", 1): break
+        page += 1
+    return per_bulan
+
+
+def tool_rekap_penjualan_bulanan(host, chat_id, date_from, date_to, date_from2="", date_to2="", label="", label2=""):
+    """Rekap penjualan PER BULAN untuk satu periode; jika periode ke-2 diisi, BANDINGKAN
+    kedua periode bulan-per-bulan dan hitung persentase kenaikan/penurunan. Cocok untuk
+    'bandingkan penjualan Jan-Jun 2025 vs 2026'. Nilai per bulan dihitung sekali di server
+    (bukan dirangkai chat) supaya akurat."""
+    def run():
+        try:
+            from datetime import datetime as _dt
+            h = host if host.startswith("http") else f"https://{host}"
+            NAMA_BULAN = ["", "Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"]
+            def lbl_bulan(bkey):
+                try:
+                    th, bl = bkey.split("-"); return f"{NAMA_BULAN[int(bl)]} {th}"
+                except: return bkey
+
+            pb1 = _omset_per_bulan(h, date_from, date_to)
+            L1 = label or f"{date_from}–{date_to}"
+
+            # ===== Mode 1: satu periode saja =====
+            if not (date_from2 and date_to2):
+                total = sum(v["nilai"] for v in pb1.values())
+                cnt = sum(v["count"] for v in pb1.values())
+                msg = f"💰 *Rekap Penjualan per Bulan — {L1}*\n\n"
+                for bkey in sorted(pb1):
+                    v = pb1[bkey]
+                    msg += f"• {lbl_bulan(bkey)}: Rp {v['nilai']:,.0f} ({v['count']} inv)\n"
+                msg += f"\n*Total: Rp {total:,.0f}* ({cnt} inv)"
+                msg += "\n\n_Nilai = totalAmount invoice (termasuk yang belum lunas)._"
+                send_message(chat_id, msg)
+                return
+
+            # ===== Mode 2: banding dua periode =====
+            pb2 = _omset_per_bulan(h, date_from2, date_to2)
+            L2 = label2 or f"{date_from2}–{date_to2}"
+
+            # samakan berdasar urutan bulan (bulan ke-1, ke-2, ...) supaya Jan vs Jan
+            b1 = sorted(pb1); b2 = sorted(pb2)
+            n = max(len(b1), len(b2))
+
+            total1 = sum(v["nilai"] for v in pb1.values())
+            total2 = sum(v["nilai"] for v in pb2.values())
+
+            msg = f"📊 *Perbandingan Penjualan per Bulan*\n"
+            msg += f"🅰️ {L1}  vs  🅱️ {L2}\n\n"
+            for i in range(n):
+                k1 = b1[i] if i < len(b1) else None
+                k2 = b2[i] if i < len(b2) else None
+                v1 = pb1[k1]["nilai"] if k1 else 0.0
+                v2 = pb2[k2]["nilai"] if k2 else 0.0
+                nama = lbl_bulan(k2) if k2 else (lbl_bulan(k1) if k1 else f"Bulan {i+1}")
+                # persentase perubahan B relatif ke A (B dibanding A)
+                if v1 > 0:
+                    pct = (v2 - v1) / v1 * 100
+                    if pct < -0.05:
+                        tanda = f"🔻 turun {abs(pct):.1f}%"
+                    elif pct > 0.05:
+                        tanda = f"🔺 naik {pct:.1f}%"
+                    else:
+                        tanda = "➡️ sama"
+                else:
+                    tanda = "—" if v2 == 0 else "🆕 baru"
+                bulan1_lbl = lbl_bulan(k1) if k1 else "-"
+                bulan2_lbl = lbl_bulan(k2) if k2 else "-"
+                msg += (f"*{nama.split()[0]}*\n"
+                        f"  🅰️ {bulan1_lbl}: Rp {v1:,.0f}\n"
+                        f"  🅱️ {bulan2_lbl}: Rp {v2:,.0f}\n"
+                        f"  {tanda}\n\n")
+            send_message(chat_id, msg)
+
+            # ringkasan total
+            if total1 > 0:
+                pct_total = (total2 - total1) / total1 * 100
+                if pct_total < -0.05:
+                    arah = f"🔻 *TURUN {abs(pct_total):.1f}%*"
+                elif pct_total > 0.05:
+                    arah = f"🔺 *NAIK {pct_total:.1f}%*"
+                else:
+                    arah = "➡️ *SAMA*"
+            else:
+                arah = "—"
+            selisih = total2 - total1
+            msg2 = f"🧾 *Ringkasan Total*\n\n"
+            msg2 += f"🅰️ {L1}: Rp {total1:,.0f}\n"
+            msg2 += f"🅱️ {L2}: Rp {total2:,.0f}\n"
+            msg2 += f"Selisih: Rp {selisih:,.0f}\n\n"
+            msg2 += f"{arah} (B dibanding A)\n"
+            msg2 += "\n_Nilai = totalAmount invoice (termasuk belum lunas). % dihitung: (B − A) / A._"
+            send_message(chat_id, msg2)
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal rekap penjualan bulanan: {str(e)[:150]}")
+            print(f"[REKAP PENJUALAN BULANAN ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
     def run():
         try:
             h = host if host.startswith("http") else f"https://{host}"
@@ -1435,13 +1569,29 @@ TOOLS = [
     },
     {
         "name": "get_omset_summary",
-        "description": "Hitung TOTAL pendapatan/omset/penjualan satu periode dengan membaca SEMUA invoice (semua halaman, bukan cuma 100). WAJIB pakai tool ini untuk pertanyaan total omset/pendapatan/penjualan per bulan atau per periode, contoh 'berapa pendapatan Juni', 'total penjualan bulan ini', 'omset Mei'. JANGAN pakai get_invoices untuk menghitung total omset karena get_invoices dibatasi 100 invoice. Background 2-3 menit, hasil dikirim otomatis ke Telegram.",
+        "description": "Hitung SATU ANGKA TOTAL pendapatan/omset/penjualan untuk SATU periode utuh (membaca SEMUA invoice, semua halaman). Pakai untuk 'total omset Juni', 'total penjualan bulan ini'. PENTING: tool ini TIDAK memecah per bulan dan TIDAK membandingkan periode. Untuk 'penjualan PER BULAN', 'omset tiap bulan', atau 'bandingkan 2025 vs 2026 / ada penurunan berapa %', JANGAN pakai tool ini — pakai rekap_penjualan_bulanan. Background 2-3 menit, hasil ke Telegram.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "date_from": {"type": "string", "description": "DD/MM/YYYY"},
                 "date_to": {"type": "string", "description": "DD/MM/YYYY"},
                 "label": {"type": "string", "description": "Label periode, contoh 'Juni 2026'"}
+            },
+            "required": ["date_from", "date_to"]
+        }
+    },
+    {
+        "name": "rekap_penjualan_bulanan",
+        "description": "Rekap penjualan DIPECAH PER BULAN, dan bisa MEMBANDINGKAN dua periode berbeda bulan-per-bulan lengkap dengan persentase kenaikan/penurunan. WAJIB pakai tool ini (BUKAN get_omset_summary) untuk: 'penjualan per bulan', 'omset tiap bulan Jan-Jun', 'bandingkan penjualan 2025 vs 2026', 'ada penurunan berapa persen', 'rekap penjualan beberapa bulan'. get_omset_summary hanya memberi 1 angka total tanpa pecahan bulanan — untuk perbandingan/omset per bulan gunakan tool ini agar angka bulanan akurat (dihitung di server, tidak dikira-kira). Untuk membandingkan, isi date_from2 & date_to2 (periode pembanding). Background beberapa menit, hasil ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "Awal periode utama (B), DD/MM/YYYY. Contoh untuk 2026: 01/01/2026"},
+                "date_to": {"type": "string", "description": "Akhir periode utama (B), DD/MM/YYYY. Contoh: 30/06/2026"},
+                "date_from2": {"type": "string", "description": "Awal periode pembanding (A), DD/MM/YYYY. Contoh untuk 2025: 01/01/2025. Kosongkan kalau hanya 1 periode."},
+                "date_to2": {"type": "string", "description": "Akhir periode pembanding (A), DD/MM/YYYY. Contoh: 30/06/2025. Kosongkan kalau hanya 1 periode."},
+                "label": {"type": "string", "description": "Label periode utama (B), contoh 'Jan-Jun 2026'"},
+                "label2": {"type": "string", "description": "Label periode pembanding (A), contoh 'Jan-Jun 2025'"}
             },
             "required": ["date_from", "date_to"]
         }
@@ -1920,6 +2070,8 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_get_piutang_summary(host, chat_id, tool_input.get("date_from"), tool_input.get("date_to"), tool_input.get("label","Semua Periode"))
                 elif tool_name == "get_omset_summary":
                     result = tool_get_omset_summary(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
+                elif tool_name == "rekap_penjualan_bulanan":
+                    result = tool_rekap_penjualan_bulanan(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("date_from2",""), tool_input.get("date_to2",""), tool_input.get("label",""), tool_input.get("label2",""))
                 elif tool_name == "get_low_stock":
                     result = tool_get_low_stock(host, chat_id, tool_input["keyword"], tool_input.get("threshold", 30))
                 elif tool_name == "get_overdue_customers":
