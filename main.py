@@ -1298,6 +1298,176 @@ def tool_get_profit_periode(host, chat_id, date_from, date_to, label=""):
     return json.dumps({"status": "background_started"})
 
 
+def tool_omset_profit_per_customer(host, chat_id, date_from, date_to, label="", nama_filter=""):
+    """Omset & profit per CUSTOMER dalam periode. Untuk tiap customer: total omset (nilai
+    invoice), modal (HPP dari detailItem), profit (omset−modal), margin %, jumlah invoice.
+    Jika nama_filter diisi, hanya tampilkan customer yang namanya cocok. Profit memakai
+    balanceUnitCost/defStandardCost per item (sama seperti tool profit lain)."""
+    def run():
+        try:
+            from datetime import datetime as _dt
+            import time as _t
+            h = host if host.startswith("http") else f"https://{host}"
+
+            # cache modal per item
+            modal_cache = {}
+            modal_lock = threading.Lock()
+            def get_modal(item_id):
+                if item_id is None: return 0.0
+                with modal_lock:
+                    if item_id in modal_cache: return modal_cache[item_id]
+                modal = 0.0
+                for attempt in range(3):
+                    try:
+                        r2 = requests.get(f"{h}/accurate/api/item/detail.do", headers=accurate_headers(),
+                            params={"id": item_id}, timeout=12)
+                        det = r2.json().get("d", {})
+                        modal = float(det.get("balanceUnitCost") or det.get("defStandardCost") or 0)
+                        break
+                    except Exception:
+                        _t.sleep(0.4 * (attempt + 1))
+                with modal_lock:
+                    modal_cache[item_id] = modal
+                return modal
+
+            # 1. Ambil semua invoice periode
+            all_inv = []
+            page = 1
+            while True:
+                params = {"fields": "id,number,transDate", "sp.pageSize": 200, "sp.page": page,
+                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
+                r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+                data = r.json()
+                if not data.get("s"): break
+                all_inv.extend(data.get("d", []))
+                sp = data.get("sp", {})
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+
+            if not all_inv:
+                send_message(chat_id, f"Tidak ada invoice di {label or (date_from + ' - ' + date_to)}.")
+                return
+
+            send_message(chat_id, f"⏳ Menghitung omset & profit per customer dari {len(all_inv)} invoice... bisa beberapa menit.")
+
+            lock = threading.Lock()
+            # customer -> {"omset":x, "modal":y, "count":n}
+            per_cust = {}
+            gagal = []
+
+            def scan(inv):
+                try:
+                    det = None
+                    for attempt in range(4):
+                        try:
+                            r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(),
+                                params={"id": inv["id"]}, timeout=25)
+                            dj = r2.json()
+                            if dj.get("s") and dj.get("d"):
+                                det = dj["d"]; break
+                        except Exception:
+                            pass
+                        _t.sleep(0.5 * (attempt + 1))
+                    if det is None:
+                        with lock: gagal.append(inv)
+                        return
+
+                    cust = det.get("customer")
+                    cname = None
+                    if isinstance(cust, dict): cname = cust.get("name")
+                    elif isinstance(cust, list) and cust and isinstance(cust[0], dict): cname = cust[0].get("name")
+                    nama = det.get("retailWpName") or det.get("customerName") or cname or "Tanpa Nama"
+
+                    omset_inv = _resolve_nilai_invoice(det)
+                    modal_inv = 0.0
+                    items = det.get("detailItem", [])
+                    if isinstance(items, list):
+                        for item in items:
+                            if not isinstance(item, dict): continue
+                            item_obj = item.get("item", {})
+                            if isinstance(item_obj, list): item_obj = item_obj[0] if item_obj else {}
+                            item_id = item_obj.get("id") if isinstance(item_obj, dict) else None
+                            qty = float(item.get("quantity") or item.get("qty") or 0)
+                            modal_inv += get_modal(item_id) * qty
+
+                    with lock:
+                        if nama not in per_cust:
+                            per_cust[nama] = {"omset": 0.0, "modal": 0.0, "count": 0}
+                        per_cust[nama]["omset"] += omset_inv
+                        per_cust[nama]["modal"] += modal_inv
+                        per_cust[nama]["count"] += 1
+                except Exception:
+                    with lock: gagal.append(inv)
+
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                list(ex.map(scan, all_inv))
+            # retry yang gagal, worker lebih sedikit
+            if gagal:
+                ulang = list(gagal); gagal.clear()
+                with ThreadPoolExecutor(max_workers=2) as ex:
+                    list(ex.map(scan, ulang))
+
+            if not per_cust:
+                send_message(chat_id, "❌ Tidak ada data customer terbaca.")
+                return
+
+            # filter nama kalau diminta
+            baris = []
+            for nama, v in per_cust.items():
+                if nama_filter and nama_filter.strip().lower() not in nama.lower():
+                    continue
+                profit = v["omset"] - v["modal"]
+                margin = (profit / v["omset"] * 100) if v["omset"] > 0 else 0
+                baris.append({"nama": nama, "omset": v["omset"], "modal": v["modal"],
+                              "profit": profit, "margin": margin, "count": v["count"]})
+
+            if not baris:
+                send_message(chat_id, f"Tidak ada customer cocok dengan '{nama_filter}' di periode ini.")
+                return
+
+            baris.sort(key=lambda x: x["omset"], reverse=True)
+
+            judul = label or f"{date_from} - {date_to}"
+            tot_omset = sum(x["omset"] for x in baris)
+            tot_modal = sum(x["modal"] for x in baris)
+            tot_profit = tot_omset - tot_modal
+            tot_margin = (tot_profit / tot_omset * 100) if tot_omset > 0 else 0
+
+            head = f"📊 *Omset & Profit per Customer - {judul}*\n\n"
+            head += f"{len(baris)} customer | {sum(x['count'] for x in baris)} invoice\n"
+            head += f"Total omset: Rp {tot_omset:,.0f}\n"
+            head += f"Total modal (HPP): Rp {tot_modal:,.0f}\n"
+            head += f"Total profit: Rp {tot_profit:,.0f} (margin {tot_margin:.1f}%)\n"
+            if gagal:
+                head += f"_({len(gagal)} invoice gagal dibaca, tidak masuk hitungan)_\n"
+            head += "\n_Diurutkan dari omset terbesar._"
+            send_message(chat_id, head)
+
+            blok = []
+            for i, c in enumerate(baris, 1):
+                blok.append(
+                    f"━━━━━━━━━━\n{i}. *{c['nama']}*\n"
+                    f"   🧾 {c['count']} invoice\n"
+                    f"   💰 Omset: Rp {c['omset']:,.0f}\n"
+                    f"   📦 Modal: Rp {c['modal']:,.0f}\n"
+                    f"   📈 Profit: Rp {c['profit']:,.0f} (margin {c['margin']:.1f}%)"
+                )
+                if len(blok) >= 10:
+                    send_message(chat_id, "\n".join(blok)); blok = []
+            if blok:
+                send_message(chat_id, "\n".join(blok))
+
+            send_message(chat_id, "_Modal = HPP (balanceUnitCost) per item × qty. Profit = omset − modal. Invoice tanpa item (mis. jasa) modalnya 0, jadi profit = omset._")
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal hitung omset/profit per customer: {str(e)[:150]}")
+            print(f"[OMSET PROFIT CUSTOMER ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
+
+
 def tool_rekap_bulanan(host, chat_id, date_from, date_to, label=""):
     def run():
         try:
@@ -1657,6 +1827,20 @@ TOOLS = [
                 "date_from": {"type": "string", "description": "DD/MM/YYYY"},
                 "date_to": {"type": "string", "description": "DD/MM/YYYY"},
                 "label": {"type": "string", "description": "Label periode, contoh 'Juni 2026'"}
+            },
+            "required": ["date_from", "date_to"]
+        }
+    },
+    {
+        "name": "omset_profit_per_customer",
+        "description": "Hitung OMSET dan PROFIT per CUSTOMER dalam satu periode (1 bulan atau 1 tahun). Untuk tiap customer: total omset, modal (HPP), profit (omset−modal), margin %, jumlah invoice — diurutkan dari omset terbesar. WAJIB pakai tool ini untuk 'omset per customer', 'profit tiap pelanggan', 'customer mana yang paling untung', 'omset dan profit customer X'. Kalau user tanya SATU customer tertentu, isi nama_filter dengan nama itu. Background beberapa menit (buka detail tiap invoice + ambil modal item), hasil ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD/MM/YYYY"},
+                "date_to": {"type": "string", "description": "DD/MM/YYYY"},
+                "label": {"type": "string", "description": "Label periode, contoh 'Juli 2026' atau 'Tahun 2026'"},
+                "nama_filter": {"type": "string", "description": "Opsional. Nama customer tertentu untuk difilter. Kosongkan untuk semua customer."}
             },
             "required": ["date_from", "date_to"]
         }
@@ -2100,6 +2284,8 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_get_sales_per_salesman(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "get_product_profit":
                     result = tool_get_product_profit(host, chat_id, tool_input["keyword"], tool_input["date_from"], tool_input["date_to"])
+                elif tool_name == "omset_profit_per_customer":
+                    result = tool_omset_profit_per_customer(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""), tool_input.get("nama_filter",""))
                 elif tool_name == "cek_bukti_bayar":
                     result = tool_cek_bukti_bayar(host, chat_id, tool_input["nomor_invoice"])
                 elif tool_name == "cek_bukti_bayar_massal":
