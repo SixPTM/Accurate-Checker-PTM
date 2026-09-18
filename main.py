@@ -1637,6 +1637,159 @@ def tool_invoice_profit_terendah(host, chat_id, date_from, date_to, label="", to
     return json.dumps({"status": "background_started"})
 
 
+def tool_invoice_profit_tertinggi(host, chat_id, date_from, date_to, label="", top_n=20):
+    """Cari INVOICE dengan profit paling TINGGI dalam periode. Profit per invoice =
+    omset invoice − modal (HPP balanceUnitCost × qty tiap item). Diurutkan dari profit
+    terbesar. Menampilkan nomor invoice, customer, omset, modal, profit, margin %."""
+    def run():
+        try:
+            import time as _t
+            h = host if host.startswith("http") else f"https://{host}"
+
+            # cache modal per item
+            modal_cache = {}
+            modal_lock = threading.Lock()
+            def get_modal(item_id):
+                if item_id is None: return 0.0
+                with modal_lock:
+                    if item_id in modal_cache: return modal_cache[item_id]
+                modal = 0.0
+                for attempt in range(3):
+                    try:
+                        r2 = requests.get(f"{h}/accurate/api/item/detail.do", headers=accurate_headers(),
+                            params={"id": item_id}, timeout=12)
+                        det = r2.json().get("d", {})
+                        modal = float(det.get("balanceUnitCost") or det.get("defStandardCost") or 0)
+                        break
+                    except Exception:
+                        _t.sleep(0.4 * (attempt + 1))
+                with modal_lock:
+                    modal_cache[item_id] = modal
+                return modal
+
+            # 1. Ambil semua invoice periode
+            all_inv = []
+            page = 1
+            while True:
+                params = {"fields": "id,number,transDate", "sp.pageSize": 200, "sp.page": page,
+                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
+                r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+                data = r.json()
+                if not data.get("s"): break
+                all_inv.extend(data.get("d", []))
+                sp = data.get("sp", {})
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+
+            if not all_inv:
+                send_message(chat_id, f"Tidak ada invoice di {label or (date_from + ' - ' + date_to)}.")
+                return
+
+            send_message(chat_id, f"⏳ Menghitung profit {len(all_inv)} invoice untuk cari yang tertinggi... bisa beberapa menit.")
+
+            lock = threading.Lock()
+            hasil = []
+            gagal = []
+
+            def scan(inv):
+                try:
+                    det = None
+                    for attempt in range(4):
+                        try:
+                            r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(),
+                                params={"id": inv["id"]}, timeout=25)
+                            dj = r2.json()
+                            if dj.get("s") and dj.get("d"):
+                                det = dj["d"]; break
+                        except Exception:
+                            pass
+                        _t.sleep(0.5 * (attempt + 1))
+                    if det is None:
+                        with lock: gagal.append(inv)
+                        return
+
+                    cust = det.get("customer")
+                    cname = None
+                    if isinstance(cust, dict): cname = cust.get("name")
+                    elif isinstance(cust, list) and cust and isinstance(cust[0], dict): cname = cust[0].get("name")
+                    nama = det.get("retailWpName") or det.get("customerName") or cname or "Tanpa Nama"
+
+                    omset = _resolve_nilai_invoice(det)
+                    modal = 0.0
+                    items = det.get("detailItem", [])
+                    if isinstance(items, list):
+                        for item in items:
+                            if not isinstance(item, dict): continue
+                            item_obj = item.get("item", {})
+                            if isinstance(item_obj, list): item_obj = item_obj[0] if item_obj else {}
+                            item_id = item_obj.get("id") if isinstance(item_obj, dict) else None
+                            qty = float(item.get("quantity") or item.get("qty") or 0)
+                            modal += get_modal(item_id) * qty
+
+                    profit = omset - modal
+                    margin = (profit / omset * 100) if omset > 0 else 0
+                    with lock:
+                        hasil.append({"number": det.get("number") or inv.get("number"),
+                                      "cust": nama, "omset": omset, "modal": modal,
+                                      "profit": profit, "margin": margin})
+                except Exception:
+                    with lock: gagal.append(inv)
+
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                list(ex.map(scan, all_inv))
+            if gagal:
+                ulang = list(gagal); gagal.clear()
+                with ThreadPoolExecutor(max_workers=2) as ex:
+                    list(ex.map(scan, ulang))
+
+            if not hasil:
+                send_message(chat_id, "❌ Tidak ada data profit terbaca.")
+                return
+
+            # untuk profit TERTINGGI, invoice tanpa modal (HPP 0) sengaja DIKECUALIKAN
+            # karena profit-nya = omset penuh (tidak akurat) dan akan menutupi yang asli
+            dgn_modal = [x for x in hasil if x["modal"] > 0]
+            tanpa_modal = [x for x in hasil if x["modal"] <= 0]
+
+            dasar = dgn_modal if dgn_modal else hasil
+            dasar.sort(key=lambda x: x["profit"], reverse=True)  # profit terbesar di atas
+            tampil = dasar[:top_n]
+
+            judul = label or f"{date_from} - {date_to}"
+            head = f"📈 *Invoice Profit Tertinggi - {judul}*\n\n"
+            head += f"Dihitung: {len(hasil)} invoice"
+            if tanpa_modal:
+                head += f" ({len(tanpa_modal)} invoice tanpa modal/HPP dikecualikan dari daftar ini)"
+            head += f"\nMenampilkan {len(tampil)} invoice dengan profit terbesar."
+            if gagal:
+                head += f"\n_({len(gagal)} invoice gagal dibaca)_"
+            send_message(chat_id, head)
+
+            blok = []
+            for i, x in enumerate(tampil, 1):
+                tanda = "🟢" if x["margin"] >= 30 else ("🟡" if x["margin"] >= 10 else "🟠")
+                blok.append(
+                    f"━━━━━━━━━━\n{i}. {tanda} *{x['number']}* — {x['cust']}\n"
+                    f"   💰 Omset: Rp {x['omset']:,.0f}\n"
+                    f"   📦 Modal: Rp {x['modal']:,.0f}\n"
+                    f"   📈 Profit: Rp {x['profit']:,.0f} (margin {x['margin']:.1f}%)"
+                )
+                if len(blok) >= 10:
+                    send_message(chat_id, "\n".join(blok)); blok = []
+            if blok:
+                send_message(chat_id, "\n".join(blok))
+
+            send_message(chat_id, "🟢 margin ≥30% | 🟡 margin 10–30% | 🟠 margin <10%\n_Profit = omset − modal (HPP per item × qty). Invoice tanpa HPP di master item dikecualikan agar tidak salah terlihat untung besar._")
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal cari invoice profit tertinggi: {str(e)[:150]}")
+            print(f"[INVOICE PROFIT TERTINGGI ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
+
+
 def tool_rekap_bulanan(host, chat_id, date_from, date_to, label=""):
     def run():
         try:
@@ -2024,6 +2177,20 @@ TOOLS = [
                 "date_to": {"type": "string", "description": "DD/MM/YYYY"},
                 "label": {"type": "string", "description": "Label periode, contoh 'Juli 2026'"},
                 "top_n": {"type": "integer", "description": "Berapa invoice profit terendah yang ditampilkan. Default 20."}
+            },
+            "required": ["date_from", "date_to"]
+        }
+    },
+    {
+        "name": "invoice_profit_tertinggi",
+        "description": "Cari INVOICE dengan PROFIT paling TINGGI dalam periode. Profit per invoice = harga jual di invoice (omset) DIKURANGI harga beli/modal (HPP tiap item × qty). Diurutkan dari profit terbesar di atas. Menampilkan nomor invoice, customer, omset, modal, profit, margin %. WAJIB pakai tool ini untuk 'invoice mana yang profitnya paling tinggi', 'invoice paling untung', 'invoice dengan keuntungan terbesar', 'profit tertinggi dari modal dikurangi invoice'. Kebalikan dari invoice_profit_terendah. Beda dengan omset_profit_per_customer (per customer) dan get_product_profit (per produk). Background beberapa menit, hasil ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD/MM/YYYY"},
+                "date_to": {"type": "string", "description": "DD/MM/YYYY"},
+                "label": {"type": "string", "description": "Label periode, contoh 'Juli 2026'"},
+                "top_n": {"type": "integer", "description": "Berapa invoice profit tertinggi yang ditampilkan. Default 20."}
             },
             "required": ["date_from", "date_to"]
         }
@@ -2471,6 +2638,8 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_omset_profit_per_customer(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""), tool_input.get("nama_filter",""))
                 elif tool_name == "invoice_profit_terendah":
                     result = tool_invoice_profit_terendah(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""), tool_input.get("top_n", 20))
+                elif tool_name == "invoice_profit_tertinggi":
+                    result = tool_invoice_profit_tertinggi(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""), tool_input.get("top_n", 20))
                 elif tool_name == "cek_bukti_bayar":
                     result = tool_cek_bukti_bayar(host, chat_id, tool_input["nomor_invoice"])
                 elif tool_name == "cek_bukti_bayar_massal":
