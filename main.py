@@ -6012,9 +6012,9 @@ def debug_invoice():
 # =====================================================================
 # SYNC SKU dari Accurate -> Supabase (tambahan untuk sistem Request Barang)
 # =====================================================================
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
-SYNC_SECRET = os.environ.get("SYNC_SECRET", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
+SYNC_SECRET = os.environ.get("SYNC_SECRET", "").strip()
 
 
 def _sb_headers():
@@ -6068,6 +6068,11 @@ def simpan_sku_ke_supabase(rows):
     """Upsert ke tabel sku_master berdasarkan kode_sku."""
     if not rows:
         return 0
+    # buang kode_sku duplikat (ambil kemunculan terakhir) agar tidak bentrok saat upsert
+    unik = {}
+    for row in rows:
+        unik[row["kode_sku"]] = row
+    rows = list(unik.values())
     url = f"{SUPABASE_URL}/rest/v1/sku_master?on_conflict=kode_sku"
     r = requests.post(url, headers=_sb_headers(), json=rows, timeout=30)
     if not r.ok:
