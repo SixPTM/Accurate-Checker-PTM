@@ -6092,5 +6092,38 @@ def route_sync_sku():
         return {"ok": False, "error": str(e)}, 500
 
 
+
+# =====================================================================
+# SYNC SKU OTOMATIS — jalan tiap hari jam 06:00 WIB (background thread)
+# =====================================================================
+import time as _time
+
+def _auto_sync_loop():
+    sudah_hari_ini = None
+    while True:
+        try:
+            now = datetime.datetime.utcnow() + datetime.timedelta(hours=7)  # WIB
+            tanggal = now.strftime("%Y-%m-%d")
+            # jalankan sekali saat jam 6 pagi, dan belum jalan hari ini
+            if now.hour == 6 and sudah_hari_ini != tanggal:
+                try:
+                    rows = tarik_semua_sku()
+                    jml = simpan_sku_ke_supabase(rows)
+                    print(f"[auto-sync] {tanggal} berhasil: {jml} SKU")
+                except Exception as e:
+                    print(f"[auto-sync] gagal: {e}")
+                sudah_hari_ini = tanggal
+        except Exception as e:
+            print(f"[auto-sync] error loop: {e}")
+        _time.sleep(600)  # cek tiap 10 menit
+
+# nyalakan thread saat aplikasi start (hanya sekali)
+try:
+    _sync_thread = threading.Thread(target=_auto_sync_loop, daemon=True)
+    _sync_thread.start()
+except Exception as _e:
+    print("gagal start auto-sync:", _e)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
