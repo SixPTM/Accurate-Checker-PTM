@@ -11,6 +11,23 @@ from flask import Flask, request
 
 app = Flask(__name__)
 
+# --- CORS: izinkan web Request Barang (Vercel) memanggil endpoint ini ---
+_ALLOWED_ORIGINS = {
+    "https://requestbarang.vercel.app",
+}
+@app.after_request
+def _tambah_cors(resp):
+    origin = request.headers.get("Origin", "")
+    if origin in _ALLOWED_ORIGINS or origin.endswith(".vercel.app"):
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp
+
+@app.route("/cek-foto", methods=["OPTIONS"])
+def _cek_foto_preflight():
+    return ("", 204)
+
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 ACCURATE_API_TOKEN = os.environ.get("ACCURATE_API_TOKEN")
@@ -6136,6 +6153,79 @@ try:
     threading.Thread(target=_auto_sync_loop, daemon=True).start()
 except Exception as _e:
     print("gagal start auto-sync:", _e)
+
+
+
+# =====================================================================
+# CEK FOTO BARANG (AI hitung qty) — untuk sistem Request Barang
+# AI hanya MEMBANTU hitung; angka final tetap dari konfirmasi manusia.
+# =====================================================================
+def hitung_qty_dari_foto(image_b64, media, qty_invoice, nama_barang):
+    """Kirim foto barang ke Claude vision, minta perkiraan jumlah. Return dict."""
+    import re as _re
+    prompt = (
+        f"Ini foto barang yang baru datang dari supplier. Nama barang: {nama_barang}. "
+        f"Menurut invoice jumlahnya seharusnya {qty_invoice}. "
+        "Tugasmu: PERKIRAKAN berapa jumlah unit barang yang terlihat di foto. "
+        "Kamu hanya membantu; petugas gudang akan tetap menghitung fisik. "
+        "PENTING format jawaban:\n"
+        "Baris 1: HANYA angka perkiraan jumlah (tanpa teks). Kalau tidak yakin sama sekali tulis 0.\n"
+        "Baris 2: tingkat keyakinan dalam persen saja (angka 0-100).\n"
+        "Baris 3: catatan singkat (mis. 'terlihat 3 tumpukan @20, baris belakang tertutup'). "
+        "Jujur kalau sebagian tidak terlihat atau sulit dihitung."
+    )
+    payload = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 400,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": media, "data": image_b64}},
+                {"type": "text", "text": prompt}
+            ]
+        }]
+    }
+    try:
+        r = requests.post("https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json=payload, timeout=45)
+        data = r.json()
+    except Exception as e:
+        return {"qty": 0, "confidence": 0, "catatan": "gagal hubungi AI: " + str(e)}
+    teks = ""
+    for blk in data.get("content", []):
+        if blk.get("type") == "text":
+            teks += blk["text"]
+    baris = [b.strip() for b in teks.strip().split("\n") if b.strip()]
+    def angka(x, default=0):
+        m = _re.search(r"\d+", x.replace(".", "").replace(",", ""))
+        return int(m.group(0)) if m else default
+    qty = angka(baris[0]) if len(baris) > 0 else 0
+    conf = angka(baris[1]) if len(baris) > 1 else 0
+    if conf > 100: conf = 100
+    catatan = " ".join(baris[2:]) if len(baris) > 2 else (baris[-1] if baris else "")
+    return {"qty": qty, "confidence": conf, "catatan": catatan}
+
+
+@app.route("/cek-foto", methods=["POST"])
+def route_cek_foto():
+    if SYNC_SECRET and request.args.get("secret") != SYNC_SECRET:
+        return {"ok": False, "error": "secret salah"}, 403
+    try:
+        body = request.get_json(force=True)
+        image_b64 = body.get("image_b64", "")
+        media = body.get("media", "image/jpeg")
+        qty_invoice = body.get("qty_invoice", 0)
+        nama = body.get("nama_barang", "barang")
+        if not image_b64:
+            return {"ok": False, "error": "tidak ada foto"}, 400
+        # buang prefix data URL kalau ada
+        if "," in image_b64 and image_b64.strip().startswith("data:"):
+            image_b64 = image_b64.split(",", 1)[1]
+        hasil = hitung_qty_dari_foto(image_b64, media, qty_invoice, nama)
+        return {"ok": True, **hasil}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}, 500
 
 
 if __name__ == "__main__":
