@@ -6094,33 +6094,46 @@ def route_sync_sku():
 
 
 # =====================================================================
-# SYNC SKU OTOMATIS — jalan tiap hari jam 06:00 WIB (background thread)
+# SYNC SKU OTOMATIS — tiap hari jam 06:00 WIB (aman walau banyak worker)
+# Pakai file-lock agar hanya SATU worker yang menjalankan sync per hari.
 # =====================================================================
 import time as _time
 
+_SYNC_LOCK_DIR = "/tmp/pm_sync_lock"
+
+def _sudah_sync_hari_ini(tanggal):
+    """True jika sync tanggal ini sudah diklaim worker lain (via file lock)."""
+    try:
+        os.makedirs(_SYNC_LOCK_DIR, exist_ok=True)
+        path = os.path.join(_SYNC_LOCK_DIR, tanggal)
+        # buat file secara eksklusif; kalau sudah ada -> worker lain sudah klaim
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+        return False  # kita yang berhasil klaim
+    except FileExistsError:
+        return True   # worker lain sudah klaim
+    except Exception:
+        return False
+
 def _auto_sync_loop():
-    sudah_hari_ini = None
     while True:
         try:
             now = datetime.datetime.utcnow() + datetime.timedelta(hours=7)  # WIB
             tanggal = now.strftime("%Y-%m-%d")
-            # jalankan sekali saat jam 6 pagi, dan belum jalan hari ini
-            if now.hour == 6 and sudah_hari_ini != tanggal:
-                try:
-                    rows = tarik_semua_sku()
-                    jml = simpan_sku_ke_supabase(rows)
-                    print(f"[auto-sync] {tanggal} berhasil: {jml} SKU")
-                except Exception as e:
-                    print(f"[auto-sync] gagal: {e}")
-                sudah_hari_ini = tanggal
+            if now.hour == 6:
+                if not _sudah_sync_hari_ini(tanggal):
+                    try:
+                        rows = tarik_semua_sku()
+                        jml = simpan_sku_ke_supabase(rows)
+                        print(f"[auto-sync] {tanggal} berhasil: {jml} SKU")
+                    except Exception as e:
+                        print(f"[auto-sync] gagal: {e}")
         except Exception as e:
             print(f"[auto-sync] error loop: {e}")
         _time.sleep(600)  # cek tiap 10 menit
 
-# nyalakan thread saat aplikasi start (hanya sekali)
 try:
-    _sync_thread = threading.Thread(target=_auto_sync_loop, daemon=True)
-    _sync_thread.start()
+    threading.Thread(target=_auto_sync_loop, daemon=True).start()
 except Exception as _e:
     print("gagal start auto-sync:", _e)
 
