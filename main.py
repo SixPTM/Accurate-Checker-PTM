@@ -11,23 +11,6 @@ from flask import Flask, request
 
 app = Flask(__name__)
 
-# --- CORS: izinkan web Request Barang (Vercel) memanggil endpoint ini ---
-_ALLOWED_ORIGINS = {
-    "https://requestbarang.vercel.app",
-}
-@app.after_request
-def _tambah_cors(resp):
-    origin = request.headers.get("Origin", "")
-    if origin in _ALLOWED_ORIGINS or origin.endswith(".vercel.app"):
-        resp.headers["Access-Control-Allow-Origin"] = origin
-        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    return resp
-
-@app.route("/cek-foto", methods=["OPTIONS"])
-def _cek_foto_preflight():
-    return ("", 204)
-
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 ACCURATE_API_TOKEN = os.environ.get("ACCURATE_API_TOKEN")
@@ -672,6 +655,220 @@ def _omset_per_bulan(h, date_from, date_to):
         if page >= sp.get("pageCount", 1): break
         page += 1
     return per_bulan
+
+
+def _omset_profit_per_bulan(h, date_from, date_to, modal_cache=None, modal_lock=None):
+    """Omset + modal (HPP) + profit per bulan (YYYY-MM) untuk satu rentang.
+    Butuh buka DETAIL tiap invoice (untuk detailItem + modal), jadi lebih lambat dari
+    _omset_per_bulan. Kembalikan dict {'YYYY-MM': {'omset':x,'modal':y,'count':n}}.
+    modal_cache/lock bisa dibagikan antar pemanggilan supaya HPP item tidak ditarik ulang."""
+    import time as _t
+    from datetime import datetime as _dt
+    if modal_cache is None: modal_cache = {}
+    if modal_lock is None: modal_lock = threading.Lock()
+
+    def parse_tgl(s):
+        for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+            try: return _dt.strptime((s or "").split(" ")[0], fmt)
+            except: pass
+        return None
+
+    def get_modal(item_id):
+        if item_id is None: return 0.0
+        with modal_lock:
+            if item_id in modal_cache: return modal_cache[item_id]
+        modal = 0.0
+        for attempt in range(3):
+            try:
+                r2 = requests.get(f"{h}/accurate/api/item/detail.do", headers=accurate_headers(),
+                    params={"id": item_id}, timeout=12)
+                det = r2.json().get("d", {})
+                modal = float(det.get("balanceUnitCost") or det.get("defStandardCost") or 0)
+                break
+            except Exception:
+                _t.sleep(0.4 * (attempt + 1))
+        with modal_lock:
+            modal_cache[item_id] = modal
+        return modal
+
+    # ambil semua invoice periode
+    all_inv = []
+    page = 1
+    while True:
+        params = {"fields": "id,number,transDate", "sp.pageSize": 200, "sp.page": page,
+            "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
+        r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+        data = r.json()
+        if not data.get("s"): break
+        all_inv.extend(data.get("d", []))
+        sp = data.get("sp", {})
+        if page >= sp.get("pageCount", 1): break
+        page += 1
+
+    per_bulan = {}
+    lock = threading.Lock()
+    gagal = []
+
+    def scan(inv):
+        try:
+            det = None
+            for attempt in range(4):
+                try:
+                    r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(),
+                        params={"id": inv["id"]}, timeout=25)
+                    dj = r2.json()
+                    if dj.get("s") and dj.get("d"):
+                        det = dj["d"]; break
+                except Exception:
+                    pass
+                _t.sleep(0.5 * (attempt + 1))
+            if det is None:
+                with lock: gagal.append(inv)
+                return
+            tgl = parse_tgl(det.get("transDate") or inv.get("transDate"))
+            if tgl is None: return
+            bkey = tgl.strftime("%Y-%m")
+            omset = _resolve_nilai_invoice(det)
+            modal = 0.0
+            items = det.get("detailItem", [])
+            if isinstance(items, list):
+                for item in items:
+                    if not isinstance(item, dict): continue
+                    item_obj = item.get("item", {})
+                    if isinstance(item_obj, list): item_obj = item_obj[0] if item_obj else {}
+                    item_id = item_obj.get("id") if isinstance(item_obj, dict) else None
+                    qty = float(item.get("quantity") or item.get("qty") or 0)
+                    modal += get_modal(item_id) * qty
+            with lock:
+                per_bulan.setdefault(bkey, {"omset": 0.0, "modal": 0.0, "count": 0})
+                per_bulan[bkey]["omset"] += omset
+                per_bulan[bkey]["modal"] += modal
+                per_bulan[bkey]["count"] += 1
+        except Exception:
+            with lock: gagal.append(inv)
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        list(ex.map(scan, all_inv))
+    if gagal:
+        ulang = list(gagal); gagal.clear()
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            list(ex.map(scan, ulang))
+    return per_bulan
+
+
+def tool_rekap_omset_profit_bulanan(host, chat_id, date_from, date_to, date_from2="", date_to2="", label="", label2=""):
+    """Omset & PROFIT per bulan untuk satu periode; jika periode ke-2 diisi, bandingkan
+    dua tahun bulan-per-bulan. Profit = omset − modal (HPP). Arah naik/turun ditentukan
+    otomatis (tahun lebih baru dibanding tahun lebih lama)."""
+    def run():
+        try:
+            from datetime import datetime as _dt
+            h = host if host.startswith("http") else f"https://{host}"
+            NAMA_BULAN = ["", "Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"]
+            def lbl_bulan(bkey):
+                try:
+                    th, bl = bkey.split("-"); return f"{NAMA_BULAN[int(bl)]} {th}"
+                except: return bkey
+
+            # cache modal dibagikan antar dua periode
+            modal_cache = {}; modal_lock = threading.Lock()
+
+            send_message(chat_id, "⏳ Menghitung omset & profit per bulan (buka detail tiap invoice)... bisa beberapa menit.")
+            pb1 = _omset_profit_per_bulan(h, date_from, date_to, modal_cache, modal_lock)
+            L1 = label or f"{date_from}–{date_to}"
+
+            def baris_bulan(bkey, v):
+                omset = v["omset"]; modal = v["modal"]; profit = omset - modal
+                margin = (profit / omset * 100) if omset > 0 else 0
+                return (f"• {lbl_bulan(bkey)}: omset Rp {omset:,.0f} | profit Rp {profit:,.0f} "
+                        f"(margin {margin:.1f}%)")
+
+            # ===== Mode 1: satu periode =====
+            if not (date_from2 and date_to2):
+                if not pb1:
+                    send_message(chat_id, f"Tidak ada data di {L1}.")
+                    return
+                t_omset = sum(v["omset"] for v in pb1.values())
+                t_modal = sum(v["modal"] for v in pb1.values())
+                t_profit = t_omset - t_modal
+                t_margin = (t_profit / t_omset * 100) if t_omset > 0 else 0
+                msg = f"💰 *Omset & Profit per Bulan — {L1}*\n\n"
+                for bkey in sorted(pb1):
+                    msg += baris_bulan(bkey, pb1[bkey]) + "\n"
+                msg += (f"\n*Total omset: Rp {t_omset:,.0f}*\n"
+                        f"*Total profit: Rp {t_profit:,.0f}* (margin {t_margin:.1f}%)")
+                msg += "\n\n_Profit = omset − modal (HPP). Invoice tanpa HPP di master item, modalnya 0._"
+                send_message(chat_id, msg)
+                return
+
+            # ===== Mode 2: banding dua periode =====
+            pb2 = _omset_profit_per_bulan(h, date_from2, date_to2, modal_cache, modal_lock)
+            L2 = label2 or f"{date_from2}–{date_to2}"
+
+            def tgl_awal(s):
+                for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                    try: return _dt.strptime((s or "").split(" ")[0], fmt)
+                    except: pass
+                return _dt(1900, 1, 1)
+
+            # tentukan LAMA (lebih awal) & BARU (lebih akhir) otomatis
+            if tgl_awal(date_from) <= tgl_awal(date_from2):
+                pb_lama, L_lama = pb1, L1
+                pb_baru, L_baru = pb2, L2
+            else:
+                pb_lama, L_lama = pb2, L2
+                pb_baru, L_baru = pb1, L1
+
+            b_lama = sorted(pb_lama); b_baru = sorted(pb_baru)
+            n = max(len(b_lama), len(b_baru))
+
+            def prof(v): return v["omset"] - v["modal"]
+            tot_om_lama = sum(v["omset"] for v in pb_lama.values())
+            tot_pr_lama = sum(prof(v) for v in pb_lama.values())
+            tot_om_baru = sum(v["omset"] for v in pb_baru.values())
+            tot_pr_baru = sum(prof(v) for v in pb_baru.values())
+
+            msg = f"📊 *Omset & Profit per Bulan*\n{L_baru} dibanding {L_lama}\n\n"
+            for i in range(n):
+                kL = b_lama[i] if i < len(b_lama) else None
+                kB = b_baru[i] if i < len(b_baru) else None
+                omL = pb_lama[kL]["omset"] if kL else 0.0
+                prL = prof(pb_lama[kL]) if kL else 0.0
+                omB = pb_baru[kB]["omset"] if kB else 0.0
+                prB = prof(pb_baru[kB]) if kB else 0.0
+                nama = (lbl_bulan(kB).split()[0] if kB else (lbl_bulan(kL).split()[0] if kL else f"Bln {i+1}"))
+                def arah(vl, vb):
+                    if vl > 0:
+                        p = (vb - vl) / vl * 100
+                        if p < -0.05: return f"🔻{abs(p):.0f}%"
+                        if p > 0.05: return f"🔺{p:.0f}%"
+                        return "➡️"
+                    return "🆕" if vb else "—"
+                msg += (f"*{nama}*\n"
+                        f"  omset: {omL:,.0f} → {omB:,.0f}  {arah(omL,omB)}\n"
+                        f"  profit: {prL:,.0f} → {prB:,.0f}  {arah(prL,prB)}\n\n")
+            send_message(chat_id, msg)
+
+            def arah_txt(vl, vb):
+                if vl > 0:
+                    p = (vb - vl) / vl * 100
+                    if p < -0.05: return f"🔻 TURUN {abs(p):.1f}%"
+                    if p > 0.05: return f"🔺 NAIK {p:.1f}%"
+                    return "➡️ SAMA"
+                return "—"
+            m2 = "🧾 *Ringkasan Total*\n\n"
+            m2 += f"*Omset:*\n  {L_lama}: Rp {tot_om_lama:,.0f}\n  {L_baru}: Rp {tot_om_baru:,.0f}\n  {arah_txt(tot_om_lama, tot_om_baru)}\n\n"
+            m2 += f"*Profit:*\n  {L_lama}: Rp {tot_pr_lama:,.0f}\n  {L_baru}: Rp {tot_pr_baru:,.0f}\n  {arah_txt(tot_pr_lama, tot_pr_baru)}\n"
+            m2 += f"\n_{L_baru} dibanding {L_lama}. Profit = omset − modal (HPP)._"
+            send_message(chat_id, m2)
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal rekap omset & profit bulanan: {str(e)[:150]}")
+            print(f"[REKAP OMSET PROFIT BULANAN ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
 
 
 def tool_rekap_penjualan_bulanan(host, chat_id, date_from, date_to, date_from2="", date_to2="", label="", label2=""):
@@ -2124,6 +2321,22 @@ TOOLS = [
         }
     },
     {
+        "name": "rekap_omset_profit_bulanan",
+        "description": "Rekap OMSET DAN PROFIT per BULAN, bisa membandingkan dua tahun bulan-per-bulan. Untuk tiap bulan: omset, profit (omset−modal HPP), margin %. WAJIB pakai tool ini (BUKAN rekap_penjualan_bulanan) kalau user minta OMSET DAN PROFIT sekaligus per bulan, contoh 'omset dan profit per bulan 2025 dan 2026', 'keuntungan tiap bulan bandingkan dua tahun', 'omset profit bulanan'. Beda: rekap_penjualan_bulanan hanya omset (cepat); tool ini juga menghitung profit (buka detail tiap invoice, lebih lambat). Untuk bandingkan dua tahun, isi date_from2 & date_to2. Arah naik/turun ditentukan otomatis. Background beberapa menit, hasil ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "Awal periode utama, DD/MM/YYYY. Contoh 2026: 01/01/2026"},
+                "date_to": {"type": "string", "description": "Akhir periode utama, DD/MM/YYYY. Contoh: 31/12/2026"},
+                "date_from2": {"type": "string", "description": "Awal periode pembanding, DD/MM/YYYY. Contoh 2025: 01/01/2025. Kosongkan kalau 1 periode."},
+                "date_to2": {"type": "string", "description": "Akhir periode pembanding, DD/MM/YYYY. Contoh: 31/12/2025. Kosongkan kalau 1 periode."},
+                "label": {"type": "string", "description": "Label periode utama, contoh '2026'"},
+                "label2": {"type": "string", "description": "Label periode pembanding, contoh '2025'"}
+            },
+            "required": ["date_from", "date_to"]
+        }
+    },
+    {
         "name": "get_low_stock",
         "description": "Cek produk kategori tertentu yang stoknya MENIPIS (di bawah ambang batas, default 30 pcs). Untuk 'stok tumbler yang menipis', 'tumbler di bawah 30 pcs', 'mug yang hampir habis'. User HARUS sebut kategori produk (tumbler, mug, banner, dll). Background, hasil dikirim ke Telegram.",
         "input_schema": {
@@ -2641,6 +2854,8 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_get_omset_summary(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "rekap_penjualan_bulanan":
                     result = tool_rekap_penjualan_bulanan(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("date_from2",""), tool_input.get("date_to2",""), tool_input.get("label",""), tool_input.get("label2",""))
+                elif tool_name == "rekap_omset_profit_bulanan":
+                    result = tool_rekap_omset_profit_bulanan(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("date_from2",""), tool_input.get("date_to2",""), tool_input.get("label",""), tool_input.get("label2",""))
                 elif tool_name == "get_low_stock":
                     result = tool_get_low_stock(host, chat_id, tool_input["keyword"], tool_input.get("threshold", 30))
                 elif tool_name == "get_overdue_customers":
@@ -6023,209 +6238,6 @@ def debug_invoice():
         }
     except Exception as e:
         return {"error": str(e)}, 500
-
-
-
-# =====================================================================
-# SYNC SKU dari Accurate -> Supabase (tambahan untuk sistem Request Barang)
-# =====================================================================
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
-SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
-SYNC_SECRET = os.environ.get("SYNC_SECRET", "").strip()
-
-
-def _sb_headers():
-    return {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-        "Content-Type": "application/json",
-        "Prefer": "resolution=merge-duplicates",
-    }
-
-
-def tarik_semua_sku():
-    """Ambil semua barang stok (INVENTORY) dari Accurate."""
-    host = get_host()
-    hasil = []
-    page = 1
-    while True:
-        r = requests.get(
-            f"{host}/accurate/api/item/list.do",
-            headers=accurate_headers(),
-            params={
-                "fields": "id,no,name,unit,itemType,lastPurchasePrice",
-                "sp.pageSize": 100,
-                "sp.page": page,
-            },
-            timeout=20,
-        )
-        data = r.json()
-        rows = data.get("d", []) or []
-        for it in rows:
-            if it.get("itemType") and it.get("itemType") != "INVENTORY":
-                continue
-            if not it.get("no"):
-                continue
-            hasil.append({
-                "accurate_id": str(it.get("id")) if it.get("id") is not None else None,
-                "kode_sku": it.get("no"),
-                "nama_barang": it.get("name"),
-                "satuan": it.get("unit"),
-                "harga_beli_akhir": it.get("lastPurchasePrice"),
-                "aktif": True,
-            })
-        sp = data.get("sp", {}) or {}
-        if page >= sp.get("pageCount", 1):
-            break
-        page += 1
-    return hasil
-
-
-def simpan_sku_ke_supabase(rows):
-    """Upsert ke tabel sku_master berdasarkan kode_sku."""
-    if not rows:
-        return 0
-    # buang kode_sku duplikat (ambil kemunculan terakhir) agar tidak bentrok saat upsert
-    unik = {}
-    for row in rows:
-        unik[row["kode_sku"]] = row
-    rows = list(unik.values())
-    url = f"{SUPABASE_URL}/rest/v1/sku_master?on_conflict=kode_sku"
-    r = requests.post(url, headers=_sb_headers(), json=rows, timeout=30)
-    if not r.ok:
-        raise RuntimeError(f"Supabase error {r.status_code}: {r.text}")
-    return len(rows)
-
-
-@app.route("/sync-sku")
-def route_sync_sku():
-    if SYNC_SECRET and request.args.get("secret") != SYNC_SECRET:
-        return {"ok": False, "error": "secret salah"}, 403
-    try:
-        rows = tarik_semua_sku()
-        jml = simpan_sku_ke_supabase(rows)
-        return {"ok": True, "jumlah_sku": jml}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}, 500
-
-
-
-# =====================================================================
-# SYNC SKU OTOMATIS — tiap hari jam 06:00 WIB (aman walau banyak worker)
-# Pakai file-lock agar hanya SATU worker yang menjalankan sync per hari.
-# =====================================================================
-import time as _time
-
-_SYNC_LOCK_DIR = "/tmp/pm_sync_lock"
-
-def _sudah_sync_hari_ini(tanggal):
-    """True jika sync tanggal ini sudah diklaim worker lain (via file lock)."""
-    try:
-        os.makedirs(_SYNC_LOCK_DIR, exist_ok=True)
-        path = os.path.join(_SYNC_LOCK_DIR, tanggal)
-        # buat file secara eksklusif; kalau sudah ada -> worker lain sudah klaim
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.close(fd)
-        return False  # kita yang berhasil klaim
-    except FileExistsError:
-        return True   # worker lain sudah klaim
-    except Exception:
-        return False
-
-def _auto_sync_loop():
-    while True:
-        try:
-            now = datetime.datetime.utcnow() + datetime.timedelta(hours=7)  # WIB
-            tanggal = now.strftime("%Y-%m-%d")
-            if now.hour == 6:
-                if not _sudah_sync_hari_ini(tanggal):
-                    try:
-                        rows = tarik_semua_sku()
-                        jml = simpan_sku_ke_supabase(rows)
-                        print(f"[auto-sync] {tanggal} berhasil: {jml} SKU")
-                    except Exception as e:
-                        print(f"[auto-sync] gagal: {e}")
-        except Exception as e:
-            print(f"[auto-sync] error loop: {e}")
-        _time.sleep(600)  # cek tiap 10 menit
-
-try:
-    threading.Thread(target=_auto_sync_loop, daemon=True).start()
-except Exception as _e:
-    print("gagal start auto-sync:", _e)
-
-
-
-# =====================================================================
-# CEK FOTO BARANG (AI hitung qty) — untuk sistem Request Barang
-# AI hanya MEMBANTU hitung; angka final tetap dari konfirmasi manusia.
-# =====================================================================
-def hitung_qty_dari_foto(image_b64, media, qty_invoice, nama_barang):
-    """Kirim foto barang ke Claude vision, minta perkiraan jumlah. Return dict."""
-    import re as _re
-    prompt = (
-        f"Ini foto barang yang baru datang dari supplier. Nama barang: {nama_barang}. "
-        f"Menurut invoice jumlahnya seharusnya {qty_invoice}. "
-        "Tugasmu: PERKIRAKAN berapa jumlah unit barang yang terlihat di foto. "
-        "Kamu hanya membantu; petugas gudang akan tetap menghitung fisik. "
-        "PENTING format jawaban:\n"
-        "Baris 1: HANYA angka perkiraan jumlah (tanpa teks). Kalau tidak yakin sama sekali tulis 0.\n"
-        "Baris 2: tingkat keyakinan dalam persen saja (angka 0-100).\n"
-        "Baris 3: catatan singkat (mis. 'terlihat 3 tumpukan @20, baris belakang tertutup'). "
-        "Jujur kalau sebagian tidak terlihat atau sulit dihitung."
-    )
-    payload = {
-        "model": "claude-sonnet-4-6",
-        "max_tokens": 400,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": media, "data": image_b64}},
-                {"type": "text", "text": prompt}
-            ]
-        }]
-    }
-    try:
-        r = requests.post("https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json=payload, timeout=45)
-        data = r.json()
-    except Exception as e:
-        return {"qty": 0, "confidence": 0, "catatan": "gagal hubungi AI: " + str(e)}
-    teks = ""
-    for blk in data.get("content", []):
-        if blk.get("type") == "text":
-            teks += blk["text"]
-    baris = [b.strip() for b in teks.strip().split("\n") if b.strip()]
-    def angka(x, default=0):
-        m = _re.search(r"\d+", x.replace(".", "").replace(",", ""))
-        return int(m.group(0)) if m else default
-    qty = angka(baris[0]) if len(baris) > 0 else 0
-    conf = angka(baris[1]) if len(baris) > 1 else 0
-    if conf > 100: conf = 100
-    catatan = " ".join(baris[2:]) if len(baris) > 2 else (baris[-1] if baris else "")
-    return {"qty": qty, "confidence": conf, "catatan": catatan}
-
-
-@app.route("/cek-foto", methods=["POST"])
-def route_cek_foto():
-    if SYNC_SECRET and request.args.get("secret") != SYNC_SECRET:
-        return {"ok": False, "error": "secret salah"}, 403
-    try:
-        body = request.get_json(force=True)
-        image_b64 = body.get("image_b64", "")
-        media = body.get("media", "image/jpeg")
-        qty_invoice = body.get("qty_invoice", 0)
-        nama = body.get("nama_barang", "barang")
-        if not image_b64:
-            return {"ok": False, "error": "tidak ada foto"}, 400
-        # buang prefix data URL kalau ada
-        if "," in image_b64 and image_b64.strip().startswith("data:"):
-            image_b64 = image_b64.split(",", 1)[1]
-        hasil = hitung_qty_dari_foto(image_b64, media, qty_invoice, nama)
-        return {"ok": True, **hasil}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}, 500
 
 
 if __name__ == "__main__":
