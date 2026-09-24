@@ -2440,7 +2440,7 @@ TOOLS = [
     },
     {
         "name": "get_produk_terlaku",
-        "description": "Rekap SEMUA produk terlaku/terjual di satu rentang tanggal, diurutkan dari qty tertinggi ke terendah, semua kategori sekaligus (tidak perlu keyword). Untuk 'produk terlaku hari ini', 'produk paling laris minggu ini', 'urutkan semua produk dari penjualan tertinggi'. Cocok untuk rentang pendek (harian/mingguan) karena cepat. Untuk rentang panjang sebulan penuh boleh juga tapi lebih lama. Background, hasil dikirim ke Telegram.",
+        "description": "Rekap produk TERLARIS DAN paling TIDAK LAKU di satu rentang tanggal, semua kategori sekaligus (tidak perlu keyword). Menampilkan 4 daftar: terlaris by nilai Rp, terlaris by qty, paling tidak laku by qty, paling tidak laku by nilai. Untuk 'produk apa yang laku tahun 2025', 'produk yang tidak laku 2026', 'produk terlaris dan terlemah', 'produk paling laris', 'produk kurang laku'. Untuk membandingkan dua tahun, jalankan dua kali (2025 saja, lalu 2026 saja). CATATAN: yang ditampilkan hanya produk yang TERJUAL di periode itu; produk 0 penjualan tidak muncul (pakai cek stok untuk itu). Background beberapa menit untuk rentang setahun, hasil ke Telegram.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -4145,18 +4145,44 @@ def tool_get_produk_terlaku(host, chat_id, date_from, date_to, label=""):
                 send_message(chat_id, f"❌ Tidak ada produk terjual di periode {date_from} - {date_to}.")
                 return
 
-            # Urutkan dari NILAI Rp tertinggi (nominal terbesar)
-            urut = sorted(nilai_map.items(), key=lambda x: x[1], reverse=True)
             total_qty = sum(qty_map.values())
             total_nilai = sum(nilai_map.values())
             judul = label or f"{date_from} - {date_to}"
-            msg = f"🏆 *Produk Terlaku (by Nominal) - {judul}*\n"
-            msg += f"Dari {len(all_ids)} invoice | Total {total_qty:,.0f} pcs | Rp {total_nilai:,.0f}\n\n"
-            for i, (nm, nilai) in enumerate(urut, 1):
-                qty = qty_map.get(nm, 0)
-                jml_inv = inv_map.get(nm, 0)
-                msg += f"{i}. {nm}: Rp {nilai:,.0f} | {qty:,.0f} pcs | {jml_inv} inv\n"
-            send_message(chat_id, msg)
+            N = 15  # berapa produk ditampilkan tiap daftar
+
+            head = f"📦 *Produk Terlaris & Terlemah - {judul}*\n"
+            head += f"{len(qty_map)} jenis produk | dari {len(all_ids)} invoice\n"
+            head += f"Total: {total_qty:,.0f} pcs | Rp {total_nilai:,.0f}"
+            send_message(chat_id, head)
+
+            def kirim_daftar(judul_blok, urutan):
+                msg = judul_blok + "\n"
+                for i, nm in enumerate(urutan, 1):
+                    q = qty_map.get(nm, 0)
+                    v = nilai_map.get(nm, 0)
+                    inv = inv_map.get(nm, 0)
+                    msg += f"{i}. {nm}\n   {q:,.0f} pcs | Rp {v:,.0f} | {inv} inv\n"
+                send_message(chat_id, msg)
+
+            # 1) TERLARIS by NILAI Rp
+            by_nilai = [nm for nm, _ in sorted(nilai_map.items(), key=lambda x: x[1], reverse=True)]
+            kirim_daftar(f"🏆 *TERLARIS by Nilai Rp (top {N})*", by_nilai[:N])
+
+            # 2) TERLARIS by QTY
+            by_qty = [nm for nm, _ in sorted(qty_map.items(), key=lambda x: x[1], reverse=True)]
+            kirim_daftar(f"🏆 *TERLARIS by Qty terjual (top {N})*", by_qty[:N])
+
+            # 3) TERLEMAH by QTY (paling sedikit terjual) — hanya produk yang memang terjual di periode ini
+            terjual = [nm for nm in qty_map if qty_map[nm] > 0]
+            bottom_qty = sorted(terjual, key=lambda nm: qty_map[nm])
+            kirim_daftar(f"🐢 *PALING TIDAK LAKU by Qty (bawah {N})*", bottom_qty[:N])
+
+            # 4) TERLEMAH by NILAI Rp
+            terjual_v = [nm for nm in nilai_map if nilai_map[nm] > 0]
+            bottom_nilai = sorted(terjual_v, key=lambda nm: nilai_map[nm])
+            kirim_daftar(f"🐢 *PALING TIDAK LAKU by Nilai Rp (bawah {N})*", bottom_nilai[:N])
+
+            send_message(chat_id, "_'Paling tidak laku' = produk yang TERJUAL tapi paling sedikit di periode ini. Produk yang 0 penjualan tidak muncul di sini (tidak ada di invoice). Untuk cek stok yang menumpuk tak terjual, pakai cek stok._")
         except Exception as e:
             send_message(chat_id, f"❌ Gagal rekap produk: {str(e)[:120]}")
             print(f"[PRODUK TERLAKU ERROR] {e}")
