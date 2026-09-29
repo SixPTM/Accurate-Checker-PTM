@@ -2981,6 +2981,52 @@ def debug_item():
         return {"error": str(e)}, 500
 
 
+@app.route("/debug-customer", methods=["GET"])
+def debug_customer():
+    """Lihat SEMUA field yang mungkin menyimpan nama customer dari sebuah invoice.
+    Pakai: /debug-customer?number=SI.2026.09.00023"""
+    try:
+        host = get_host()
+        if not host: return {"error": "Gagal dapat host"}, 500
+        h = host if host.startswith("http") else f"https://{host}"
+        number = request.args.get("number", "").strip()
+        if not number:
+            return {"error": "Kasih ?number=SI.2026.09.00023"}, 400
+        # cari id invoice dari nomor
+        r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(),
+            params={"fields": "id,number", "filter.keywords": number, "sp.pageSize": 5}, timeout=20)
+        lst = r.json().get("d", [])
+        cocok = next((x for x in lst if isinstance(x, dict) and (x.get("number") or "").upper() == number.upper()), None)
+        if not cocok and lst: cocok = lst[0]
+        if not cocok:
+            return {"error": f"Invoice {number} tidak ditemukan"}, 404
+        iid = cocok.get("id")
+        r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do", headers=accurate_headers(),
+            params={"id": iid}, timeout=25)
+        det = r2.json().get("d", {})
+        if not isinstance(det, dict):
+            return {"error": "Detail tidak terbaca"}, 500
+        # kumpulkan semua field yang mengandung 'name'/'customer'/'bill'/'ship' + objek customer
+        kandidat = {}
+        for k, v in det.items():
+            kl = k.lower()
+            if any(x in kl for x in ("name", "customer", "bill", "ship", "retail", "contact", "person")):
+                # ringkas objek besar
+                if isinstance(v, (dict, list)):
+                    kandidat[k] = v
+                else:
+                    kandidat[k] = v
+        return {
+            "number": det.get("number"),
+            "id": iid,
+            "yang_dibaca_bot_sekarang": det.get("retailWpName") or det.get("customerName") or "(kosong)",
+            "field_kandidat_nama": kandidat,
+            "customer_obj": det.get("customer"),
+        }
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {str(e)[:300]}"}, 500
+
+
 def get_drive_token():
     """Ambil access token Google Drive dari service account (JWT flow)."""
     from google.oauth2 import service_account
