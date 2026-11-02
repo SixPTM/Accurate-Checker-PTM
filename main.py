@@ -2384,6 +2384,19 @@ TOOLS = [
         }
     },
     {
+        "name": "komisi_sales",
+        "description": "Hitung KOMISI per sales dari omset LUNAS dalam satu periode (bulanan). Tier FLAT: di bawah 50jt = tidak dapat, 50–150jt = 0,5%, 150jt ke atas = 0,75% (seluruh omset dikali tarif tier yang dicapai). Otomatis MENGECUALIKAN invoice tanpa nama sales, invoice bernama karyawan (…PTM), dan Six Pratama (pemilik). Juga menampilkan jumlah & nilai invoice BELUM LUNAS tiap sales sebagai info (tidak menambah komisi). WAJIB pakai tool ini untuk 'hitung komisi sales', 'komisi per sales bulan ini', 'berapa komisi masing-masing sales', 'komisi sales dan invoice belum lunas'. Background beberapa menit, hasil ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD/MM/YYYY, awal bulan"},
+                "date_to": {"type": "string", "description": "DD/MM/YYYY, akhir bulan"},
+                "label": {"type": "string", "description": "Label periode, contoh 'November 2026'"}
+            },
+            "required": ["date_from", "date_to"]
+        }
+    },
+    {
         "name": "omset_profit_per_customer",
         "description": "Hitung OMSET dan PROFIT per CUSTOMER dalam satu periode (1 bulan atau 1 tahun). Untuk tiap customer: total omset, modal (HPP), profit (omset−modal), margin %, jumlah invoice — diurutkan dari omset terbesar. WAJIB pakai tool ini untuk 'omset per customer', 'profit tiap pelanggan', 'customer mana yang paling untung', 'omset dan profit customer X'. Kalau user tanya SATU customer tertentu, isi nama_filter dengan nama itu. Background beberapa menit (buka detail tiap invoice + ambil modal item), hasil ke Telegram.",
         "input_schema": {
@@ -2864,6 +2877,8 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_get_unpaid_invoices_detail(host, chat_id, tool_input.get("date_from"), tool_input.get("date_to"), tool_input.get("label",""))
                 elif tool_name == "get_sales_per_salesman":
                     result = tool_get_sales_per_salesman(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
+                elif tool_name == "komisi_sales":
+                    result = tool_komisi_sales(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "get_product_profit":
                     result = tool_get_product_profit(host, chat_id, tool_input["keyword"], tool_input["date_from"], tool_input["date_to"])
                 elif tool_name == "omset_profit_per_customer":
@@ -3724,7 +3739,8 @@ def _sales_dikecualikan(nama):
 def tool_komisi_sales(host, chat_id, date_from, date_to, label=""):
     """Hitung KOMISI per sales dari omset LUNAS periode. Tier FLAT: <50jt=0%,
     50-150jt=0.5%, >=150jt=0.75% (seluruh omset x tarif). Mengecualikan invoice
-    tanpa nama sales, nama karyawan (…PTM), dan Six Pratama (pemilik)."""
+    tanpa nama sales, nama karyawan (…PTM), dan Six Pratama (pemilik). Juga menampilkan
+    jumlah & nilai invoice BELUM LUNAS tiap sales sebagai info (tidak menambah komisi)."""
     def run():
         try:
             h = host if host.startswith("http") else f"https://{host}"
@@ -3743,7 +3759,8 @@ def tool_komisi_sales(host, chat_id, date_from, date_to, label=""):
                 if page >= sp.get("pageCount", 1): break
                 page += 1
 
-            # 2. Saring hanya invoice LUNAS
+            # 2. Pisah invoice LUNAS vs BELUM LUNAS (komisi hanya dari lunas;
+            #    belum lunas ditampilkan sebagai info tambahan per sales)
             def nilai_list(inv):
                 for k in ("totalAmount", "salesAmount", "subTotal"):
                     try:
@@ -3752,37 +3769,44 @@ def tool_komisi_sales(host, chat_id, date_from, date_to, label=""):
                     except: pass
                 return 0.0
 
-            lunas = []
+            semua = []
             for inv in all_inv:
                 if not isinstance(inv, dict): continue
                 status = (inv.get("statusName") or "").upper()
-                if "LUNAS" in status or "PAID" in status or "CLOSE" in status:
-                    lunas.append({"id": inv.get("id"), "number": inv.get("number"), "nilai": nilai_list(inv)})
+                is_lunas = ("LUNAS" in status or "PAID" in status or "CLOSE" in status)
+                if inv.get("id") is None: continue
+                semua.append({"id": inv.get("id"), "number": inv.get("number"),
+                              "nilai": nilai_list(inv), "lunas": is_lunas})
 
-            if not lunas:
-                send_message(chat_id, f"Tidak ada invoice LUNAS di {label or (date_from + ' - ' + date_to)}.")
+            if not semua:
+                send_message(chat_id, f"Tidak ada invoice di {label or (date_from + ' - ' + date_to)}.")
                 return
 
-            send_message(chat_id, f"⏳ Menghitung komisi dari {len(lunas)} invoice lunas (baca nama sales tiap invoice)... bisa beberapa menit.")
+            n_lunas = sum(1 for x in semua if x["lunas"])
+            send_message(chat_id, f"⏳ Menghitung komisi dari {n_lunas} invoice lunas (+ cek {len(semua)-n_lunas} belum lunas)... baca nama sales tiap invoice, bisa beberapa menit.")
 
-            # 3. Baca nama sales tiap invoice lunas (dari detail)
-            valid = [x for x in lunas if x.get("id") is not None]
-            id_sales = _baca_nama_sales_massal(h, valid, max_workers=3)
+            # 3. Baca nama sales SEMUA invoice (lunas & belum) dari detail
+            id_sales = _baca_nama_sales_massal(h, semua, max_workers=3)
 
-            # 4. Akumulasi omset per sales, kecualikan yang tidak dapat komisi
+            # 4. Akumulasi per sales. Omset komisi HANYA dari lunas; belum lunas dicatat terpisah.
             per_sales = {}
             dikecualikan_total = 0.0
             dikecualikan_inv = 0
-            for x in valid:
+            for x in semua:
                 nama = id_sales.get(x["id"]) or "Tanpa Sales"
                 if _sales_dikecualikan(nama):
-                    dikecualikan_total += x["nilai"]
-                    dikecualikan_inv += 1
+                    if x["lunas"]:
+                        dikecualikan_total += x["nilai"]
+                        dikecualikan_inv += 1
                     continue
                 if nama not in per_sales:
-                    per_sales[nama] = {"omset": 0.0, "count": 0}
-                per_sales[nama]["omset"] += x["nilai"]
-                per_sales[nama]["count"] += 1
+                    per_sales[nama] = {"omset": 0.0, "count": 0, "belum_nilai": 0.0, "belum_count": 0}
+                if x["lunas"]:
+                    per_sales[nama]["omset"] += x["nilai"]
+                    per_sales[nama]["count"] += 1
+                else:
+                    per_sales[nama]["belum_nilai"] += x["nilai"]
+                    per_sales[nama]["belum_count"] += 1
 
             if not per_sales:
                 send_message(chat_id, "Tidak ada sales yang memenuhi syarat komisi (semua invoice tanpa sales / karyawan / Six Pratama).")
@@ -3793,15 +3817,18 @@ def tool_komisi_sales(host, chat_id, date_from, date_to, label=""):
             for nama, d in per_sales.items():
                 persen, komisi = _tarif_komisi(d["omset"])
                 baris.append({"nama": nama, "omset": d["omset"], "count": d["count"],
-                              "persen": persen, "komisi": komisi})
+                              "persen": persen, "komisi": komisi,
+                              "belum_nilai": d["belum_nilai"], "belum_count": d["belum_count"]})
             baris.sort(key=lambda x: x["omset"], reverse=True)
 
             judul = label or f"{date_from} - {date_to}"
             total_komisi = sum(b["komisi"] for b in baris)
             total_omset_komisi = sum(b["omset"] for b in baris)
+            total_belum = sum(b["belum_nilai"] for b in baris)
+            total_belum_inv = sum(b["belum_count"] for b in baris)
 
             msg = f"💵 *Komisi Sales - {judul}*\n"
-            msg += f"_(dari omset LUNAS; tanpa sales / karyawan PTM / Six Pratama dikecualikan)_\n\n"
+            msg += f"_(komisi dari omset LUNAS; tanpa sales / karyawan PTM / Six Pratama dikecualikan)_\n\n"
             for i, b in enumerate(baris, 1):
                 if b["persen"] == 0:
                     ket = "❌ belum dapat (di bawah 50jt)"
@@ -3809,12 +3836,17 @@ def tool_komisi_sales(host, chat_id, date_from, date_to, label=""):
                     ket = f"✅ {b['persen']}% → Rp {b['komisi']:,.0f}"
                 msg += (f"{i}. *{b['nama']}*\n"
                         f"   Omset lunas: Rp {b['omset']:,.0f} ({b['count']} inv)\n"
-                        f"   Komisi: {ket}\n\n")
+                        f"   Komisi: {ket}\n")
+                if b["belum_count"]:
+                    msg += f"   ⏳ Belum lunas: {b['belum_count']} inv (Rp {b['belum_nilai']:,.0f}) — tidak dihitung komisi\n"
+                msg += "\n"
             msg += f"━━━━━━━━━━\n*TOTAL KOMISI: Rp {total_komisi:,.0f}*\n"
-            msg += f"Total omset kena hitung: Rp {total_omset_komisi:,.0f}\n"
+            msg += f"Total omset lunas kena hitung: Rp {total_omset_komisi:,.0f}\n"
+            if total_belum_inv:
+                msg += f"Total belum lunas (sales kena komisi): {total_belum_inv} inv | Rp {total_belum:,.0f}\n"
             if dikecualikan_inv:
-                msg += f"_Dikecualikan: {dikecualikan_inv} invoice (Rp {dikecualikan_total:,.0f}) — tanpa sales / karyawan / Six Pratama._\n"
-            msg += "\n_Tier (flat): <50jt=0% | 50–150jt=0,5% | ≥150jt=0,75%. Seluruh omset × tarif._"
+                msg += f"_Dikecualikan dari omset: {dikecualikan_inv} invoice lunas (Rp {dikecualikan_total:,.0f}) — tanpa sales / karyawan / Six Pratama._\n"
+            msg += "\n_Tier (flat): <50jt=0% | 50–150jt=0,5% | ≥150jt=0,75%. Seluruh omset lunas × tarif. Invoice belum lunas hanya info, tidak menambah komisi._"
             send_message(chat_id, msg)
         except Exception as e:
             send_message(chat_id, f"❌ Gagal hitung komisi sales: {str(e)[:150]}")
@@ -3824,6 +3856,9 @@ def tool_komisi_sales(host, chat_id, date_from, date_to, label=""):
     t.daemon = True
     t.start()
     return json.dumps({"status": "background_started"})
+
+
+def tool_penjualan_sales_per_bulan(host, chat_id, date_from, date_to, label="", nama_sales=None):
     def run():
         try:
             h = host if host.startswith("http") else f"https://{host}"
