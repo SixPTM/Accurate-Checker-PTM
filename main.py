@@ -173,7 +173,7 @@ def tool_get_invoices(host, params):
                 if isinstance(customer, dict): cname = customer.get("name")
                 elif isinstance(customer, list) and customer: cname = customer[0].get("name") if isinstance(customer[0], dict) else str(customer[0])
                 else: cname = None
-                inv["customerName"] = _resolve_customer_name(detail)
+                inv["customerName"] = detail.get("retailWpName") or detail.get("customerName") or cname or "Tanpa Nama"
                 inv["outstanding"] = detail.get("primeOwing") or 0
                 inv["totalAmount"] = _resolve_nilai_invoice(detail) or inv.get("totalAmount") or 0
             # Enrich semua invoice yang terambil bila jumlahnya wajar (mis. harian/mingguan).
@@ -476,7 +476,7 @@ def tool_get_unpaid_customers_background(host, chat_id, date_from=None, date_to=
                     if isinstance(customer, dict): cname = customer.get("name")
                     elif isinstance(customer, list) and customer: cname = customer[0].get("name") if isinstance(customer[0], dict) else None
                     else: cname = None
-                    name = _resolve_customer_name(detail)
+                    name = detail.get("retailWpName") or detail.get("customerName") or cname or "Tanpa Nama"
                     if name:
                         with lock:
                             if name not in customer_data: customer_data[name] = {"count": 0, "total": 0.0, "outstanding": 0.0}
@@ -1128,7 +1128,7 @@ def tool_get_overdue_customers(host, chat_id, days=30):
                     if isinstance(customer, dict): cname = customer.get("name")
                     elif isinstance(customer, list) and customer: cname = customer[0].get("name") if isinstance(customer[0], dict) else None
                     else: cname = None
-                    name = _resolve_customer_name(detail)
+                    name = detail.get("retailWpName") or detail.get("customerName") or cname or "Tanpa Nama"
                     hari_lewat = (today - due).days
                     if name:
                         with lock:
@@ -1202,7 +1202,7 @@ def tool_get_unpaid_invoices_detail(host, chat_id, date_from=None, date_to=None,
                     if isinstance(customer, dict): cname = customer.get("name")
                     elif isinstance(customer, list) and customer: cname = customer[0].get("name") if isinstance(customer[0], dict) else None
                     else: cname = None
-                    name = _resolve_customer_name(detail)
+                    name = detail.get("retailWpName") or detail.get("customerName") or cname or "Tanpa Nama"
                     number = detail.get("number") or inv.get("number") or "-"
                     with lock:
                         rows.append({"number": number, "name": name, "nilai": owing})
@@ -1605,7 +1605,7 @@ def tool_omset_profit_per_customer(host, chat_id, date_from, date_to, label="", 
                     cname = None
                     if isinstance(cust, dict): cname = cust.get("name")
                     elif isinstance(cust, list) and cust and isinstance(cust[0], dict): cname = cust[0].get("name")
-                    nama = _resolve_customer_name(det)
+                    nama = det.get("retailWpName") or det.get("customerName") or cname or "Tanpa Nama"
 
                     omset_inv = _resolve_nilai_invoice(det)
                     modal_inv = 0.0
@@ -1773,7 +1773,7 @@ def tool_invoice_profit_terendah(host, chat_id, date_from, date_to, label="", to
                     cname = None
                     if isinstance(cust, dict): cname = cust.get("name")
                     elif isinstance(cust, list) and cust and isinstance(cust[0], dict): cname = cust[0].get("name")
-                    nama = _resolve_customer_name(det)
+                    nama = det.get("retailWpName") or det.get("customerName") or cname or "Tanpa Nama"
 
                     omset = _resolve_nilai_invoice(det)
                     modal = 0.0
@@ -1926,7 +1926,7 @@ def tool_invoice_profit_tertinggi(host, chat_id, date_from, date_to, label="", t
                     cname = None
                     if isinstance(cust, dict): cname = cust.get("name")
                     elif isinstance(cust, list) and cust and isinstance(cust[0], dict): cname = cust[0].get("name")
-                    nama = _resolve_customer_name(det)
+                    nama = det.get("retailWpName") or det.get("customerName") or cname or "Tanpa Nama"
 
                     omset = _resolve_nilai_invoice(det)
                     modal = 0.0
@@ -3696,7 +3696,134 @@ def tool_sales_tinggi_rendah_per_bulan(host, chat_id, date_from, date_to, label=
     return json.dumps({"status": "background_started"})
 
 
-def tool_penjualan_sales_per_bulan(host, chat_id, date_from, date_to, label="", nama_sales=None):
+def _tarif_komisi(omset):
+    """Tier komisi FLAT: seluruh omset dikali tarif tier yang dicapai.
+    0-50jt: 0% | 50-150jt: 0.5% | 150jt ke atas: 0.75%. Kembalikan (persen, komisi_rp)."""
+    if omset < 50_000_000:
+        p = 0.0
+    elif omset < 150_000_000:
+        p = 0.5
+    else:
+        p = 0.75
+    return p, omset * p / 100.0
+
+
+def _sales_dikecualikan(nama):
+    """True kalau sales ini TIDAK dapat komisi: tanpa sales, nama karyawan internal
+    (mengandung 'PTM'), atau Six Pratama (pemilik). Dibandingkan case-insensitive."""
+    n = (nama or "").strip().lower()
+    if not n or n in ("tanpa sales", "-"):
+        return True
+    if "ptm" in n:           # HILMAN PTM, BAGAS PTM, RIDWAN PTM, dll
+        return True
+    if "six pratama" in n or n == "six" or "pratama talenta" in n:
+        return True
+    return False
+
+
+def tool_komisi_sales(host, chat_id, date_from, date_to, label=""):
+    """Hitung KOMISI per sales dari omset LUNAS periode. Tier FLAT: <50jt=0%,
+    50-150jt=0.5%, >=150jt=0.75% (seluruh omset x tarif). Mengecualikan invoice
+    tanpa nama sales, nama karyawan (…PTM), dan Six Pratama (pemilik)."""
+    def run():
+        try:
+            h = host if host.startswith("http") else f"https://{host}"
+            # 1. Ambil semua invoice periode + status (untuk saring LUNAS) + nilai
+            all_inv = []
+            page = 1
+            while True:
+                params = {"fields": "id,number,totalAmount,salesAmount,subTotal,statusName",
+                    "sp.pageSize": 200, "sp.page": page,
+                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
+                r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+                data = r.json()
+                if not data.get("s"): break
+                all_inv.extend(data.get("d", []))
+                sp = data.get("sp", {})
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+
+            # 2. Saring hanya invoice LUNAS
+            def nilai_list(inv):
+                for k in ("totalAmount", "salesAmount", "subTotal"):
+                    try:
+                        fv = float(inv.get(k))
+                        if fv != 0: return fv
+                    except: pass
+                return 0.0
+
+            lunas = []
+            for inv in all_inv:
+                if not isinstance(inv, dict): continue
+                status = (inv.get("statusName") or "").upper()
+                if "LUNAS" in status or "PAID" in status or "CLOSE" in status:
+                    lunas.append({"id": inv.get("id"), "number": inv.get("number"), "nilai": nilai_list(inv)})
+
+            if not lunas:
+                send_message(chat_id, f"Tidak ada invoice LUNAS di {label or (date_from + ' - ' + date_to)}.")
+                return
+
+            send_message(chat_id, f"⏳ Menghitung komisi dari {len(lunas)} invoice lunas (baca nama sales tiap invoice)... bisa beberapa menit.")
+
+            # 3. Baca nama sales tiap invoice lunas (dari detail)
+            valid = [x for x in lunas if x.get("id") is not None]
+            id_sales = _baca_nama_sales_massal(h, valid, max_workers=3)
+
+            # 4. Akumulasi omset per sales, kecualikan yang tidak dapat komisi
+            per_sales = {}
+            dikecualikan_total = 0.0
+            dikecualikan_inv = 0
+            for x in valid:
+                nama = id_sales.get(x["id"]) or "Tanpa Sales"
+                if _sales_dikecualikan(nama):
+                    dikecualikan_total += x["nilai"]
+                    dikecualikan_inv += 1
+                    continue
+                if nama not in per_sales:
+                    per_sales[nama] = {"omset": 0.0, "count": 0}
+                per_sales[nama]["omset"] += x["nilai"]
+                per_sales[nama]["count"] += 1
+
+            if not per_sales:
+                send_message(chat_id, "Tidak ada sales yang memenuhi syarat komisi (semua invoice tanpa sales / karyawan / Six Pratama).")
+                return
+
+            # 5. Hitung komisi flat per sales, urut omset terbesar
+            baris = []
+            for nama, d in per_sales.items():
+                persen, komisi = _tarif_komisi(d["omset"])
+                baris.append({"nama": nama, "omset": d["omset"], "count": d["count"],
+                              "persen": persen, "komisi": komisi})
+            baris.sort(key=lambda x: x["omset"], reverse=True)
+
+            judul = label or f"{date_from} - {date_to}"
+            total_komisi = sum(b["komisi"] for b in baris)
+            total_omset_komisi = sum(b["omset"] for b in baris)
+
+            msg = f"💵 *Komisi Sales - {judul}*\n"
+            msg += f"_(dari omset LUNAS; tanpa sales / karyawan PTM / Six Pratama dikecualikan)_\n\n"
+            for i, b in enumerate(baris, 1):
+                if b["persen"] == 0:
+                    ket = "❌ belum dapat (di bawah 50jt)"
+                else:
+                    ket = f"✅ {b['persen']}% → Rp {b['komisi']:,.0f}"
+                msg += (f"{i}. *{b['nama']}*\n"
+                        f"   Omset lunas: Rp {b['omset']:,.0f} ({b['count']} inv)\n"
+                        f"   Komisi: {ket}\n\n")
+            msg += f"━━━━━━━━━━\n*TOTAL KOMISI: Rp {total_komisi:,.0f}*\n"
+            msg += f"Total omset kena hitung: Rp {total_omset_komisi:,.0f}\n"
+            if dikecualikan_inv:
+                msg += f"_Dikecualikan: {dikecualikan_inv} invoice (Rp {dikecualikan_total:,.0f}) — tanpa sales / karyawan / Six Pratama._\n"
+            msg += "\n_Tier (flat): <50jt=0% | 50–150jt=0,5% | ≥150jt=0,75%. Seluruh omset × tarif._"
+            send_message(chat_id, msg)
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal hitung komisi sales: {str(e)[:150]}")
+            print(f"[KOMISI SALES ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
     def run():
         try:
             h = host if host.startswith("http") else f"https://{host}"
@@ -3812,7 +3939,7 @@ def _baca_nama_customer_massal(h, invoices, max_workers=3):
         if isinstance(customer, dict): cname = customer.get("name")
         elif isinstance(customer, list) and customer: cname = customer[0].get("name") if isinstance(customer[0], dict) else None
         else: cname = None
-        nama = _resolve_customer_name(detail)
+        nama = detail.get("retailWpName") or detail.get("customerName") or cname or "Tanpa Nama"
         with lock:
             id_cust[iid] = nama
         _t.sleep(0.05)
@@ -3973,7 +4100,7 @@ def tool_get_customer_reguler(host, chat_id, date_from, date_to, keyword="chromo
                     if isinstance(customer, dict): cname = customer.get("name")
                     elif isinstance(customer, list) and customer: cname = customer[0].get("name") if isinstance(customer[0], dict) else None
                     else: cname = None
-                    nama = _resolve_customer_name(det)
+                    nama = det.get("retailWpName") or det.get("customerName") or cname or "Tanpa Nama"
                     tgl = parse_tgl(det.get("transDate") or inv.get("transDate"))
                     if tgl is None: return
                     bulan_key = tgl.strftime("%Y-%m")
@@ -4120,7 +4247,7 @@ def tool_get_customer_terbanyak(host, chat_id, date_from, date_to, label="", uru
                 if isinstance(customer, dict): cname = customer.get("name")
                 elif isinstance(customer, list) and customer: cname = customer[0].get("name") if isinstance(customer[0], dict) else None
                 else: cname = None
-                nama = _resolve_customer_name(detail)
+                nama = detail.get("retailWpName") or detail.get("customerName") or cname or "Tanpa Nama"
                 # Nilai invoice dari detail: totalAmount paling akurat, fallback ke subTotal
                 nilai = _resolve_nilai_invoice(detail)
                 catat(nama, nilai)
@@ -4321,7 +4448,7 @@ def tool_piutang_per_sales(host, chat_id, date_from, date_to, label=""):
                 if isinstance(customer, dict): cname = customer.get("name")
                 elif isinstance(customer, list) and customer: cname = customer[0].get("name") if isinstance(customer[0], dict) else None
                 else: cname = None
-                cust = _resolve_customer_name(detail)
+                cust = detail.get("retailWpName") or detail.get("customerName") or cname or "Tanpa Nama"
                 due = detail.get("dueDate") or inv.get("dueDate") or ""
                 tgl = detail.get("transDate") or inv.get("transDate") or ""
                 umur = None
@@ -4898,7 +5025,7 @@ def tool_bukti_belum_ada_per_sales(host, chat_id, date_from, date_to, label="", 
                     return
                 b["sales"] = _resolve_sales_name(detail)
                 b["nilai"] = _resolve_nilai_invoice(detail)
-                b["cust"] = _resolve_customer_name(detail)
+                b["cust"] = detail.get("retailWpName") or detail.get("customerName") or "Tanpa Nama"
             with ThreadPoolExecutor(max_workers=8) as ex:
                 list(ex.map(ambil_sales, belum))
 
@@ -5042,7 +5169,7 @@ def tool_hitung_lunas_metode(host, chat_id, date_from, date_to, label=""):
                 cname = None
                 if isinstance(cust, dict): cname = cust.get("name")
                 elif isinstance(cust, list) and cust and isinstance(cust[0], dict): cname = cust[0].get("name")
-                item["customer"] = _resolve_customer_name(detail)
+                item["customer"] = detail.get("retailWpName") or detail.get("customerName") or cname or "Tanpa Nama"
                 item["sales"] = _resolve_sales_name(detail)
 
                 histori = _parse_receipt_history(detail.get("receiptHistory"))
@@ -5448,7 +5575,7 @@ def _lunas_dengan_metode(h, date_from, date_to):
         cname = None
         if isinstance(cust, dict): cname = cust.get("name")
         elif isinstance(cust, list) and cust and isinstance(cust[0], dict): cname = cust[0].get("name")
-        item["cust"] = _resolve_customer_name(detail)
+        item["cust"] = detail.get("retailWpName") or detail.get("customerName") or cname or "Tanpa Nama"
         tgl = parse_tgl(detail.get("transDate") or item.get("transDate"))
         item["tgl"] = tgl
         item["bulan"] = tgl.strftime("%Y-%m") if tgl else "????-??"
@@ -5708,7 +5835,7 @@ def tool_customer_rutin(host, chat_id, date_from, date_to, min_order=5, label=""
                 cname = None
                 if isinstance(cust, dict): cname = cust.get("name")
                 elif isinstance(cust, list) and cust and isinstance(cust[0], dict): cname = cust[0].get("name")
-                item["cust"] = (lambda n: None if n == "Tanpa Nama" else n)(_resolve_customer_name(detail))
+                item["cust"] = detail.get("retailWpName") or detail.get("customerName") or cname or None
                 item["sales"] = _resolve_sales_name(detail)
                 tgl = parse_tgl(detail.get("transDate") or item.get("transDate"))
                 item["tgl"] = tgl
