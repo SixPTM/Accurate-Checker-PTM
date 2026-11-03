@@ -2385,7 +2385,7 @@ TOOLS = [
     },
     {
         "name": "komisi_sales",
-        "description": "Hitung KOMISI per sales dari omset LUNAS dalam satu periode (bulanan). Tier FLAT: di bawah 50jt = tidak dapat, 50–150jt = 0,5%, 150jt ke atas = 0,75% (seluruh omset dikali tarif tier yang dicapai). Otomatis MENGECUALIKAN invoice tanpa nama sales, invoice bernama karyawan (…PTM), dan Six Pratama (pemilik). Juga menampilkan jumlah & nilai invoice BELUM LUNAS tiap sales sebagai info (tidak menambah komisi). WAJIB pakai tool ini untuk 'hitung komisi sales', 'komisi per sales bulan ini', 'berapa komisi masing-masing sales', 'komisi sales dan invoice belum lunas'. Background beberapa menit, hasil ke Telegram.",
+        "description": "Hitung KOMISI per sales berdasarkan TANGGAL PEMBAYARAN (uang masuk) dalam satu bulan. Invoice yang LUNAS PENUH dan dibayarnya di bulan itu masuk komisi — TERMASUK invoice bulan sebelumnya yang baru lunas bulan ini. Tier FLAT: di bawah 50jt = tidak dapat, 50–150jt = 0,5%, 150jt ke atas = 0,75% (seluruh omset dibayar dikali tarif). Otomatis MENGECUALIKAN invoice tanpa nama sales, karyawan (…PTM), dan Six Pratama. Juga menampilkan info invoice belum lunas per sales. WAJIB pakai tool ini untuk 'hitung komisi sales', 'komisi per sales bulan ini', 'berapa komisi masing-masing sales'. Background beberapa menit (cek pembayaran tiap invoice), hasil ke Telegram.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -3723,6 +3723,53 @@ def _tarif_komisi(omset):
     return p, omset * p / 100.0
 
 
+def _tanggal_lunas_dari_detail(detail):
+    """Dari detail invoice, kembalikan tanggal invoice jadi LUNAS PENUH sebagai objek
+    datetime, atau None kalau belum lunas / tidak terbaca. Caranya: ambil tanggal
+    pembayaran TERAKHIR yang APPROVED & bukan void dari receiptHistory. Kalau status
+    invoice bukan lunas, kembalikan None (karena belum lunas penuh).
+    Fallback: field lastPaymentDate kalau receiptHistory tidak terbaca."""
+    import ast as _ast
+    from datetime import datetime as _dt
+    if not isinstance(detail, dict):
+        return None
+    # harus lunas penuh dulu
+    status = (detail.get("statusName") or "").upper()
+    if not ("LUNAS" in status or "PAID" in status or "CLOSE" in status):
+        return None
+
+    def parse_dt(s):
+        s = (s or "").split(" ")[0]  # ambil tanggal saja (buang jam)
+        for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+            try: return _dt.strptime(s, fmt)
+            except: pass
+        return None
+
+    raw = detail.get("receiptHistory")
+    histori = []
+    if isinstance(raw, list):
+        histori = raw
+    elif isinstance(raw, str) and raw:
+        try:
+            val = _ast.literal_eval(raw)
+            histori = val if isinstance(val, list) else []
+        except (ValueError, SyntaxError):
+            histori = []
+
+    tgl_terakhir = None
+    for hh_ in histori:
+        if not isinstance(hh_, dict): continue
+        if hh_.get("historyIsVoidReceipt"): continue
+        if hh_.get("approvalStatus") not in (None, "APPROVED"): continue
+        t = parse_dt(hh_.get("historyDateTime"))
+        if t and (tgl_terakhir is None or t > tgl_terakhir):
+            tgl_terakhir = t
+    if tgl_terakhir:
+        return tgl_terakhir
+    # fallback: lastPaymentDate
+    return parse_dt(detail.get("lastPaymentDate"))
+
+
 def _sales_dikecualikan(nama):
     """True kalau sales ini TIDAK dapat komisi: tanpa sales, nama karyawan internal
     (mengandung 'PTM'), atau Six Pratama (pemilik). Dibandingkan case-insensitive."""
@@ -3737,20 +3784,43 @@ def _sales_dikecualikan(nama):
 
 
 def tool_komisi_sales(host, chat_id, date_from, date_to, label=""):
-    """Hitung KOMISI per sales dari omset LUNAS periode. Tier FLAT: <50jt=0%,
-    50-150jt=0.5%, >=150jt=0.75% (seluruh omset x tarif). Mengecualikan invoice
-    tanpa nama sales, nama karyawan (…PTM), dan Six Pratama (pemilik). Juga menampilkan
-    jumlah & nilai invoice BELUM LUNAS tiap sales sebagai info (tidak menambah komisi)."""
+    """Hitung KOMISI per sales berdasarkan TANGGAL PEMBAYARAN (uang masuk), bukan tanggal
+    invoice. Invoice yang LUNAS PENUH dan tanggal bayarnya di [date_from, date_to] masuk
+    komisi bulan itu — termasuk invoice bulan lalu yang baru lunas. Tier FLAT: <50jt=0%,
+    50-150jt=0.5%, >=150jt=0.75%. Mengecualikan tanpa sales / karyawan (…PTM) / Six Pratama."""
     def run():
         try:
+            import time as _t
+            from datetime import datetime as _dt
             h = host if host.startswith("http") else f"https://{host}"
-            # 1. Ambil semua invoice periode + status (untuk saring LUNAS) + nilai
+
+            def parse_d(s):
+                for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                    try: return _dt.strptime((s or "").split(" ")[0], fmt)
+                    except: pass
+                return None
+
+            d_awal = parse_d(date_from)
+            d_akhir = parse_d(date_to)
+            if not d_awal or not d_akhir:
+                send_message(chat_id, "❌ Tanggal tidak valid.")
+                return
+
+            # Rentang invoice DIPERLUAS 4 bulan ke belakang: invoice lama yang baru lunas
+            # bulan ini ikut terbaca. (dibayar bln ini, tapi invoice-nya bisa bulan2 lalu)
+            bulan_mundur = 4
+            y = d_awal.year; m = d_awal.month - bulan_mundur
+            while m <= 0: m += 12; y -= 1
+            from_lebar = f"01/{m:02d}/{y}"
+            to_lebar = date_to
+
+            # 1. Ambil invoice rentang lebar (butuh id + status; nilai & detail dari detail)
             all_inv = []
             page = 1
             while True:
-                params = {"fields": "id,number,totalAmount,salesAmount,subTotal,statusName",
+                params = {"fields": "id,number,totalAmount,salesAmount,subTotal,statusName,transDate",
                     "sp.pageSize": 200, "sp.page": page,
-                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
+                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": from_lebar, "filter.transDate.val[1]": to_lebar}
                 r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
                 data = r.json()
                 if not data.get("s"): break
@@ -3759,8 +3829,9 @@ def tool_komisi_sales(host, chat_id, date_from, date_to, label=""):
                 if page >= sp.get("pageCount", 1): break
                 page += 1
 
-            # 2. Pisah invoice LUNAS vs BELUM LUNAS (komisi hanya dari lunas;
-            #    belum lunas ditampilkan sebagai info tambahan per sales)
+            # hanya invoice LUNAS yang perlu dibuka detailnya (yang belum lunas tidak mungkin
+            # masuk komisi tanggal-bayar). Tapi untuk info "belum lunas", kita hitung yang
+            # transDate-nya di bulan target saja.
             def nilai_list(inv):
                 for k in ("totalAmount", "salesAmount", "subTotal"):
                     try:
@@ -3769,84 +3840,128 @@ def tool_komisi_sales(host, chat_id, date_from, date_to, label=""):
                     except: pass
                 return 0.0
 
-            semua = []
+            lunas_ids = []
+            belum_bulan_ini = []  # untuk info: invoice belum lunas yg transDate di bulan target
             for inv in all_inv:
-                if not isinstance(inv, dict): continue
+                if not isinstance(inv, dict) or inv.get("id") is None: continue
                 status = (inv.get("statusName") or "").upper()
                 is_lunas = ("LUNAS" in status or "PAID" in status or "CLOSE" in status)
-                if inv.get("id") is None: continue
-                semua.append({"id": inv.get("id"), "number": inv.get("number"),
-                              "nilai": nilai_list(inv), "lunas": is_lunas})
+                if is_lunas:
+                    lunas_ids.append({"id": inv.get("id"), "number": inv.get("number"), "nilai_list": nilai_list(inv)})
+                else:
+                    td = parse_d(inv.get("transDate"))
+                    if td and d_awal <= td <= d_akhir:
+                        belum_bulan_ini.append({"id": inv.get("id"), "number": inv.get("number"), "nilai": nilai_list(inv)})
 
-            if not semua:
-                send_message(chat_id, f"Tidak ada invoice di {label or (date_from + ' - ' + date_to)}.")
+            if not lunas_ids:
+                send_message(chat_id, f"Tidak ada invoice lunas di rentang pengecekan untuk {label or (date_from + ' - ' + date_to)}.")
                 return
 
-            n_lunas = sum(1 for x in semua if x["lunas"])
-            send_message(chat_id, f"⏳ Menghitung komisi dari {n_lunas} invoice lunas (+ cek {len(semua)-n_lunas} belum lunas)... baca nama sales tiap invoice, bisa beberapa menit.")
+            send_message(chat_id, f"⏳ Cek {len(lunas_ids)} invoice lunas (termasuk bulan sebelumnya) untuk komisi berdasarkan tanggal bayar... bisa beberapa menit.")
 
-            # 3. Baca nama sales SEMUA invoice (lunas & belum) dari detail
-            id_sales = _baca_nama_sales_massal(h, semua, max_workers=3)
+            # 2. Buka detail tiap invoice lunas: baca tanggal bayar (receiptHistory) + sales + nilai
+            lock = threading.Lock()
+            hasil = []          # invoice yang DIBAYAR dalam [d_awal, d_akhir]
+            gagal = []
+            def scan(item):
+                detail = None
+                for attempt in range(4):
+                    try:
+                        r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do",
+                            headers=accurate_headers(), params={"id": item["id"]}, timeout=25)
+                        dj = r2.json()
+                        if dj.get("s") and dj.get("d"):
+                            detail = dj["d"]; break
+                    except Exception:
+                        pass
+                    _t.sleep(0.5 * (attempt + 1))
+                if detail is None:
+                    with lock: gagal.append(item)
+                    return
+                tgl_bayar = _tanggal_lunas_dari_detail(detail)
+                if tgl_bayar is None:
+                    return  # tidak terbaca tanggal bayarnya -> lewati
+                if not (d_awal <= tgl_bayar <= d_akhir):
+                    return  # dibayar di luar bulan target -> bukan komisi bulan ini
+                nama = _resolve_sales_name(detail)
+                nilai = _resolve_nilai_invoice(detail) or item.get("nilai_list") or 0
+                with lock:
+                    hasil.append({"number": detail.get("number") or item["number"],
+                                  "sales": nama, "nilai": nilai, "tgl_bayar": tgl_bayar})
+                _t.sleep(0.05)
 
-            # 4. Akumulasi per sales. Omset komisi HANYA dari lunas; belum lunas dicatat terpisah.
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                list(ex.map(scan, lunas_ids))
+            if gagal:
+                ulang = list(gagal); gagal.clear()
+                with ThreadPoolExecutor(max_workers=2) as ex:
+                    list(ex.map(scan, ulang))
+
+            if not hasil:
+                send_message(chat_id, f"Tidak ada invoice yang DIBAYAR lunas di {label or (date_from + ' - ' + date_to)}.")
+                return
+
+            # 3. Akumulasi omset per sales (dari tanggal bayar), kecualikan yang tak dapat komisi
             per_sales = {}
-            dikecualikan_total = 0.0
-            dikecualikan_inv = 0
-            for x in semua:
-                nama = id_sales.get(x["id"]) or "Tanpa Sales"
+            dikecualikan_total = 0.0; dikecualikan_inv = 0
+            for x in hasil:
+                nama = x["sales"] or "Tanpa Sales"
                 if _sales_dikecualikan(nama):
-                    if x["lunas"]:
-                        dikecualikan_total += x["nilai"]
-                        dikecualikan_inv += 1
+                    dikecualikan_total += x["nilai"]; dikecualikan_inv += 1
                     continue
-                if nama not in per_sales:
-                    per_sales[nama] = {"omset": 0.0, "count": 0, "belum_nilai": 0.0, "belum_count": 0}
-                if x["lunas"]:
-                    per_sales[nama]["omset"] += x["nilai"]
-                    per_sales[nama]["count"] += 1
-                else:
-                    per_sales[nama]["belum_nilai"] += x["nilai"]
-                    per_sales[nama]["belum_count"] += 1
+                per_sales.setdefault(nama, {"omset": 0.0, "count": 0})
+                per_sales[nama]["omset"] += x["nilai"]
+                per_sales[nama]["count"] += 1
+
+            # info belum lunas per sales (dari invoice bulan target yg belum lunas) — butuh nama sales
+            belum_per_sales = {}
+            if belum_bulan_ini:
+                id_sales_belum = _baca_nama_sales_massal(h, belum_bulan_ini, max_workers=3)
+                for b in belum_bulan_ini:
+                    nama = id_sales_belum.get(b["id"]) or "Tanpa Sales"
+                    if _sales_dikecualikan(nama): continue
+                    belum_per_sales.setdefault(nama, {"nilai": 0.0, "count": 0})
+                    belum_per_sales[nama]["nilai"] += b["nilai"]
+                    belum_per_sales[nama]["count"] += 1
 
             if not per_sales:
-                send_message(chat_id, "Tidak ada sales yang memenuhi syarat komisi (semua invoice tanpa sales / karyawan / Six Pratama).")
+                send_message(chat_id, "Tidak ada sales yang memenuhi syarat komisi (semua tanpa sales / karyawan / Six Pratama).")
                 return
 
-            # 5. Hitung komisi flat per sales, urut omset terbesar
+            # 4. Hitung komisi flat
             baris = []
             for nama, d in per_sales.items():
                 persen, komisi = _tarif_komisi(d["omset"])
+                bl = belum_per_sales.get(nama, {"nilai": 0.0, "count": 0})
                 baris.append({"nama": nama, "omset": d["omset"], "count": d["count"],
                               "persen": persen, "komisi": komisi,
-                              "belum_nilai": d["belum_nilai"], "belum_count": d["belum_count"]})
+                              "belum_nilai": bl["nilai"], "belum_count": bl["count"]})
             baris.sort(key=lambda x: x["omset"], reverse=True)
 
             judul = label or f"{date_from} - {date_to}"
             total_komisi = sum(b["komisi"] for b in baris)
             total_omset_komisi = sum(b["omset"] for b in baris)
-            total_belum = sum(b["belum_nilai"] for b in baris)
-            total_belum_inv = sum(b["belum_count"] for b in baris)
 
             msg = f"💵 *Komisi Sales - {judul}*\n"
-            msg += f"_(komisi dari omset LUNAS; tanpa sales / karyawan PTM / Six Pratama dikecualikan)_\n\n"
+            msg += f"_(berdasarkan TANGGAL BAYAR / uang masuk bulan ini; termasuk invoice bulan lalu yang baru lunas)_\n\n"
             for i, b in enumerate(baris, 1):
                 if b["persen"] == 0:
                     ket = "❌ belum dapat (di bawah 50jt)"
                 else:
                     ket = f"✅ {b['persen']}% → Rp {b['komisi']:,.0f}"
                 msg += (f"{i}. *{b['nama']}*\n"
-                        f"   Omset lunas: Rp {b['omset']:,.0f} ({b['count']} inv)\n"
+                        f"   Omset dibayar: Rp {b['omset']:,.0f} ({b['count']} inv)\n"
                         f"   Komisi: {ket}\n")
                 if b["belum_count"]:
-                    msg += f"   ⏳ Belum lunas: {b['belum_count']} inv (Rp {b['belum_nilai']:,.0f}) — tidak dihitung komisi\n"
+                    msg += f"   ⏳ Belum lunas (invoice bln ini): {b['belum_count']} inv (Rp {b['belum_nilai']:,.0f})\n"
                 msg += "\n"
             msg += f"━━━━━━━━━━\n*TOTAL KOMISI: Rp {total_komisi:,.0f}*\n"
-            msg += f"Total omset lunas kena hitung: Rp {total_omset_komisi:,.0f}\n"
-            if total_belum_inv:
-                msg += f"Total belum lunas (sales kena komisi): {total_belum_inv} inv | Rp {total_belum:,.0f}\n"
+            msg += f"Total omset dibayar kena hitung: Rp {total_omset_komisi:,.0f}\n"
             if dikecualikan_inv:
-                msg += f"_Dikecualikan dari omset: {dikecualikan_inv} invoice lunas (Rp {dikecualikan_total:,.0f}) — tanpa sales / karyawan / Six Pratama._\n"
-            msg += "\n_Tier (flat): <50jt=0% | 50–150jt=0,5% | ≥150jt=0,75%. Seluruh omset lunas × tarif. Invoice belum lunas hanya info, tidak menambah komisi._"
+                msg += f"_Dikecualikan: {dikecualikan_inv} invoice (Rp {dikecualikan_total:,.0f}) — tanpa sales / karyawan / Six Pratama._\n"
+            if gagal:
+                msg += f"_⚠️ {len(gagal)} invoice gagal dibaca, tidak masuk hitungan._\n"
+            msg += "\n_Komisi = omset invoice yang DIBAYAR LUNAS bulan ini × tarif tier. Tier (flat): <50jt=0% | 50–150jt=0,5% | ≥150jt=0,75%._"
             send_message(chat_id, msg)
         except Exception as e:
             send_message(chat_id, f"❌ Gagal hitung komisi sales: {str(e)[:150]}")
