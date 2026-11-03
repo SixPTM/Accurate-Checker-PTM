@@ -2385,7 +2385,7 @@ TOOLS = [
     },
     {
         "name": "komisi_sales",
-        "description": "Hitung KOMISI per sales berdasarkan TANGGAL PEMBAYARAN (uang masuk) dalam satu bulan. Invoice yang LUNAS PENUH dan dibayarnya di bulan itu masuk komisi — TERMASUK invoice bulan sebelumnya yang baru lunas bulan ini. Tier FLAT: di bawah 50jt = tidak dapat, 50–150jt = 0,5%, 150jt ke atas = 0,75% (seluruh omset dibayar dikali tarif). Otomatis MENGECUALIKAN invoice tanpa nama sales, karyawan (…PTM), dan Six Pratama. Juga menampilkan info invoice belum lunas per sales. WAJIB pakai tool ini untuk 'hitung komisi sales', 'komisi per sales bulan ini', 'berapa komisi masing-masing sales'. Background beberapa menit (cek pembayaran tiap invoice), hasil ke Telegram.",
+        "description": "Hitung KOMISI per sales berdasarkan TANGGAL PEMBAYARAN (uang masuk) dalam satu bulan. Invoice yang LUNAS PENUH dan dibayarnya di bulan itu masuk komisi — TERMASUK invoice bulan sebelumnya yang baru lunas bulan ini. Tier FLAT: di bawah 50jt = tidak dapat, 50–100jt = 0,25%, 100–200jt = 0,5%, 200jt ke atas = 0,75% (seluruh omset dibayar dikali tarif). Otomatis MENGECUALIKAN invoice tanpa nama sales, karyawan (…PTM), dan Six Pratama. Juga menampilkan info invoice belum lunas per sales. WAJIB pakai tool ini untuk 'hitung komisi sales', 'komisi per sales bulan ini', 'berapa komisi masing-masing sales'. Background beberapa menit (cek pembayaran tiap invoice), hasil ke Telegram.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -3713,10 +3713,13 @@ def tool_sales_tinggi_rendah_per_bulan(host, chat_id, date_from, date_to, label=
 
 def _tarif_komisi(omset):
     """Tier komisi FLAT: seluruh omset dikali tarif tier yang dicapai.
-    0-50jt: 0% | 50-150jt: 0.5% | 150jt ke atas: 0.75%. Kembalikan (persen, komisi_rp)."""
+    <50jt: 0% | 50-100jt: 0.25% | 100-200jt: 0.5% | >=200jt: 0.75% (termasuk di atas 400jt).
+    Kembalikan (persen, komisi_rp)."""
     if omset < 50_000_000:
         p = 0.0
-    elif omset < 150_000_000:
+    elif omset < 100_000_000:
+        p = 0.25
+    elif omset < 200_000_000:
         p = 0.5
     else:
         p = 0.75
@@ -3961,7 +3964,7 @@ def tool_komisi_sales(host, chat_id, date_from, date_to, label=""):
                 msg += f"_Dikecualikan: {dikecualikan_inv} invoice (Rp {dikecualikan_total:,.0f}) — tanpa sales / karyawan / Six Pratama._\n"
             if gagal:
                 msg += f"_⚠️ {len(gagal)} invoice gagal dibaca, tidak masuk hitungan._\n"
-            msg += "\n_Komisi = omset invoice yang DIBAYAR LUNAS bulan ini × tarif tier. Tier (flat): <50jt=0% | 50–150jt=0,5% | ≥150jt=0,75%._"
+            msg += "\n_Komisi = omset invoice yang DIBAYAR LUNAS bulan ini × tarif tier. Tier (flat): <50jt=0% | 50–100jt=0,25% | 100–200jt=0,5% | ≥200jt=0,75%._"
             send_message(chat_id, msg)
         except Exception as e:
             send_message(chat_id, f"❌ Gagal hitung komisi sales: {str(e)[:150]}")
