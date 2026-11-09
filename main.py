@@ -18,6 +18,9 @@ ACCURATE_SIGNATURE_SECRET = os.environ.get("ACCURATE_SIGNATURE_SECRET", "")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
 GOOGLE_CREDENTIALS_B64 = os.environ.get("GOOGLE_CREDENTIALS_B64", "")
 GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID", "")
+# Chat ID pemilik untuk notifikasi otomatis terjadwal (isi di Railway Variables).
+# Bisa beberapa chat id dipisah koma. Kalau kosong, penjadwal tidak mengirim apa-apa.
+OWNER_CHAT_ID = os.environ.get("OWNER_CHAT_ID", "")
 
 def _load_google_creds_info():
     """Ambil isi kredensial JSON, dari base64 (diutamakan) atau JSON langsung."""
@@ -2797,7 +2800,7 @@ Tools background (hasilnya dikirim otomatis ke Telegram setelah selesai, beri ta
 - rekap_bulanan: rekap PENJUALAN + LABA per bulan dalam SATU pesan (tabel tiap bulan + sorotan bulan tertinggi penjualan & laba). WAJIB pakai ini (SATU KALI, rentang penuh) untuk 'penjualan dan laba tertinggi bulan apa', 'bulan mana omset/laba paling tinggi', 'rekap penjualan per bulan'. DILARANG memanggil get_omset_summary berkali-kali per bulan untuk pertanyaan seperti ini — itu boros dan hasilnya berserakan. Cukup rekap_bulanan sekali, mis. date_from=01/01/2026 date_to=30/06/2026.
 - sales_tinggi_rendah_per_bulan: untuk TIAP sales, bulan penjualan TERTINGGI & TERENDAH-nya (mis. 'Febby tertinggi Juni, terendah Mei'). WAJIB pakai ini untuk 'penjualan tiap sales tertinggi berapa terendah berapa', 'bulan tertinggi & terendah masing-masing sales'. Beda dari get_sales_per_salesman (total) dan get_rata_sales_per_bulan (rata-rata).
 - penjualan_sales_per_bulan: untuk TIAP sales, RINCIAN penjualan TIAP BULAN (Jan berapa, Feb berapa, ... + total). WAJIB pakai ini untuk 'penjualan setiap sales per bulan', 'sales Caca tiap bulan berapa', 'rincian bulanan tiap sales', 'penjualan masing-masing sales Januari sampai Juni per bulan'. Kalau user sebut nama sales tertentu isi nama_sales, kalau tidak tampilkan semua. Beda dari sales_tinggi_rendah_per_bulan (cuma 2 bulan ekstrem) dan get_rata_sales_per_bulan (cuma rata-rata).
-- komisi_sales: hitung KOMISI per sales satu bulan (RINGKAS: tiap sales → omset dibayar → komisi → total). Dari invoice LUNAS PENUH berdasarkan tanggal bayar (uang masuk), termasuk invoice bulan lalu yang baru lunas. Tier flat <50jt=0%, 50-100jt=0,25%, 100-200jt=0,5%, ≥200jt=0,75%. Otomatis kecualikan tanpa sales / karyawan (…PTM) / Six Pratama. WAJIB pakai tool ini SENDIRI untuk SEMUA pertanyaan komisi ('hitung komisi sales', 'komisi sales Oktober', 'berapa komisi tiap sales'). DILARANG memanggil rekap_bayar_sales, get_sales_per_salesman, atau tool lain bersamaan untuk pertanyaan komisi — komisi_sales sudah cukup sendiri. Panggil HANYA SATU tool ini.
+- komisi_sales: hitung KOMISI per sales satu bulan (RINGKAS: tiap sales → omset dibayar → komisi → total). Dari invoice LUNAS PENUH berdasarkan tanggal bayar (uang masuk), termasuk invoice bulan lalu yang baru lunas. Komisi BERTINGKAT per lapisan: 0-50jt=0%, 50-100jt=0,25%, 100-200jt=0,5%, di atas 200jt=0,75%. Otomatis kecualikan tanpa sales / karyawan (…PTM) / Six Pratama. WAJIB pakai tool ini SENDIRI untuk SEMUA pertanyaan komisi ('hitung komisi sales', 'komisi sales Oktober', 'berapa komisi tiap sales'). DILARANG memanggil rekap_bayar_sales, get_sales_per_salesman, atau tool lain bersamaan untuk pertanyaan komisi — komisi_sales sudah cukup sendiri. Panggil HANYA SATU tool ini.
 - get_piutang_summary: total piutang (2-3 menit)
 - get_low_stock: produk yang stoknya menipis di bawah ambang batas (perlu sebut kategori produk)
 - get_overdue_customers: customer yang nunggak lewat jatuh tempo > sekian hari
@@ -2995,6 +2998,24 @@ def debug_item():
         return {"status": r.status_code, "response": r.json()}
     except Exception as e:
         return {"error": str(e)}, 500
+
+
+@app.route("/test-notif-omset", methods=["GET"])
+def test_notif_omset():
+    """Jalankan notifikasi omset SEKARANG (untuk tes). Buka di browser."""
+    if not _owner_chat_ids():
+        return {"error": "OWNER_CHAT_ID belum diset di Railway Variables"}, 400
+    threading.Thread(target=_notif_omset, daemon=True).start()
+    return {"status": "notifikasi omset dikirim ke Telegram, cek chat kamu"}
+
+
+@app.route("/test-notif-bayar", methods=["GET"])
+def test_notif_bayar():
+    """Jalankan notifikasi belum-bayar & bukti SEKARANG (untuk tes)."""
+    if not _owner_chat_ids():
+        return {"error": "OWNER_CHAT_ID belum diset di Railway Variables"}, 400
+    threading.Thread(target=_notif_belum_bayar_bukti, daemon=True).start()
+    return {"status": "notifikasi belum-bayar & bukti dikirim ke Telegram, cek chat kamu"}
 
 
 @app.route("/debug-customer", methods=["GET"])
@@ -6651,6 +6672,258 @@ def debug_invoice():
         }
     except Exception as e:
         return {"error": str(e)}, 500
+
+
+# ===================== NOTIFIKASI OTOMATIS TERJADWAL =====================
+# Jadwal (waktu WIB / UTC+7):
+#   - Omset (hari ini + bulan ini): 09:00, 12:00, 15:00, 18:00, 20:15, Senin–Sabtu
+#   - Piutang (+umur) & belum ada bukti (ringkas): tiap 2 hari sekali, jam 09:05
+# Semua dikirim ke OWNER_CHAT_ID (env var di Railway, bisa beberapa dipisah koma).
+
+def _owner_chat_ids():
+    return [c.strip() for c in (OWNER_CHAT_ID or "").split(",") if c.strip()]
+
+def _wib_now():
+    return datetime.datetime.utcnow() + datetime.timedelta(hours=7)
+
+def _notif_omset():
+    """Hitung omset HARI INI + BULAN INI, kirim ringkas ke owner. Langsung (bukan via AI)."""
+    ids = _owner_chat_ids()
+    if not ids:
+        print("[NOTIF] OWNER_CHAT_ID kosong, lewati omset")
+        return
+    try:
+        host = get_host()
+        if not host:
+            return
+        h = host if host.startswith("http") else f"https://{host}"
+        now = _wib_now()
+        hari_ini = now.strftime("%d/%m/%Y")
+        awal_bulan = now.strftime("01/%m/%Y")
+
+        def total_omset(d_from, d_to):
+            total = 0.0; jml = 0
+            page = 1
+            while True:
+                params = {"fields": "id,totalAmount,salesAmount,subTotal", "sp.pageSize": 200, "sp.page": page,
+                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": d_from, "filter.transDate.val[1]": d_to}
+                r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+                data = r.json()
+                if not data.get("s"): break
+                for inv in data.get("d", []):
+                    if not isinstance(inv, dict): continue
+                    for k in ("totalAmount", "salesAmount", "subTotal"):
+                        try:
+                            fv = float(inv.get(k))
+                            if fv != 0: total += fv; break
+                        except: pass
+                    jml += 1
+                sp = data.get("sp", {})
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+            return total, jml
+
+        om_hari, n_hari = total_omset(hari_ini, hari_ini)
+        om_bulan, n_bulan = total_omset(awal_bulan, hari_ini)
+
+        _NB = ["", "Januari","Februari","Maret","April","Mei","Juni","Juli","Agustus","September","Oktober","November","Desember"]
+        nama_bulan = _NB[now.month]
+        msg = f"📊 *Update Omset — {now.strftime('%d %b %Y, %H:%M')} WIB*\n\n"
+        msg += f"🗓️ *Hari ini* ({hari_ini}):\n   Rp {om_hari:,.0f} ({n_hari} invoice)\n\n"
+        msg += f"📅 *Bulan {nama_bulan}* (s/d hari ini):\n   Rp {om_bulan:,.0f} ({n_bulan} invoice)\n"
+        msg += "\n_Nilai total invoice (termasuk belum lunas)._"
+        for cid in ids:
+            send_message(cid, msg)
+        print(f"[NOTIF] omset terkirim ke {len(ids)} chat")
+    except Exception as e:
+        print(f"[NOTIF OMSET ERROR] {e}")
+
+def _notif_belum_bayar_bukti():
+    """Notif 2-harian: PIUTANG customer (belum bayar) + UMUR piutang dari jatuh tempo,
+    plus jumlah invoice LUNAS bulan ini yang belum ada bukti di Drive."""
+    ids = _owner_chat_ids()
+    if not ids:
+        return
+    try:
+        host = get_host()
+        if not host:
+            return
+        h = host if host.startswith("http") else f"https://{host}"
+        now = _wib_now()
+        hari_ini = now.strftime("%d/%m/%Y")
+        awal_bulan = now.strftime("01/%m/%Y")
+
+        def parse_tgl(s):
+            for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                try: return datetime.datetime.strptime((s or "").split(" ")[0], fmt)
+                except: pass
+            return None
+
+        # 1. PIUTANG: semua invoice BELUM lunas (semua periode), ambil sisa + umur dari dueDate
+        belum_n = 0; belum_nilai = 0.0
+        overdue_n = 0; overdue_nilai = 0.0   # yang sudah lewat jatuh tempo
+        umur_maks = 0; inv_tertua = None
+        bucket = {"0-30": 0.0, "31-60": 0.0, "61-90": 0.0, ">90": 0.0}  # nilai per umur
+        page = 1
+        while True:
+            params = {"fields": "id,number,totalAmount,subTotal,outstanding,statusName,dueDate,retailWpName",
+                "sp.pageSize": 200, "sp.page": page,
+                "filter.transDate.op": "<=", "filter.transDate.val": hari_ini}
+            r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+            data = r.json()
+            if not data.get("s"): break
+            rows = data.get("d", [])
+            if not rows: break
+            for inv in rows:
+                if not isinstance(inv, dict): continue
+                status = (inv.get("statusName") or "").upper()
+                if "LUNAS" in status or "PAID" in status or "CLOSE" in status:
+                    continue
+                # sisa tagihan
+                try:
+                    sisa = float(inv.get("outstanding") or 0)
+                    if sisa == 0:
+                        sisa = float(inv.get("totalAmount") or inv.get("subTotal") or 0)
+                except: sisa = 0.0
+                if sisa <= 0:
+                    continue
+                belum_n += 1
+                belum_nilai += sisa
+                # umur dari jatuh tempo
+                due = parse_tgl(inv.get("dueDate"))
+                if due:
+                    umur = (now.replace(hour=0, minute=0, second=0, microsecond=0) - due).days
+                    if umur > 0:
+                        overdue_n += 1; overdue_nilai += sisa
+                        if umur <= 30: bucket["0-30"] += sisa
+                        elif umur <= 60: bucket["31-60"] += sisa
+                        elif umur <= 90: bucket["61-90"] += sisa
+                        else: bucket[">90"] += sisa
+                        if umur > umur_maks:
+                            umur_maks = umur
+                            inv_tertua = {"number": inv.get("number"),
+                                          "cust": inv.get("retailWpName") or "Tanpa Nama",
+                                          "sisa": sisa, "umur": umur}
+            sp = data.get("sp", {})
+            if page >= sp.get("pageCount", 1): break
+            page += 1
+
+        # 2. Belum ada bukti: invoice LUNAS bulan ini yang nomornya tidak ada di Drive
+        belum_bukti = None
+        try:
+            lunas_ids = []
+            page = 1
+            while True:
+                params = {"fields": "id,number,statusName", "sp.pageSize": 200, "sp.page": page,
+                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": awal_bulan, "filter.transDate.val[1]": hari_ini}
+                r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+                data = r.json()
+                if not data.get("s"): break
+                for inv in data.get("d", []):
+                    if not isinstance(inv, dict): continue
+                    status = (inv.get("statusName") or "").upper()
+                    if "LUNAS" in status or "PAID" in status or "CLOSE" in status:
+                        nomor = (inv.get("number") or "").strip().upper()
+                        if nomor: lunas_ids.append(nomor)
+                sp = data.get("sp", {})
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+            token = get_drive_token()
+            nama_file_drive = _kumpulkan_nomor_bukti_drive(token)
+            belum_bukti = sum(1 for nomor in lunas_ids if nomor not in nama_file_drive)
+        except Exception as e:
+            print(f"[NOTIF BUKTI] gagal cek Drive: {e}")
+
+        msg = f"🔔 *Pengingat 2-Harian — {now.strftime('%d %b %Y')}*\n\n"
+        msg += f"💸 *Piutang (belum bayar):* {belum_n} invoice\n   Total sisa: Rp {belum_nilai:,.0f}\n\n"
+        if overdue_n:
+            msg += f"⏰ *Lewat jatuh tempo:* {overdue_n} invoice | Rp {overdue_nilai:,.0f}\n"
+            msg += "   Umur piutang:\n"
+            if bucket["0-30"]:  msg += f"   • 1–30 hari: Rp {bucket['0-30']:,.0f}\n"
+            if bucket["31-60"]: msg += f"   • 31–60 hari: Rp {bucket['31-60']:,.0f}\n"
+            if bucket["61-90"]: msg += f"   • 61–90 hari: Rp {bucket['61-90']:,.0f}\n"
+            if bucket[">90"]:   msg += f"   • >90 hari: Rp {bucket['>90']:,.0f}\n"
+            if inv_tertua:
+                msg += f"   🔴 Tertua: {inv_tertua['number']} — {inv_tertua['cust']} | Rp {inv_tertua['sisa']:,.0f} ({inv_tertua['umur']} hari)\n"
+            msg += "\n"
+        else:
+            msg += "✅ Tidak ada yang lewat jatuh tempo.\n\n"
+        if belum_bukti is not None:
+            msg += f"📎 *Lunas bln ini tapi belum ada bukti:* {belum_bukti} invoice\n"
+        else:
+            msg += "📎 _Cek bukti Drive gagal (cek koneksi Google)._\n"
+        msg += "\n_Ketik 'piutang per sales' atau 'bukti belum ada per sales' untuk rinciannya._"
+        for cid in ids:
+            send_message(cid, msg)
+        print(f"[NOTIF] piutang/bukti terkirim ke {len(ids)} chat")
+    except Exception as e:
+        print(f"[NOTIF BELUM BAYAR ERROR] {e}")
+
+def _mulai_penjadwal_notifikasi():
+    """Thread background: cek tiap menit, jalankan notifikasi saat waktunya tiba.
+    Anti-dobel: simpan penanda 'sudah jalan' per slot per hari."""
+    if not _owner_chat_ids():
+        print("[NOTIF] OWNER_CHAT_ID belum diset — penjadwal tidak aktif.")
+        return
+
+    sudah_jalan = set()  # berisi string penanda unik (tanggal+slot) yang sudah dikirim
+
+    JAM_OMSET = {9, 12, 15, 18}  # WIB, Senin-Sabtu
+
+    def loop():
+        import time as _t
+        print("[NOTIF] penjadwal notifikasi AKTIF.")
+        while True:
+            try:
+                now = _wib_now()
+                tgl = now.strftime("%Y-%m-%d")
+                jam = now.hour
+                menit = now.minute
+                dow = now.weekday()  # 0=Senin ... 6=Minggu
+
+                # bersihkan penanda hari lama (biar set tidak membengkak)
+                if menit == 0 and jam == 0:
+                    sudah_jalan.clear()
+
+                # --- Omset: 09/12/15/18 (menit 0-4) + 20:15, Senin-Sabtu (dow 0-5) ---
+                if dow <= 5 and jam in JAM_OMSET and menit < 5:
+                    key = f"omset-{tgl}-{jam}"
+                    if key not in sudah_jalan:
+                        sudah_jalan.add(key)
+                        _notif_omset()
+                # slot tambahan 20:15 (menit 15-19)
+                if dow <= 5 and jam == 20 and 15 <= menit < 20:
+                    key = f"omset-{tgl}-2015"
+                    if key not in sudah_jalan:
+                        sudah_jalan.add(key)
+                        _notif_omset()
+
+                # --- Belum bayar & bukti: tiap 2 hari sekali, jam 09, menit 5-9 ---
+                #     (patokan: hari ke-N sejak epoch genap/ganjil. Pakai toordinal % 2 == 0)
+                if jam == 9 and 5 <= menit < 10:
+                    hari_ord = now.toordinal()
+                    if hari_ord % 2 == 0:  # tiap 2 hari sekali
+                        key = f"bayar-{tgl}"
+                        if key not in sudah_jalan:
+                            sudah_jalan.add(key)
+                            _notif_belum_bayar_bukti()
+            except Exception as e:
+                print(f"[NOTIF LOOP ERROR] {e}")
+            _t.sleep(60)  # cek tiap menit
+
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+
+
+# Mulai penjadwal saat modul di-load (aman untuk gunicorn MAUPUN `python main.py`).
+# Pengaman agar tidak dobel kalau modul ter-import lebih dari sekali.
+_PENJADWAL_SUDAH_MULAI = globals().get("_PENJADWAL_SUDAH_MULAI", False)
+if not _PENJADWAL_SUDAH_MULAI:
+    _PENJADWAL_SUDAH_MULAI = True
+    try:
+        _mulai_penjadwal_notifikasi()
+    except Exception as _e:
+        print(f"[NOTIF] gagal mulai penjadwal: {_e}")
 
 
 if __name__ == "__main__":
