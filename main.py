@@ -6677,7 +6677,7 @@ def debug_invoice():
 # ===================== NOTIFIKASI OTOMATIS TERJADWAL =====================
 # Jadwal (waktu WIB / UTC+7):
 #   - Omset (hari ini + bulan ini): 09:00, 12:00, 15:00, 18:00, 20:15, Senin–Sabtu
-#   - Piutang (+umur) & belum ada bukti (ringkas): tiap 2 hari sekali, jam 09:05
+#   - Piutang (+umur) & belum ada bukti (ringkas): SETIAP HARI, jam 09:05
 # Semua dikirim ke OWNER_CHAT_ID (env var di Railway, bisa beberapa dipisah koma).
 
 def _owner_chat_ids():
@@ -6759,54 +6759,65 @@ def _notif_belum_bayar_bukti():
                 except: pass
             return None
 
-        # 1. PIUTANG: semua invoice BELUM lunas (semua periode), ambil sisa + umur dari dueDate
-        belum_n = 0; belum_nilai = 0.0
-        overdue_n = 0; overdue_nilai = 0.0   # yang sudah lewat jatuh tempo
-        umur_maks = 0; inv_tertua = None
-        bucket = {"0-30": 0.0, "31-60": 0.0, "61-90": 0.0, ">90": 0.0}  # nilai per umur
+        # 1. PIUTANG: invoice status OPEN (belum lunas), baca primeOwing + dueDate + sales
+        #    dari DETAIL (sama seperti tool piutang_per_sales yang sudah terbukti benar).
+        open_inv = []
         page = 1
         while True:
-            params = {"fields": "id,number,totalAmount,subTotal,outstanding,statusName,dueDate,retailWpName",
-                "sp.pageSize": 200, "sp.page": page,
-                "filter.transDate.op": "<=", "filter.transDate.val": hari_ini}
+            params = {"fields": "id,number,dueDate,transDate", "sp.pageSize": 200, "sp.page": page,
+                "filter.status": "OPEN"}
             r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
             data = r.json()
             if not data.get("s"): break
-            rows = data.get("d", [])
-            if not rows: break
-            for inv in rows:
-                if not isinstance(inv, dict): continue
-                status = (inv.get("statusName") or "").upper()
-                if "LUNAS" in status or "PAID" in status or "CLOSE" in status:
-                    continue
-                # sisa tagihan
-                try:
-                    sisa = float(inv.get("outstanding") or 0)
-                    if sisa == 0:
-                        sisa = float(inv.get("totalAmount") or inv.get("subTotal") or 0)
-                except: sisa = 0.0
-                if sisa <= 0:
-                    continue
-                belum_n += 1
-                belum_nilai += sisa
-                # umur dari jatuh tempo
-                due = parse_tgl(inv.get("dueDate"))
-                if due:
-                    umur = (now.replace(hour=0, minute=0, second=0, microsecond=0) - due).days
-                    if umur > 0:
-                        overdue_n += 1; overdue_nilai += sisa
-                        if umur <= 30: bucket["0-30"] += sisa
-                        elif umur <= 60: bucket["31-60"] += sisa
-                        elif umur <= 90: bucket["61-90"] += sisa
-                        else: bucket[">90"] += sisa
-                        if umur > umur_maks:
-                            umur_maks = umur
-                            inv_tertua = {"number": inv.get("number"),
-                                          "cust": inv.get("retailWpName") or "Tanpa Nama",
-                                          "sisa": sisa, "umur": umur}
+            open_inv.extend(data.get("d", []))
             sp = data.get("sp", {})
             if page >= sp.get("pageCount", 1): break
             page += 1
+
+        belum_n = 0; belum_nilai = 0.0
+        overdue_n = 0; overdue_nilai = 0.0
+        umur_maks = 0; inv_tertua = None
+        bucket = {"0-30": 0.0, "31-60": 0.0, "61-90": 0.0, ">90": 0.0}
+        per_sales_piutang = {}   # sales -> nilai piutang
+        lock = threading.Lock()
+
+        def cek_piutang(inv):
+            nonlocal belum_n, belum_nilai, overdue_n, overdue_nilai, umur_maks, inv_tertua
+            detail = None
+            for attempt in range(4):
+                try:
+                    r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do",
+                        headers=accurate_headers(), params={"id": inv["id"]}, timeout=20)
+                    d = r2.json()
+                    if d.get("s") and d.get("d"):
+                        detail = d["d"]; break
+                except Exception: pass
+                import time as _t; _t.sleep(0.4 * (attempt + 1))
+            if detail is None: return
+            owing = float(detail.get("primeOwing") or 0)
+            if owing <= 0: return
+            sales = _resolve_sales_name(detail)
+            cust = _resolve_customer_name(detail)
+            due = parse_tgl(detail.get("dueDate") or inv.get("dueDate"))
+            umur = None
+            if due:
+                umur = (now.replace(hour=0, minute=0, second=0, microsecond=0) - due).days
+            with lock:
+                belum_n += 1; belum_nilai += owing
+                per_sales_piutang[sales] = per_sales_piutang.get(sales, 0.0) + owing
+                if umur is not None and umur > 0:
+                    overdue_n += 1; overdue_nilai += owing
+                    if umur <= 30: bucket["0-30"] += owing
+                    elif umur <= 60: bucket["31-60"] += owing
+                    elif umur <= 90: bucket["61-90"] += owing
+                    else: bucket[">90"] += owing
+                    if umur > umur_maks:
+                        umur_maks = umur
+                        inv_tertua = {"number": detail.get("number") or inv.get("number"),
+                                      "cust": cust, "sisa": owing, "umur": umur, "sales": sales}
+
+        with ThreadPoolExecutor(max_workers=12) as ex:
+            list(ex.map(cek_piutang, open_inv))
 
         # 2. Belum ada bukti: invoice LUNAS bulan ini yang nomornya tidak ada di Drive
         belum_bukti = None
@@ -6834,7 +6845,7 @@ def _notif_belum_bayar_bukti():
         except Exception as e:
             print(f"[NOTIF BUKTI] gagal cek Drive: {e}")
 
-        msg = f"🔔 *Pengingat 2-Harian — {now.strftime('%d %b %Y')}*\n\n"
+        msg = f"🔔 *Pengingat Harian — {now.strftime('%d %b %Y')}*\n\n"
         msg += f"💸 *Piutang (belum bayar):* {belum_n} invoice\n   Total sisa: Rp {belum_nilai:,.0f}\n\n"
         if overdue_n:
             msg += f"⏰ *Lewat jatuh tempo:* {overdue_n} invoice | Rp {overdue_nilai:,.0f}\n"
@@ -6844,7 +6855,14 @@ def _notif_belum_bayar_bukti():
             if bucket["61-90"]: msg += f"   • 61–90 hari: Rp {bucket['61-90']:,.0f}\n"
             if bucket[">90"]:   msg += f"   • >90 hari: Rp {bucket['>90']:,.0f}\n"
             if inv_tertua:
-                msg += f"   🔴 Tertua: {inv_tertua['number']} — {inv_tertua['cust']} | Rp {inv_tertua['sisa']:,.0f} ({inv_tertua['umur']} hari)\n"
+                msg += f"   🔴 Tertua: {inv_tertua['number']} — {inv_tertua['cust']} | Rp {inv_tertua['sisa']:,.0f} ({inv_tertua['umur']} hari, sales {inv_tertua['sales']})\n"
+            msg += "\n"
+        # Top sales dengan piutang terbesar
+        if per_sales_piutang:
+            top = sorted(per_sales_piutang.items(), key=lambda x: x[1], reverse=True)[:5]
+            msg += "👤 *Piutang per sales (terbesar):*\n"
+            for nama, nilai in top:
+                msg += f"   • {nama}: Rp {nilai:,.0f}\n"
             msg += "\n"
         else:
             msg += "✅ Tidak ada yang lewat jatuh tempo.\n\n"
@@ -6898,15 +6916,12 @@ def _mulai_penjadwal_notifikasi():
                         sudah_jalan.add(key)
                         _notif_omset()
 
-                # --- Belum bayar & bukti: tiap 2 hari sekali, jam 09, menit 5-9 ---
-                #     (patokan: hari ke-N sejak epoch genap/ganjil. Pakai toordinal % 2 == 0)
+                # --- Piutang & bukti: SETIAP HARI, jam 09, menit 5-9 ---
                 if jam == 9 and 5 <= menit < 10:
-                    hari_ord = now.toordinal()
-                    if hari_ord % 2 == 0:  # tiap 2 hari sekali
-                        key = f"bayar-{tgl}"
-                        if key not in sudah_jalan:
-                            sudah_jalan.add(key)
-                            _notif_belum_bayar_bukti()
+                    key = f"bayar-{tgl}"
+                    if key not in sudah_jalan:
+                        sudah_jalan.add(key)
+                        _notif_belum_bayar_bukti()
             except Exception as e:
                 print(f"[NOTIF LOOP ERROR] {e}")
             _t.sleep(60)  # cek tiap menit
