@@ -6779,6 +6779,7 @@ def _notif_belum_bayar_bukti():
         umur_maks = 0; inv_tertua = None
         bucket = {"0-30": 0.0, "31-60": 0.0, "61-90": 0.0, ">90": 0.0}
         per_sales_piutang = {}   # sales -> nilai piutang
+        piutang_rows = []        # detail tiap piutang untuk file Excel finance
         lock = threading.Lock()
 
         def cek_piutang(inv):
@@ -6805,6 +6806,13 @@ def _notif_belum_bayar_bukti():
             with lock:
                 belum_n += 1; belum_nilai += owing
                 per_sales_piutang[sales] = per_sales_piutang.get(sales, 0.0) + owing
+                piutang_rows.append({
+                    "sales": sales, "number": detail.get("number") or inv.get("number"),
+                    "cust": cust, "sisa": owing,
+                    "due": detail.get("dueDate") or inv.get("dueDate") or "",
+                    "trans": detail.get("transDate") or inv.get("transDate") or "",
+                    "umur": umur if umur is not None else "",
+                })
                 if umur is not None and umur > 0:
                     overdue_n += 1; overdue_nilai += owing
                     if umur <= 30: bucket["0-30"] += owing
@@ -6819,10 +6827,12 @@ def _notif_belum_bayar_bukti():
         with ThreadPoolExecutor(max_workers=12) as ex:
             list(ex.map(cek_piutang, open_inv))
 
-        # 2. Belum ada bukti: invoice LUNAS bulan ini yang nomornya tidak ada di Drive
+        # 2. Belum ada bukti: invoice LUNAS bulan ini yang nomornya tidak ada di Drive.
+        #    Kumpulkan DETAIL (customer, sales, tanggal) untuk file Excel finance.
         belum_bukti = None
+        bukti_rows = []
         try:
-            lunas_ids = []
+            lunas_list = []  # {id, number}
             page = 1
             while True:
                 params = {"fields": "id,number,statusName", "sp.pageSize": 200, "sp.page": page,
@@ -6834,17 +6844,48 @@ def _notif_belum_bayar_bukti():
                     if not isinstance(inv, dict): continue
                     status = (inv.get("statusName") or "").upper()
                     if "LUNAS" in status or "PAID" in status or "CLOSE" in status:
-                        nomor = (inv.get("number") or "").strip().upper()
-                        if nomor: lunas_ids.append(nomor)
+                        nomor = (inv.get("number") or "").strip()
+                        if nomor: lunas_list.append({"id": inv.get("id"), "number": nomor})
                 sp = data.get("sp", {})
                 if page >= sp.get("pageCount", 1): break
                 page += 1
             token = get_drive_token()
             nama_file_drive = _kumpulkan_nomor_bukti_drive(token)
-            belum_bukti = sum(1 for nomor in lunas_ids if nomor not in nama_file_drive)
+            tanpa_bukti = [x for x in lunas_list if x["number"].upper() not in nama_file_drive]
+            belum_bukti = len(tanpa_bukti)
+
+            # ambil detail (customer, sales, tanggal) tiap invoice tanpa bukti utk Excel
+            lock2 = threading.Lock()
+            def ambil_detail_bukti(item):
+                detail = None
+                for attempt in range(3):
+                    try:
+                        r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do",
+                            headers=accurate_headers(), params={"id": item["id"]}, timeout=20)
+                        d = r2.json()
+                        if d.get("s") and d.get("d"):
+                            detail = d["d"]; break
+                    except Exception: pass
+                    import time as _t; _t.sleep(0.4 * (attempt + 1))
+                if detail is None:
+                    with lock2:
+                        bukti_rows.append({"sales": "(gagal baca)", "number": item["number"],
+                                           "cust": "-", "nilai": 0, "trans": ""})
+                    return
+                with lock2:
+                    bukti_rows.append({
+                        "sales": _resolve_sales_name(detail),
+                        "number": detail.get("number") or item["number"],
+                        "cust": _resolve_customer_name(detail),
+                        "nilai": _resolve_nilai_invoice(detail),
+                        "trans": detail.get("transDate") or "",
+                    })
+            with ThreadPoolExecutor(max_workers=12) as ex:
+                list(ex.map(ambil_detail_bukti, tanpa_bukti))
         except Exception as e:
             print(f"[NOTIF BUKTI] gagal cek Drive: {e}")
 
+        # ---- Ringkasan di chat ----
         msg = f"🔔 *Pengingat Harian — {now.strftime('%d %b %Y')}*\n\n"
         msg += f"💸 *Piutang (belum bayar):* {belum_n} invoice\n   Total sisa: Rp {belum_nilai:,.0f}\n\n"
         if overdue_n:
@@ -6857,25 +6898,94 @@ def _notif_belum_bayar_bukti():
             if inv_tertua:
                 msg += f"   🔴 Tertua: {inv_tertua['number']} — {inv_tertua['cust']} | Rp {inv_tertua['sisa']:,.0f} ({inv_tertua['umur']} hari, sales {inv_tertua['sales']})\n"
             msg += "\n"
-        # Top sales dengan piutang terbesar
         if per_sales_piutang:
             top = sorted(per_sales_piutang.items(), key=lambda x: x[1], reverse=True)[:5]
             msg += "👤 *Piutang per sales (terbesar):*\n"
             for nama, nilai in top:
                 msg += f"   • {nama}: Rp {nilai:,.0f}\n"
             msg += "\n"
-        else:
-            msg += "✅ Tidak ada yang lewat jatuh tempo.\n\n"
         if belum_bukti is not None:
             msg += f"📎 *Lunas bln ini tapi belum ada bukti:* {belum_bukti} invoice\n"
         else:
             msg += "📎 _Cek bukti Drive gagal (cek koneksi Google)._\n"
-        msg += "\n_Ketik 'piutang per sales' atau 'bukti belum ada per sales' untuk rinciannya._"
+        msg += "\n_Detail lengkap ada di file Excel terlampir — bisa langsung diteruskan ke finance._"
         for cid in ids:
             send_message(cid, msg)
-        print(f"[NOTIF] piutang/bukti terkirim ke {len(ids)} chat")
+
+        # ---- File Excel detail untuk finance ----
+        try:
+            tgl_file = now.strftime("%Y-%m-%d")
+            # Excel 1: Piutang (urut per sales lalu umur terlama)
+            if piutang_rows:
+                piutang_rows.sort(key=lambda x: (x["sales"], -(x["umur"] if isinstance(x["umur"], int) else 0)))
+                xls1 = _buat_excel_piutang(piutang_rows, now)
+                for cid in ids:
+                    send_file_to_telegram(cid, xls1, f"Piutang_{tgl_file}.xlsx",
+                        f"📄 Detail piutang {len(piutang_rows)} invoice — per sales, customer, nilai, jatuh tempo, umur. Untuk follow-up finance.")
+            # Excel 2: Lunas belum ada bukti (urut per sales)
+            if bukti_rows:
+                bukti_rows.sort(key=lambda x: (x["sales"], x["number"]))
+                xls2 = _buat_excel_bukti(bukti_rows, now)
+                for cid in ids:
+                    send_file_to_telegram(cid, xls2, f"BelumAdaBukti_{tgl_file}.xlsx",
+                        f"📄 {len(bukti_rows)} invoice lunas belum ada bukti — per sales, customer, nilai, tanggal. Untuk follow-up finance.")
+        except Exception as e:
+            print(f"[NOTIF EXCEL ERROR] {e}")
+
+        print(f"[NOTIF] piutang/bukti + Excel terkirim ke {len(ids)} chat")
     except Exception as e:
         print(f"[NOTIF BELUM BAYAR ERROR] {e}")
+
+
+def _buat_excel_piutang(rows, now):
+    """Buat file Excel detail piutang. Kembalikan bytes."""
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+    import io
+    wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Piutang"
+    judul = ["Sales", "No. Invoice", "Customer", "Sisa Tagihan (Rp)", "Tgl Invoice", "Jatuh Tempo", "Umur (hari)"]
+    ws.append(judul)
+    hdr_fill = PatternFill("solid", fgColor="1F3A5F")
+    for c in ws[1]:
+        c.font = Font(bold=True, color="FFFFFF"); c.fill = hdr_fill; c.alignment = Alignment(horizontal="center")
+    for r_ in rows:
+        ws.append([r_["sales"], r_["number"], r_["cust"], round(r_["sisa"]),
+                   r_["trans"], r_["due"], r_["umur"]])
+    # format kolom nilai
+    for row in ws.iter_rows(min_row=2, min_col=4, max_col=4):
+        for c in row: c.number_format = '#,##0'
+    lebar = [20, 20, 32, 18, 14, 14, 11]
+    for i, w in enumerate(lebar, 1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+    ws.freeze_panes = "A2"
+    total = sum(r_["sisa"] for r_ in rows)
+    ws.append([]); ws.append(["", "", "TOTAL", round(total)])
+    ws.cell(row=ws.max_row, column=3).font = Font(bold=True)
+    ws.cell(row=ws.max_row, column=4).font = Font(bold=True); ws.cell(row=ws.max_row, column=4).number_format = '#,##0'
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
+    return buf.read()
+
+
+def _buat_excel_bukti(rows, now):
+    """Buat file Excel invoice lunas yang belum ada bukti. Kembalikan bytes."""
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+    import io
+    wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Belum Ada Bukti"
+    ws.append(["Sales", "No. Invoice", "Customer", "Nilai (Rp)", "Tgl Invoice"])
+    hdr_fill = PatternFill("solid", fgColor="7A1E1E")
+    for c in ws[1]:
+        c.font = Font(bold=True, color="FFFFFF"); c.fill = hdr_fill; c.alignment = Alignment(horizontal="center")
+    for r_ in rows:
+        ws.append([r_["sales"], r_["number"], r_["cust"], round(r_["nilai"]), r_["trans"]])
+    for row in ws.iter_rows(min_row=2, min_col=4, max_col=4):
+        for c in row: c.number_format = '#,##0'
+    lebar = [20, 20, 32, 16, 14]
+    for i, w in enumerate(lebar, 1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+    ws.freeze_panes = "A2"
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
+    return buf.read()
 
 def _mulai_penjadwal_notifikasi():
     """Thread background: cek tiap menit, jalankan notifikasi saat waktunya tiba.
@@ -6931,14 +7041,29 @@ def _mulai_penjadwal_notifikasi():
 
 
 # Mulai penjadwal saat modul di-load (aman untuk gunicorn MAUPUN `python main.py`).
-# Pengaman agar tidak dobel kalau modul ter-import lebih dari sekali.
-_PENJADWAL_SUDAH_MULAI = globals().get("_PENJADWAL_SUDAH_MULAI", False)
-if not _PENJADWAL_SUDAH_MULAI:
-    _PENJADWAL_SUDAH_MULAI = True
+# PENGAMAN ANTI-DOBEL: pakai lock lewat bind ke 1 port lokal. Kalau ada >1 worker
+# (mis. gunicorn multi-worker) atau modul ter-import berkali-kali, hanya proses PERTAMA
+# yang berhasil bind yang menjalankan scheduler — sisanya dilewati. Mencegah notifikasi
+# terkirim 2x (bug laporan omset dobel).
+def _klaim_scheduler_lock():
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        s.bind(("127.0.0.1", 49517))  # port lock khusus scheduler
+        # simpan referensi global supaya socket tidak ditutup garbage collector
+        globals()["_SCHED_LOCK_SOCK"] = s
+        return True
+    except OSError:
+        return False  # sudah ada proses lain yang pegang lock
+
+if _klaim_scheduler_lock():
     try:
         _mulai_penjadwal_notifikasi()
     except Exception as _e:
         print(f"[NOTIF] gagal mulai penjadwal: {_e}")
+else:
+    print("[NOTIF] scheduler sudah jalan di proses lain, worker ini melewati.")
 
 
 if __name__ == "__main__":
