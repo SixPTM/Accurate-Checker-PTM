@@ -110,15 +110,21 @@ def send_message(chat_id, text):
         _send_one(chat_id, chunk)
 
 def send_file_to_telegram(chat_id, file_bytes, filename, caption=""):
-    try:
-        ext = filename.lower().split(".")[-1] if "." in filename else ""
-        if ext in ["jpg", "jpeg", "png", "gif"]:
-            r = requests.post(f"{TELEGRAM_API}/sendPhoto", files={"photo": (filename, file_bytes)}, data={"chat_id": chat_id, "caption": caption}, timeout=30)
-        else:
-            r = requests.post(f"{TELEGRAM_API}/sendDocument", files={"document": (filename, file_bytes)}, data={"chat_id": chat_id, "caption": caption}, timeout=30)
-        print(f"[SEND FILE] {filename} status={r.status_code}")
-    except Exception as e:
-        print(f"[SEND FILE ERROR] {e}")
+    ext = filename.lower().split(".")[-1] if "." in filename else ""
+    endpoint = "sendPhoto" if ext in ["jpg", "jpeg", "png", "gif"] else "sendDocument"
+    field = "photo" if endpoint == "sendPhoto" else "document"
+    for attempt in range(3):
+        try:
+            r = requests.post(f"{TELEGRAM_API}/{endpoint}",
+                files={field: (filename, file_bytes)},
+                data={"chat_id": chat_id, "caption": caption}, timeout=60)
+            print(f"[SEND FILE] {filename} status={r.status_code} resp={r.text[:150]}")
+            if r.status_code == 200:
+                return True
+        except Exception as e:
+            print(f"[SEND FILE ERROR] {filename} attempt {attempt+1}: {e}")
+        import time as _t; _t.sleep(1.5 * (attempt + 1))
+    return False
 
 # ============================================================
 # ACCURATE API TOOLS
@@ -6913,26 +6919,37 @@ def _notif_belum_bayar_bukti():
             send_message(cid, msg)
 
         # ---- File Excel detail untuk finance ----
-        try:
-            tgl_file = now.strftime("%Y-%m-%d")
-            # Excel 1: Piutang (urut per sales lalu umur terlama)
-            if piutang_rows:
+        tgl_file = now.strftime("%Y-%m-%d")
+        # Excel 1: Piutang (urut per sales lalu umur terlama)
+        if piutang_rows:
+            try:
                 piutang_rows.sort(key=lambda x: (x["sales"], -(x["umur"] if isinstance(x["umur"], int) else 0)))
                 xls1 = _buat_excel_piutang(piutang_rows, now)
                 for cid in ids:
-                    send_file_to_telegram(cid, xls1, f"Piutang_{tgl_file}.xlsx",
+                    ok = send_file_to_telegram(cid, xls1, f"Piutang_{tgl_file}.xlsx",
                         f"📄 Detail piutang {len(piutang_rows)} invoice — per sales, customer, nilai, jatuh tempo, umur. Untuk follow-up finance.")
-            # Excel 2: Lunas belum ada bukti (urut per sales)
-            if bukti_rows:
+                    if not ok:
+                        send_message(cid, "⚠️ File Excel piutang gagal terkirim. Ketik 'piutang per sales' untuk rinciannya.")
+            except Exception as e:
+                print(f"[NOTIF EXCEL PIUTANG ERROR] {e}")
+                for cid in ids:
+                    send_message(cid, f"⚠️ Gagal buat file Excel piutang: {str(e)[:100]}")
+        # Excel 2: Lunas belum ada bukti (urut per sales)
+        if bukti_rows:
+            try:
                 bukti_rows.sort(key=lambda x: (x["sales"], x["number"]))
                 xls2 = _buat_excel_bukti(bukti_rows, now)
                 for cid in ids:
-                    send_file_to_telegram(cid, xls2, f"BelumAdaBukti_{tgl_file}.xlsx",
+                    ok = send_file_to_telegram(cid, xls2, f"BelumAdaBukti_{tgl_file}.xlsx",
                         f"📄 {len(bukti_rows)} invoice lunas belum ada bukti — per sales, customer, nilai, tanggal. Untuk follow-up finance.")
-        except Exception as e:
-            print(f"[NOTIF EXCEL ERROR] {e}")
+                    if not ok:
+                        send_message(cid, "⚠️ File Excel bukti gagal terkirim. Ketik 'bukti belum ada per sales' untuk rinciannya.")
+            except Exception as e:
+                print(f"[NOTIF EXCEL BUKTI ERROR] {e}")
+                for cid in ids:
+                    send_message(cid, f"⚠️ Gagal buat file Excel bukti: {str(e)[:100]}")
 
-        print(f"[NOTIF] piutang/bukti + Excel terkirim ke {len(ids)} chat")
+        print(f"[NOTIF] piutang/bukti + Excel selesai untuk {len(ids)} chat")
     except Exception as e:
         print(f"[NOTIF BELUM BAYAR ERROR] {e}")
 
