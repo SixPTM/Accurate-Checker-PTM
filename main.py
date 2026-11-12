@@ -2671,6 +2671,16 @@ TOOLS = [
         }
     },
     {
+        "name": "kirim_excel_piutang_bukti",
+        "description": "Kirim 2 FILE EXCEL ke chat: (1) detail PIUTANG — tiap baris berisi nama sales, nomor invoice, customer, sisa tagihan, tanggal invoice, jatuh tempo, dan UMUR piutang (berapa hari); (2) daftar invoice LUNAS bulan ini yang BELUM ADA BUKTI — nama sales, nomor invoice, customer, nilai, tanggal. File rapi untuk langsung diteruskan ke tim finance. WAJIB pakai tool ini untuk 'kirim excel piutang', 'detail piutang untuk finance', 'excel piutang dan bukti', 'piutang dan belum ada bukti dalam excel', 'kirim laporan piutang dan bukti bayar'. Background beberapa menit (buka detail tiap invoice), hasil berupa file Excel dikirim ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "description": "Label opsional, contoh 'November 2026'"}
+            }
+        }
+    },
+    {
         "name": "get_profit_periode",
         "description": "Hitung PROFIT/LABA (penjualan − modal HPP) untuk satu periode, ditampilkan rincian PER BULAN dan PER HARI sekaligus. WAJIB pakai tool ini untuk 'profit per hari', 'profit per bulan', 'laba harian dan bulanan', 'keuntungan tiap hari/bulan'. Beda dengan get_product_profit (itu profit per PRODUK tertentu, bukan per periode waktu). Background beberapa menit (buka detail tiap invoice + ambil modal item), hasil ke Telegram.",
         "input_schema": {
@@ -2801,6 +2811,7 @@ Tools background (hasilnya dikirim otomatis ke Telegram setelah selesai, beri ta
 - get_customer_reguler: customer yang RUTIN order produk tertentu, dikelompokkan reguler bulanan & mingguan. WAJIB pakai ini untuk 'customer yang order stiker dan kertas reguler', 'pelanggan rutin tiap bulan/minggu', 'langganan tetap'. CATATAN: 'stiker'=chromo/vinyl, 'kertas'=art paper/art carton/ivory (itu bahannya di Accurate). Untuk stiker&kertas biarkan keyword default. Kalau produk lain, isi keyword dipisah KOMA.
 - customer_rutin_bulanan: customer yang order RUTIN hampir tiap bulan (produk APA SAJA, bukan cuma stiker/kertas), default ≥5 dari 6 bulan. WAJIB pakai ini untuk 'customer yang order rutin', 'pelanggan rutin tiap bulan seperti Diri Care/Rico', 'langganan tetap' TANPA sebut produk tertentu. Marketplace dilewati. Beda dari get_customer_reguler (itu khusus produk stiker/kertas).
 - bukti_belum_ada_per_sales: invoice yang BELUM ADA bukti bayarnya di Drive, dikelompokkan PER SALES. DEFAULT hanya invoice LUNAS (hanya_lunas=true). WAJIB pakai ini untuk 'sales mana yang customernya sudah lunas tapi belum ada bukti', 'invoice lunas belum ada bukti per sales', 'bukti bayar belum ada per sales'. Kalau user minta semua (termasuk belum lunas), set hanya_lunas=false. Beda dari cek_bukti_bayar_massal (tidak per sales).
+- kirim_excel_piutang_bukti: kirim 2 FILE EXCEL (bukan teks) ke chat — (1) detail PIUTANG: sales, nomor invoice, customer, sisa, jatuh tempo, UMUR hari; (2) LUNAS belum ada bukti: sales, nomor, customer, nilai, tanggal. Untuk diteruskan ke finance. WAJIB pakai tool ini untuk 'kirim excel piutang dan bukti', 'detail piutang dan belum ada bukti untuk finance', 'piutang dan bukti dalam excel', 'laporan piutang excel'. Tidak perlu tanggal (otomatis semua piutang + bukti bulan ini).
 - hitung_lunas_metode: invoice LUNAS satu periode DIPISAH per metode bayar Tunai/Cash vs Transfer (jumlah invoice + total nilai masing-masing). WAJIB pakai ini untuk 'cek pembayaran cash', 'berapa yang bayar tunai', 'invoice lunas via cash berapa dan totalnya', 'pisahkan pembayaran tunai dan transfer'. Metode dibaca dari sales-receipt tiap invoice.
 - get_profit_periode: PROFIT/LABA (penjualan − modal HPP) satu periode, rincian PER BULAN dan PER HARI sekaligus. WAJIB pakai ini untuk 'profit per hari', 'profit per bulan', 'laba harian bulanan'. Beda dari get_product_profit (itu per produk, bukan per periode).
 - rekap_bulanan: rekap PENJUALAN + LABA per bulan dalam SATU pesan (tabel tiap bulan + sorotan bulan tertinggi penjualan & laba). WAJIB pakai ini (SATU KALI, rentang penuh) untuk 'penjualan dan laba tertinggi bulan apa', 'bulan mana omset/laba paling tinggi', 'rekap penjualan per bulan'. DILARANG memanggil get_omset_summary berkali-kali per bulan untuk pertanyaan seperti ini — itu boros dan hasilnya berserakan. Cukup rekap_bulanan sekali, mis. date_from=01/01/2026 date_to=30/06/2026.
@@ -2925,6 +2936,8 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_customer_rutin_bulanan(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""), tool_input.get("min_bulan"))
                 elif tool_name == "bukti_belum_ada_per_sales":
                     result = tool_bukti_belum_ada_per_sales(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""), tool_input.get("hanya_lunas", True))
+                elif tool_name == "kirim_excel_piutang_bukti":
+                    result = tool_kirim_excel_piutang_bukti(host, chat_id, tool_input.get("label",""))
                 elif tool_name == "hitung_lunas_metode":
                     result = tool_hitung_lunas_metode(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "rekap_bayar_sales":
@@ -6744,10 +6757,27 @@ def _notif_omset():
     except Exception as e:
         print(f"[NOTIF OMSET ERROR] {e}")
 
-def _notif_belum_bayar_bukti():
-    """Notif 2-harian: PIUTANG customer (belum bayar) + UMUR piutang dari jatuh tempo,
-    plus jumlah invoice LUNAS bulan ini yang belum ada bukti di Drive."""
-    ids = _owner_chat_ids()
+def tool_kirim_excel_piutang_bukti(host, chat_id, label=""):
+    """Tool CHAT: kirim detail PIUTANG (siapa, nomor invoice, customer, nilai, umur) +
+    daftar LUNAS belum ada bukti, sebagai 2 file Excel ke chat pemanggil. Untuk finance."""
+    def run():
+        try:
+            send_message(chat_id, "⏳ Menyiapkan detail piutang & belum ada bukti... file Excel akan dikirim beberapa menit lagi (buka detail tiap invoice).")
+            _notif_belum_bayar_bukti(target_ids=[str(chat_id)])
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal menyiapkan Excel: {str(e)[:150]}")
+            print(f"[TOOL EXCEL PIUTANG BUKTI ERROR] {e}")
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
+
+
+def _notif_belum_bayar_bukti(target_ids=None):
+    """Kirim laporan PIUTANG (belum bayar) + umur + daftar LUNAS belum ada bukti,
+    sebagai ringkasan di chat + 2 file Excel. Dipakai oleh scheduler (target_ids=None →
+    kirim ke owner) maupun tool chat (target_ids=[chat_id] → kirim ke pemanggil)."""
+    ids = target_ids if target_ids else _owner_chat_ids()
     if not ids:
         return
     try:
