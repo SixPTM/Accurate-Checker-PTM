@@ -3173,6 +3173,80 @@ def _kumpulkan_nomor_bukti_drive(token):
     return nomor_set
 
 
+# Pemetaan nama bulan (untuk bukti borongan 'CUSTOMER BULANTAHUN', mis. 'PRINTIVA NOV2026')
+_BULAN_ALIAS = {
+    "JAN": "01", "JANUARI": "01", "JANUARY": "01",
+    "FEB": "02", "FEBRUARI": "02", "FEBRUARY": "02",
+    "MAR": "03", "MARET": "03", "MARCH": "03",
+    "APR": "04", "APRIL": "04",
+    "MEI": "05", "MAY": "05",
+    "JUN": "06", "JUNI": "06", "JUNE": "06",
+    "JUL": "07", "JULI": "07", "JULY": "07",
+    "AGU": "08", "AGUSTUS": "08", "AUG": "08", "AUGUST": "08", "AGT": "08",
+    "SEP": "09", "SEPT": "09", "SEPTEMBER": "09",
+    "OKT": "10", "OKTOBER": "10", "OCT": "10", "OCTOBER": "10",
+    "NOV": "11", "NOVEMBER": "11",
+    "DES": "12", "DESEMBER": "12", "DEC": "12", "DECEMBER": "12",
+}
+
+
+def _kumpulkan_bukti_customer_bulan(token):
+    """Kumpulkan bukti bayar BORONGAN yang dinamai 'NAMA CUSTOMER <BULAN><TAHUN>'
+    (mis. 'PRINTIVA MULTIPACK NOV2026.jpg'), untuk customer yang bayar sebulan sekali
+    banyak invoice dengan 1 struk. Kembalikan SET berisi string kunci '<CUST>|<YYYY-MM>'.
+    Cara baca: dari tiap nama file, cari token bulan (NOV, NOVEMBER, dll) + tahun 4 digit;
+    sisa teks sebelum token bulan = nama customer (UPPER, spasi dirapatkan)."""
+    import re as _re
+    hasil = set()
+    # pola: <nama...> <BULAN><spasi?><TAHUN4>, bulan boleh nyambung/pisah dgn tahun
+    bulan_pat = "|".join(sorted(_BULAN_ALIAS.keys(), key=len, reverse=True))
+    pola = _re.compile(rf"^(.*?)[ _\-]*({bulan_pat})[ _\-]*(\d{{4}})\b", _re.IGNORECASE)
+    # abaikan file yang namanya mengandung nomor invoice (itu ditangani fungsi lain)
+    pola_inv = _re.compile(r"SI\.\d{4}\.\d{2}\.\d+", _re.IGNORECASE)
+
+    def proses_nama(nama):
+        if not nama: return
+        base = nama.rsplit(".", 1)[0]  # buang ekstensi
+        if pola_inv.search(base):      # ada nomor invoice -> bukan bukti customer+bulan
+            return
+        m = pola.match(base.strip())
+        if not m: return
+        cust = " ".join(m.group(1).split()).strip().upper()
+        bln = _BULAN_ALIAS.get(m.group(2).upper())
+        thn = m.group(3)
+        if cust and bln:
+            hasil.add(f"{cust}|{thn}-{bln}")
+
+    def daftar(folder_id):
+        page_token = None
+        while True:
+            params = {"q": f"'{folder_id}' in parents and trashed=false",
+                      "fields": "nextPageToken,files(id,name,mimeType)", "pageSize": 1000,
+                      "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}
+            if page_token: params["pageToken"] = page_token
+            rs = requests.get("https://www.googleapis.com/drive/v3/files",
+                headers={"Authorization": f"Bearer {token}"}, params=params, timeout=30)
+            ds = rs.json()
+            for x in ds.get("files", []):
+                if x.get("mimeType") == "application/vnd.google-apps.folder":
+                    daftar(x["id"])
+                else:
+                    proses_nama(x.get("name"))
+            page_token = ds.get("nextPageToken")
+            if not page_token: break
+
+    r = requests.get("https://www.googleapis.com/drive/v3/files",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"q": f"'{GDRIVE_FOLDER_ID}' in parents and trashed=false", "fields": "files(id,name,mimeType)",
+                "pageSize": 1000, "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}, timeout=30)
+    for f in r.json().get("files", []):
+        if f.get("mimeType") == "application/vnd.google-apps.folder":
+            daftar(f["id"])
+        else:
+            proses_nama(f.get("name"))
+    return hasil
+
+
 def drive_list_files(name_contains=None, page_size=1000):
     """List file di folder GDRIVE_FOLDER_ID. Optional filter nama mengandung teks."""
     token = get_drive_token()
@@ -6940,12 +7014,13 @@ def _notif_belum_bayar_bukti(target_ids=None):
                 page += 1
             token = get_drive_token()
             nama_file_drive = _kumpulkan_nomor_bukti_drive(token)
-            tanpa_bukti = [x for x in lunas_list if x["number"].upper() not in nama_file_drive]
-            belum_bukti = len(tanpa_bukti)
+            bukti_cust_bulan = _kumpulkan_bukti_customer_bulan(token)  # bukti borongan 'CUST|YYYY-MM'
 
-            # ambil detail (customer, sales, tanggal) tiap invoice tanpa bukti utk Excel
+            # Buka detail SEMUA invoice lunas (untuk dapat customer+tanggal), lalu tentukan
+            # "ada bukti" dengan DUA cara: (1) nomor invoice ada di nama file, ATAU
+            # (2) bukti borongan customer+bulan cocok (mis. 'PRINTIVA MULTIPACK NOV2026').
             lock2 = threading.Lock()
-            def ambil_detail_bukti(item):
+            def cek_bukti_detail(item):
                 detail = None
                 for attempt in range(3):
                     try:
@@ -6957,20 +7032,31 @@ def _notif_belum_bayar_bukti(target_ids=None):
                     except Exception: pass
                     import time as _t; _t.sleep(0.4 * (attempt + 1))
                 if detail is None:
+                    return  # gagal baca -> lewati (tidak dihitung tanpa bukti biar tidak false alarm)
+                nomor = (detail.get("number") or item["number"]).strip()
+                cust = _resolve_customer_name(detail)
+                tgl = detail.get("transDate") or ""
+                # tentukan bulan invoice utk cek borongan
+                bln_key = None
+                for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                    try:
+                        import datetime as _dt
+                        dd = _dt.datetime.strptime(tgl.split(" ")[0], fmt)
+                        bln_key = f"{cust.upper()}|{dd.strftime('%Y-%m')}"
+                        break
+                    except: pass
+                ada_bukti = (nomor.upper() in nama_file_drive) or (bln_key and bln_key in bukti_cust_bulan)
+                if not ada_bukti:
                     with lock2:
-                        bukti_rows.append({"sales": "(gagal baca)", "number": item["number"],
-                                           "cust": "-", "nilai": 0, "trans": ""})
-                    return
-                with lock2:
-                    bukti_rows.append({
-                        "sales": _resolve_sales_name(detail),
-                        "number": detail.get("number") or item["number"],
-                        "cust": _resolve_customer_name(detail),
-                        "nilai": _resolve_nilai_invoice(detail),
-                        "trans": detail.get("transDate") or "",
-                    })
+                        bukti_rows.append({
+                            "sales": _resolve_sales_name(detail),
+                            "number": nomor, "cust": cust,
+                            "nilai": _resolve_nilai_invoice(detail),
+                            "trans": tgl,
+                        })
             with ThreadPoolExecutor(max_workers=12) as ex:
-                list(ex.map(ambil_detail_bukti, tanpa_bukti))
+                list(ex.map(cek_bukti_detail, lunas_list))
+            belum_bukti = len(bukti_rows)
         except Exception as e:
             print(f"[NOTIF BUKTI] gagal cek Drive: {e}")
 
