@@ -6797,14 +6797,22 @@ def _notif_belum_bayar_bukti(target_ids=None):
 
         # 1. PIUTANG: invoice status OPEN (belum lunas), baca primeOwing + dueDate + sales
         #    dari DETAIL (sama seperti tool piutang_per_sales yang sudah terbukti benar).
+        import time as _t
         open_inv = []
         page = 1
         while True:
             params = {"fields": "id,number,dueDate,transDate", "sp.pageSize": 200, "sp.page": page,
                 "filter.status": "OPEN"}
-            r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
-            data = r.json()
-            if not data.get("s"): break
+            data = None
+            for attempt in range(4):  # retry kalau Accurate timeout
+                try:
+                    r = requests.get(f"{h}/accurate/api/sales-invoice/list.do",
+                        headers=accurate_headers(), params=params, timeout=45)
+                    data = r.json(); break
+                except Exception as e:
+                    print(f"[NOTIF PIUTANG] list page {page} timeout attempt {attempt+1}: {e}")
+                    _t.sleep(2 * (attempt + 1))
+            if data is None or not data.get("s"): break
             open_inv.extend(data.get("d", []))
             sp = data.get("sp", {})
             if page >= sp.get("pageCount", 1): break
@@ -6873,9 +6881,16 @@ def _notif_belum_bayar_bukti(target_ids=None):
             while True:
                 params = {"fields": "id,number,statusName", "sp.pageSize": 200, "sp.page": page,
                     "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": awal_bulan, "filter.transDate.val[1]": hari_ini}
-                r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
-                data = r.json()
-                if not data.get("s"): break
+                data = None
+                for attempt in range(4):
+                    try:
+                        r = requests.get(f"{h}/accurate/api/sales-invoice/list.do",
+                            headers=accurate_headers(), params=params, timeout=45)
+                        data = r.json(); break
+                    except Exception as e:
+                        print(f"[NOTIF BUKTI] list page {page} timeout attempt {attempt+1}: {e}")
+                        _t.sleep(2 * (attempt + 1))
+                if data is None or not data.get("s"): break
                 for inv in data.get("d", []):
                     if not isinstance(inv, dict): continue
                     status = (inv.get("statusName") or "").upper()
