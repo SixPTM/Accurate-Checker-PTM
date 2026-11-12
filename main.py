@@ -3037,6 +3037,34 @@ def test_notif_bayar():
     return {"status": "notifikasi belum-bayar & bukti dikirim ke Telegram, cek chat kamu"}
 
 
+@app.route("/debug-piutang-count", methods=["GET"])
+def debug_piutang_count():
+    """Cek berapa invoice OPEN dalam 12 bulan terakhir (foreground, tampil di browser).
+    Untuk memastikan jumlahnya wajar sebelum proses Excel penuh."""
+    try:
+        host = get_host()
+        if not host: return {"error": "gagal host"}, 500
+        h = host if host.startswith("http") else f"https://{host}"
+        now = datetime.datetime.utcnow() + datetime.timedelta(hours=7)
+        hari_ini = now.strftime("%d/%m/%Y")
+        y = now.year - 1; m = now.month
+        dari = f"01/{m:02d}/{y}"
+        # OPEN semua periode
+        r1 = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(),
+            params={"fields": "id", "sp.pageSize": 1, "filter.status": "OPEN"}, timeout=30)
+        total_open = r1.json().get("sp", {}).get("rowCount", "?")
+        # OPEN 12 bulan
+        r2 = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(),
+            params={"fields": "id", "sp.pageSize": 1, "filter.status": "OPEN",
+                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": dari, "filter.transDate.val[1]": hari_ini}, timeout=30)
+        open_12 = r2.json().get("sp", {}).get("rowCount", "?")
+        return {"open_semua_periode": total_open, "open_12_bulan_terakhir": open_12,
+                "rentang_12bln": f"{dari} - {hari_ini}",
+                "catatan": "Notif akan buka detail sejumlah 'open_12_bulan_terakhir'. Kalau >2000, prosesnya lama."}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {str(e)[:200]}"}, 500
+
+
 @app.route("/debug-customer", methods=["GET"])
 def debug_customer():
     """Lihat SEMUA field yang mungkin menyimpan nama customer dari sebuah invoice.
@@ -6795,14 +6823,19 @@ def _notif_belum_bayar_bukti(target_ids=None):
                 except: pass
             return None
 
-        # 1. PIUTANG: invoice status OPEN (belum lunas), baca primeOwing + dueDate + sales
-        #    dari DETAIL (sama seperti tool piutang_per_sales yang sudah terbukti benar).
+        # 1. PIUTANG: invoice status OPEN dalam 12 BULAN TERAKHIR (bukan semua periode —
+        #    status OPEN di Accurate PTM mengembalikan puluhan ribu invoice lama, mustahil
+        #    dibuka detailnya satu-satu). Piutang >12 bulan sangat jarang; cek manual.
         import time as _t
+        # batas 12 bulan ke belakang
+        y = now.year - 1; m = now.month
+        dari_12bln = f"01/{m:02d}/{y}"
         open_inv = []
         page = 1
         while True:
             params = {"fields": "id,number,dueDate,transDate", "sp.pageSize": 200, "sp.page": page,
-                "filter.status": "OPEN"}
+                "filter.status": "OPEN",
+                "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": dari_12bln, "filter.transDate.val[1]": hari_ini}
             data = None
             for attempt in range(4):  # retry kalau Accurate timeout
                 try:
@@ -6817,6 +6850,11 @@ def _notif_belum_bayar_bukti(target_ids=None):
             sp = data.get("sp", {})
             if page >= sp.get("pageCount", 1): break
             page += 1
+
+        # kabari progres supaya user tahu sedang jalan (bukan macet)
+        if len(ids) and open_inv:
+            for cid in ids:
+                send_message(cid, f"⏳ Memproses {len(open_inv)} invoice open untuk cek piutang... (sekitar 1-3 menit)")
 
         belum_n = 0; belum_nilai = 0.0
         overdue_n = 0; overdue_nilai = 0.0
