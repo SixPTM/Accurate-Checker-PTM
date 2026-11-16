@@ -2419,6 +2419,20 @@ TOOLS = [
         }
     },
     {
+        "name": "rekap_customer_bulan",
+        "description": "Rekap LENGKAP 1 CUSTOMER untuk invoice yang DIBUAT dalam 1 bulan (berdasarkan tanggal invoice): total invoice (jumlah + nilai), berapa LUNAS vs berapa masih PIUTANG (belum bayar), dan berapa invoice yang sudah ADA BUKTI bayar (termasuk bukti borongan 'NAMA BULANTAHUN' seperti PRINTIVA MULTIPACK OKT2026). WAJIB pakai tool ini untuk 'rekap printiva oktober', 'berapa piutang dan bukti customer X bulan Y', 'tagihan dan bukti bayar printiva multipack oktober', 'lunas dan belum bayar customer X bulan Z'. Isi nama_customer dengan nama yang user sebut, date_from/date_to = awal & akhir bulan yang dimaksud. Background beberapa menit, hasil ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nama_customer": {"type": "string", "description": "Nama customer, contoh 'Printiva Multipack'"},
+                "date_from": {"type": "string", "description": "DD/MM/YYYY, awal bulan (mis. 01/10/2026 untuk Oktober)"},
+                "date_to": {"type": "string", "description": "DD/MM/YYYY, akhir bulan (mis. 31/10/2026)"},
+                "label": {"type": "string", "description": "Label, contoh 'Oktober 2026'"}
+            },
+            "required": ["nama_customer", "date_from", "date_to"]
+        }
+    },
+    {
         "name": "omset_profit_per_customer",
         "description": "Hitung OMSET dan PROFIT per CUSTOMER dalam satu periode (1 bulan atau 1 tahun). Untuk tiap customer: total omset, modal (HPP), profit (omset−modal), margin %, jumlah invoice — diurutkan dari omset terbesar. WAJIB pakai tool ini untuk 'omset per customer', 'profit tiap pelanggan', 'customer mana yang paling untung', 'omset dan profit customer X'. Kalau user tanya SATU customer tertentu, isi nama_filter dengan nama itu. Background beberapa menit (buka detail tiap invoice + ambil modal item), hasil ke Telegram.",
         "input_schema": {
@@ -2832,6 +2846,7 @@ Tools background (hasilnya dikirim otomatis ke Telegram setelah selesai, beri ta
 - penjualan_sales_per_bulan: untuk TIAP sales, RINCIAN penjualan TIAP BULAN (Jan berapa, Feb berapa, ... + total). WAJIB pakai ini untuk 'penjualan setiap sales per bulan', 'sales Caca tiap bulan berapa', 'rincian bulanan tiap sales', 'penjualan masing-masing sales Januari sampai Juni per bulan'. Kalau user sebut nama sales tertentu isi nama_sales, kalau tidak tampilkan semua. Beda dari sales_tinggi_rendah_per_bulan (cuma 2 bulan ekstrem) dan get_rata_sales_per_bulan (cuma rata-rata).
 - komisi_sales: hitung KOMISI per sales satu bulan (RINGKAS: tiap sales → omset dibayar → komisi → total). Dari invoice LUNAS PENUH berdasarkan tanggal bayar (uang masuk), termasuk invoice bulan lalu yang baru lunas. Komisi BERTINGKAT per lapisan: 0-50jt=0%, 50-100jt=0,25%, 100-200jt=0,5%, di atas 200jt=0,75%. Otomatis kecualikan tanpa sales / karyawan (…PTM) / Six Pratama. WAJIB pakai tool ini SENDIRI untuk SEMUA pertanyaan komisi ('hitung komisi sales', 'komisi sales Oktober', 'berapa komisi tiap sales'). DILARANG memanggil rekap_bayar_sales, get_sales_per_salesman, atau tool lain bersamaan untuk pertanyaan komisi — komisi_sales sudah cukup sendiri. Panggil HANYA SATU tool ini.
 - cek_perubahan_rentang: cek PERUBAHAN piutang & bukti dalam rentang tanggal — invoice yang DIBAYAR LUNAS + bukti yang DI-UPLOAD dalam rentang itu. WAJIB pakai untuk 'perubahan dari Jumat sampai hari ini', 'siapa saja yang sudah bayar dari tanggal X ke Y', 'apa yang berubah beberapa hari terakhir', 'pembayaran dan bukti antara tanggal ...'. Isi date_from & date_to sesuai rentang yang user sebut (mis. Jumat kemarin = tanggalnya, sampai hari ini). Bisa untuk tanggal ke belakang.
+- rekap_customer_bulan: rekap LENGKAP 1 customer 1 bulan (invoice dibuat bulan itu): total invoice, lunas vs piutang, berapa sudah ada bukti. WAJIB pakai tool ini SENDIRI untuk 'rekap printiva oktober', 'berapa piutang dan bukti customer X bulan Y', 'tagihan dan bukti bayar [customer] [bulan]'. JANGAN panggil get_piutang_customer + rekap_transfer_bukti terpisah untuk ini — rekap_customer_bulan sudah menggabungkan piutang + bukti dalam 1 jawaban. Isi nama_customer + date_from/date_to sesuai bulan yang diminta.
 - get_piutang_summary: total piutang (2-3 menit)
 - get_low_stock: produk yang stoknya menipis di bawah ambang batas (perlu sebut kategori produk)
 - get_overdue_customers: customer yang nunggak lewat jatuh tempo > sekian hari
@@ -2916,6 +2931,8 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_komisi_sales(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "cek_perubahan_rentang":
                     result = tool_cek_perubahan_rentang(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
+                elif tool_name == "rekap_customer_bulan":
+                    result = tool_rekap_customer_bulan(host, chat_id, tool_input["nama_customer"], tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "get_product_profit":
                     result = tool_get_product_profit(host, chat_id, tool_input["keyword"], tool_input["date_from"], tool_input["date_to"])
                 elif tool_name == "omset_profit_per_customer":
@@ -4292,6 +4309,135 @@ def tool_cek_perubahan_rentang(host, chat_id, date_from, date_to, label=""):
         except Exception as e:
             send_message(chat_id, f"❌ Gagal cek perubahan: {str(e)[:150]}")
             print(f"[CEK PERUBAHAN ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
+
+
+def tool_rekap_customer_bulan(host, chat_id, nama_customer, date_from, date_to, label=""):
+    """Rekap 1 CUSTOMER untuk invoice yang DIBUAT dalam rentang (biasanya 1 bulan):
+    total invoice (jumlah+nilai), berapa LUNAS vs PIUTANG, dan berapa yang sudah ADA
+    BUKTI (termasuk bukti borongan 'CUSTOMER BULANTAHUN'). Dasar bulan = tanggal invoice."""
+    def run():
+        try:
+            import time as _t
+            from datetime import datetime as _dt
+            h = host if host.startswith("http") else f"https://{host}"
+            kw = (nama_customer or "").strip().lower()
+            if not kw:
+                send_message(chat_id, "❌ Sebutkan nama customer.")
+                return
+
+            # 1. Ambil semua invoice periode (tanggal invoice dalam rentang)
+            all_inv = []
+            page = 1
+            while True:
+                params = {"fields": "id,number,statusName,transDate", "sp.pageSize": 200, "sp.page": page,
+                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
+                data = None
+                for attempt in range(4):
+                    try:
+                        r = requests.get(f"{h}/accurate/api/sales-invoice/list.do",
+                            headers=accurate_headers(), params=params, timeout=45)
+                        data = r.json(); break
+                    except Exception: _t.sleep(2 * (attempt + 1))
+                if data is None or not data.get("s"): break
+                all_inv.extend(data.get("d", []))
+                sp = data.get("sp", {})
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+
+            if not all_inv:
+                send_message(chat_id, f"Tidak ada invoice di {label or (date_from + ' - ' + date_to)}.")
+                return
+
+            send_message(chat_id, f"⏳ Mengecek invoice '{nama_customer}' di {label or (date_from+'-'+date_to)}... (buka detail tiap invoice)")
+
+            # 2. Buka detail tiap invoice, saring yang customernya cocok
+            lock = threading.Lock()
+            cocok = []   # {number, cust, nilai, lunas, bulan_key}
+            def scan(inv):
+                detail = None
+                for attempt in range(3):
+                    try:
+                        r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do",
+                            headers=accurate_headers(), params={"id": inv["id"]}, timeout=25)
+                        d = r2.json()
+                        if d.get("s") and d.get("d"):
+                            detail = d["d"]; break
+                    except Exception: pass
+                    _t.sleep(0.5 * (attempt + 1))
+                if detail is None: return
+                cust = _resolve_customer_name(detail)
+                if kw not in (cust or "").lower():
+                    return  # bukan customer yang dicari
+                st = (detail.get("statusName") or "").upper()
+                lunas = ("LUNAS" in st or "PAID" in st or "CLOSE" in st)
+                tgl = detail.get("transDate") or inv.get("transDate") or ""
+                bulan_key = None
+                for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                    try:
+                        dd = _dt.strptime(tgl.split(" ")[0], fmt)
+                        bulan_key = f"{cust.upper()}|{dd.strftime('%Y-%m')}"
+                        break
+                    except: pass
+                with lock:
+                    cocok.append({"number": (detail.get("number") or inv.get("number") or "").strip(),
+                                  "cust": cust, "nilai": _resolve_nilai_invoice(detail),
+                                  "lunas": lunas, "bulan_key": bulan_key})
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                list(ex.map(scan, all_inv))
+
+            if not cocok:
+                send_message(chat_id, f"Tidak ada invoice customer '{nama_customer}' di {label or (date_from+'-'+date_to)}.")
+                return
+
+            # 3. Cek bukti: nomor di Drive ATAU bukti borongan customer+bulan
+            nama_file_drive = set(); bukti_cust_bulan = set()
+            try:
+                token = get_drive_token()
+                nama_file_drive = _kumpulkan_nomor_bukti_drive(token)
+                bukti_cust_bulan = _kumpulkan_bukti_customer_bulan(token)
+            except Exception as e:
+                print(f"[REKAP CUST] gagal Drive: {e}")
+
+            def ada_bukti(it):
+                if it["number"].upper() in nama_file_drive: return True
+                if it["bulan_key"] and it["bulan_key"] in bukti_cust_bulan: return True
+                return False
+
+            # 4. Hitung rekap
+            total_n = len(cocok)
+            total_nilai = sum(x["nilai"] for x in cocok)
+            lunas_list = [x for x in cocok if x["lunas"]]
+            piutang_list = [x for x in cocok if not x["lunas"]]
+            n_lunas = len(lunas_list); nilai_lunas = sum(x["nilai"] for x in lunas_list)
+            n_piutang = len(piutang_list); nilai_piutang = sum(x["nilai"] for x in piutang_list)
+            dgn_bukti = [x for x in cocok if ada_bukti(x)]
+            n_bukti = len(dgn_bukti)
+            lunas_tanpa_bukti = [x for x in lunas_list if not ada_bukti(x)]
+
+            nama_tampil = cocok[0]["cust"]  # nama asli dari Accurate
+            judul = label or f"{date_from} - {date_to}"
+            msg = f"📊 *Rekap {nama_tampil} — {judul}*\n"
+            msg += f"_(invoice yang DIBUAT pada periode ini)_\n\n"
+            msg += f"🧾 Total invoice: {total_n} | Rp {total_nilai:,.0f}\n\n"
+            msg += f"✅ Lunas: {n_lunas} inv | Rp {nilai_lunas:,.0f}\n"
+            msg += f"⏳ Belum bayar (piutang): {n_piutang} inv | Rp {nilai_piutang:,.0f}\n\n"
+            msg += f"📎 Sudah ada bukti: {n_bukti} dari {total_n} invoice\n"
+            if lunas_tanpa_bukti:
+                msg += f"❗ Lunas tapi belum ada bukti: {len(lunas_tanpa_bukti)} invoice\n"
+            # kalau ada bukti borongan terdeteksi, beri tahu
+            borongan = any(x["bulan_key"] in bukti_cust_bulan for x in cocok if x["bulan_key"])
+            if borongan:
+                msg += "_(terdeteksi bukti borongan customer+bulan di Drive)_\n"
+            msg += "\n_Piutang berdasarkan status invoice; bukti dari nama file di Drive (termasuk bukti borongan 'NAMA BULANTAHUN')._"
+            send_message(chat_id, msg)
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal rekap customer: {str(e)[:150]}")
+            print(f"[REKAP CUSTOMER BULAN ERROR] {e}")
 
     t = threading.Thread(target=run)
     t.daemon = True
