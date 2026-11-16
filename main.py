@@ -6896,6 +6896,27 @@ def tool_kirim_excel_piutang_bukti(host, chat_id, label=""):
     return json.dumps({"status": "background_started"})
 
 
+# Snapshot piutang & bukti untuk bandingkan perubahan harian. Disimpan ke file lokal
+# (bertahan antar-hari di Railway; ter-reset hanya saat redeploy — tidak fatal).
+_SNAPSHOT_PATH = "/tmp/piutang_bukti_snapshot.json"
+
+def _muat_snapshot():
+    try:
+        with open(_SNAPSHOT_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _simpan_snapshot(piutang_nomor, bukti_nomor, tanggal):
+    try:
+        with open(_SNAPSHOT_PATH, "w") as f:
+            json.dump({"tanggal": tanggal,
+                       "piutang": sorted(piutang_nomor),
+                       "bukti": sorted(bukti_nomor)}, f)
+    except Exception as e:
+        print(f"[SNAPSHOT] gagal simpan: {e}")
+
+
 def _notif_belum_bayar_bukti(target_ids=None):
     """Kirim laporan PIUTANG (belum bayar) + umur + daftar LUNAS belum ada bukti,
     sebagai ringkasan di chat + 2 file Excel. Dipakai oleh scheduler (target_ids=None →
@@ -7081,6 +7102,50 @@ def _notif_belum_bayar_bukti(target_ids=None):
         except Exception as e:
             print(f"[NOTIF BUKTI] gagal cek Drive: {e}")
 
+        # ---- Bandingkan dengan snapshot KEMARIN (perubahan harian) ----
+        piutang_set = set(x["number"].upper() for x in piutang_rows if x.get("number"))
+        belum_bukti_set = set(x["number"].upper() for x in bukti_rows if x.get("number"))
+        blok_perubahan = ""
+        snap = _muat_snapshot()
+        if snap and snap.get("tanggal") != now.strftime("%Y-%m-%d"):
+            piutang_kemarin = set(snap.get("piutang", []))
+            bukti_kemarin = set(snap.get("bukti", []))
+            # peta nomor->info (untuk tampilkan customer/nilai)
+            info_piutang = {x["number"].upper(): x for x in piutang_rows}
+            info_bukti = {x["number"].upper(): x for x in bukti_rows}
+
+            jadi_lunas = piutang_kemarin - piutang_set        # kemarin piutang, skrg tidak -> lunas
+            piutang_baru = piutang_set - piutang_kemarin       # baru muncul
+            bukti_masuk = bukti_kemarin - belum_bukti_set      # kemarin belum bukti, skrg sudah
+            bukti_baru_belum = belum_bukti_set - bukti_kemarin # baru lunas tanpa bukti
+
+            def baris_singkat(nomor_set, info_map, n=8):
+                out = ""
+                for nm in list(nomor_set)[:n]:
+                    it = info_map.get(nm)
+                    if it:
+                        out += f"   • {nm} — {it.get('cust','?')}\n"
+                    else:
+                        out += f"   • {nm}\n"
+                sisa = len(nomor_set) - n
+                if sisa > 0: out += f"   _...dan {sisa} lainnya_\n"
+                return out
+
+            blok_perubahan = f"\n🔄 *Perubahan dari {snap.get('tanggal','kemarin')}:*\n"
+            blok_perubahan += f"✅ Piutang jadi LUNAS: {len(jadi_lunas)}\n"
+            if jadi_lunas: blok_perubahan += baris_singkat(jadi_lunas, {})
+            blok_perubahan += f"🆕 Piutang BARU: {len(piutang_baru)}\n"
+            if piutang_baru: blok_perubahan += baris_singkat(piutang_baru, info_piutang)
+            blok_perubahan += f"📎 Bukti BARU masuk: {len(bukti_masuk)}\n"
+            if bukti_masuk: blok_perubahan += baris_singkat(bukti_masuk, {})
+            blok_perubahan += f"❗ Lunas baru BELUM ada bukti: {len(bukti_baru_belum)}\n"
+            if bukti_baru_belum: blok_perubahan += baris_singkat(bukti_baru_belum, info_bukti)
+            if not (jadi_lunas or piutang_baru or bukti_masuk or bukti_baru_belum):
+                blok_perubahan += "   _Tidak ada perubahan dari kemarin._\n"
+
+        # simpan snapshot hari ini untuk dibandingkan besok
+        _simpan_snapshot(piutang_set, belum_bukti_set, now.strftime("%Y-%m-%d"))
+
         # ---- Ringkasan di chat ----
         msg = f"🔔 *Pengingat Harian — {now.strftime('%d %b %Y')}*\n\n"
         msg += f"💸 *Piutang (belum bayar):* {belum_n} invoice\n   Total sisa: Rp {belum_nilai:,.0f}\n\n"
@@ -7105,6 +7170,8 @@ def _notif_belum_bayar_bukti(target_ids=None):
         else:
             msg += "📎 _Cek bukti Drive gagal (cek koneksi Google)._\n"
         msg += "\n_Detail lengkap ada di file Excel terlampir — bisa langsung diteruskan ke finance._"
+        if blok_perubahan:
+            msg += "\n" + blok_perubahan
         for cid in ids:
             send_message(cid, msg)
 
