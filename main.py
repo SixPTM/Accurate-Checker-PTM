@@ -4429,10 +4429,82 @@ def tool_rekap_customer_bulan(host, chat_id, nama_customer, date_from, date_to, 
             msg += f"📎 Sudah ada bukti: {n_bukti} dari {total_n} invoice\n"
             if lunas_tanpa_bukti:
                 msg += f"❗ Lunas tapi belum ada bukti: {len(lunas_tanpa_bukti)} invoice\n"
-            # kalau ada bukti borongan terdeteksi, beri tahu
+            # kalau ada bukti borongan terdeteksi, beri tahu + BANDINGKAN NOMINAL
             borongan = any(x["bulan_key"] in bukti_cust_bulan for x in cocok if x["bulan_key"])
             if borongan:
                 msg += "_(terdeteksi bukti borongan customer+bulan di Drive)_\n"
+                # cari file bukti borongan utk customer+bulan ini, baca nominalnya
+                try:
+                    import re as _re
+                    token2 = get_drive_token()
+                    cust_up = nama_tampil.upper()
+                    # bulan target dari date_from (mis. Oktober -> 10)
+                    bln_target = None
+                    for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                        try:
+                            ddf = _dt.strptime(date_from.split(" ")[0], fmt)
+                            bln_target = ddf.strftime("%Y-%m"); break
+                        except: pass
+                    # cari file yg namanya PRINTIVA... + bulan, ambil id
+                    total_bukti_nominal = 0.0; file_borongan = []
+                    def cari_file(folder_id):
+                        pt = None
+                        while True:
+                            params = {"q": f"'{folder_id}' in parents and trashed=false",
+                                      "fields": "nextPageToken,files(id,name,mimeType)", "pageSize": 1000,
+                                      "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}
+                            if pt: params["pageToken"] = pt
+                            rs = requests.get("https://www.googleapis.com/drive/v3/files",
+                                headers={"Authorization": f"Bearer {token2}"}, params=params, timeout=30)
+                            ds = rs.json()
+                            for x in ds.get("files", []):
+                                if x.get("mimeType") == "application/vnd.google-apps.folder":
+                                    cari_file(x["id"]); continue
+                                nama_f = x.get("name", "")
+                                base = nama_f.rsplit(".", 1)[0]
+                                if _re.search(r"SI\.\d{4}\.\d{2}\.\d+", base, _re.IGNORECASE):
+                                    continue  # bukti per-invoice, lewati
+                                if cust_up in base.upper():
+                                    # cek bulan cocok via _kumpulkan logic sederhana
+                                    file_borongan.append({"id": x["id"], "nama": nama_f})
+                            pt = ds.get("nextPageToken")
+                            if not pt: break
+                    rr = requests.get("https://www.googleapis.com/drive/v3/files",
+                        headers={"Authorization": f"Bearer {token2}"},
+                        params={"q": f"'{GDRIVE_FOLDER_ID}' in parents and trashed=false",
+                                "fields": "files(id,name,mimeType)", "pageSize": 1000,
+                                "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}, timeout=30)
+                    cari_file(GDRIVE_FOLDER_ID)
+                    for f in rr.json().get("files", []):
+                        if f.get("mimeType") == "application/vnd.google-apps.folder":
+                            cari_file(f["id"])
+                    # baca nominal tiap file borongan yang cocok customer+bulan
+                    for fb in file_borongan:
+                        base = fb["nama"].rsplit(".", 1)[0]
+                        # pastikan bulannya memang target (lewat _BULAN_ALIAS)
+                        mb = _re.search(r"(" + "|".join(_BULAN_ALIAS.keys()) + r")[ _\-]*(\d{4})", base, _re.IGNORECASE)
+                        if not mb: continue
+                        key_file = f"{_BULAN_ALIAS.get(mb.group(1).upper())}"
+                        thn_file = mb.group(2)
+                        if bln_target and f"{thn_file}-{key_file}" != bln_target:
+                            continue
+                        try:
+                            img = drive_download_file(fb["id"])
+                            nom, _ = baca_nominal_dari_gambar(img, "image/jpeg")
+                            total_bukti_nominal += nom
+                        except Exception: pass
+                    if total_bukti_nominal > 0:
+                        selisih = total_bukti_nominal - total_nilai
+                        msg += f"\n💵 Nominal bukti borongan: Rp {total_bukti_nominal:,.0f}\n"
+                        msg += f"   Total invoice: Rp {total_nilai:,.0f}\n"
+                        if abs(selisih) < 1000:
+                            msg += "   ✅ Nominal bukti COCOK dengan total invoice.\n"
+                        elif selisih < 0:
+                            msg += f"   ⚠️ KURANG Rp {abs(selisih):,.0f} — bukti belum menutup semua invoice.\n"
+                        else:
+                            msg += f"   ⚠️ LEBIH Rp {selisih:,.0f} — nominal bukti melebihi total invoice.\n"
+                except Exception as e:
+                    print(f"[REKAP CUST NOMINAL] {e}")
             msg += "\n_Piutang berdasarkan status invoice; bukti dari nama file di Drive (termasuk bukti borongan 'NAMA BULANTAHUN')._"
             send_message(chat_id, msg)
         except Exception as e:
