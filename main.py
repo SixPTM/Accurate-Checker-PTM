@@ -6311,11 +6311,11 @@ def tool_cek_bukti_bayar(host, chat_id, nomor_invoice):
     def run():
         try:
             h = host if host.startswith("http") else f"https://{host}"
-            # 1. Ambil nilai invoice dari Accurate
+            # 1. Ambil DETAIL invoice: nilai, status lunas, customer, tanggal
             r = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(),
                 params={"fields": "id,number", "filter.keywords": nomor_invoice, "sp.pageSize": 1}, timeout=15)
             lst = r.json().get("d", [])
-            nilai_invoice = None
+            nilai_invoice = None; status_lunas = None; cust = None; bln_key = None
             if lst and isinstance(lst[0], dict):
                 inv_id = lst[0].get("id")
                 if inv_id:
@@ -6323,23 +6323,25 @@ def tool_cek_bukti_bayar(host, chat_id, nomor_invoice):
                     det = r2.json().get("d", {})
                     if isinstance(det, dict):
                         nilai_invoice = _resolve_nilai_invoice(det)
+                        st = (det.get("statusName") or "").upper()
+                        status_lunas = ("LUNAS" in st or "PAID" in st or "CLOSE" in st)
+                        cust = _resolve_customer_name(det)
+                        tgl = det.get("transDate") or ""
+                        for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                            try:
+                                import datetime as _dt
+                                dd = _dt.datetime.strptime(tgl.split(" ")[0], fmt)
+                                bln_key = f"{(cust or '').upper()}|{dd.strftime('%Y-%m')}"
+                                break
+                            except: pass
 
-            # 2. Cari file bukti bayar di Drive
+            # 2. Cari file bukti bayar di Drive (per nomor) + cek bukti borongan customer+bulan
             files = drive_cari_file_invoice(nomor_invoice)
-            if not files:
-                msg = f"❌ Bukti bayar untuk {nomor_invoice} TIDAK ditemukan di Google Drive."
-                if nilai_invoice is not None:
-                    msg += f"\nNilai invoice di Accurate: Rp {nilai_invoice:,.0f}"
-                send_message(chat_id, msg)
-                return
-
-            # 3. Saring hanya file yang nomor invoicenya BENAR cocok (hindari 00515 vs 005150),
-            #    lalu baca nominal SEMUA file dan JUMLAHKAN (1 invoice bisa >1 bukti: DP + pelunasan)
             import re as _re
             nomor_up = nomor_invoice.strip().upper()
             pola_nomor = _re.compile(r"SI\.\d{4}\.\d{2}\.\d+", _re.IGNORECASE)
             files_cocok = []
-            for f in files:
+            for f in (files or []):
                 if not isinstance(f, dict) or not f.get("id"):
                     continue
                 ditemukan = [n.upper() for n in pola_nomor.findall(f.get("name", ""))]
@@ -6347,19 +6349,45 @@ def tool_cek_bukti_bayar(host, chat_id, nomor_invoice):
                     if nomor_up in ditemukan:
                         files_cocok.append(f)
                 else:
-                    # nama file tanpa pola nomor -> pakai kecocokan longgar (nama mengandung nomor)
                     if nomor_up in f.get("name", "").upper():
                         files_cocok.append(f)
 
-            if not files_cocok:
-                msg = f"❌ Bukti bayar untuk {nomor_invoice} TIDAK ditemukan di Google Drive."
-                if nilai_invoice is not None:
-                    msg += f"\nNilai invoice di Accurate: Rp {nilai_invoice:,.0f}"
-                send_message(chat_id, msg)
+            # cek bukti borongan (mis. 'PRINTIVA MULTIPACK NOV2026')
+            bukti_borongan = False
+            if bln_key:
+                try:
+                    token = get_drive_token()
+                    if bln_key in _kumpulkan_bukti_customer_bulan(token):
+                        bukti_borongan = True
+                except Exception as e:
+                    print(f"[CEK BUKTI] gagal cek borongan: {e}")
+
+            # 3. Susun jawaban TEGAS: status lunas + ada/tidak bukti + kesimpulan
+            head = f"📎 *Cek Bukti Bayar {nomor_invoice}*\n"
+            if cust: head += f"Customer: {cust}\n"
+            if nilai_invoice is not None: head += f"Nilai invoice: Rp {nilai_invoice:,.0f}\n"
+            if status_lunas is True: head += "Status: ✅ LUNAS\n"
+            elif status_lunas is False: head += "Status: ⏳ BELUM LUNAS\n"
+            head += "\n"
+
+            # Kasus A: ada bukti borongan customer+bulan
+            if bukti_borongan and not files_cocok:
+                head += "✅ *SUDAH ADA BUKTI* (bukti borongan customer+bulan di Drive).\n"
+                head += "_Invoice ini tercakup dalam bukti bayar bulanan customer._"
+                send_message(chat_id, head)
                 return
 
-            rincian = []
-            total_nominal = 0
+            # Kasus B: tidak ada bukti sama sekali
+            if not files_cocok:
+                if status_lunas is False:
+                    head += "⏳ *BELUM ADA BUKTI* — tapi invoice ini memang BELUM LUNAS, jadi wajar. Tidak perlu ditagih buktinya sampai dibayar."
+                else:
+                    head += "❌ *BELUM ADA BUKTI* — invoice sudah lunas tapi bukti belum di-upload ke Drive. *Perlu ditagih ke sales.*"
+                send_message(chat_id, head)
+                return
+
+            # Kasus C: ada file bukti -> baca nominal & bandingkan
+            rincian = []; total_nominal = 0
             for f in files_cocok:
                 try:
                     img = drive_download_file(f["id"])
@@ -6369,26 +6397,19 @@ def tool_cek_bukti_bayar(host, chat_id, nomor_invoice):
                 total_nominal += nominal_foto
                 rincian.append({"nama": f.get("name", "?"), "nominal": nominal_foto, "penjelasan": penjelasan})
 
-            # 4. Bandingkan TOTAL semua bukti dengan nilai invoice
-            msg = f"📎 *Cek Bukti Bayar {nomor_invoice}*\n\n"
-            msg += f"Ditemukan {len(files_cocok)} file bukti:\n"
+            head += f"✅ *SUDAH ADA BUKTI* — ditemukan {len(files_cocok)} file:\n"
             for r_ in rincian:
-                msg += f"• {r_['nama']}: Rp {r_['nominal']:,.0f}\n"
-                if r_.get("penjelasan"):
-                    msg += f"   _{r_['penjelasan']}_\n"
-            msg += f"\nTotal nominal terbaca: Rp {total_nominal:,.0f}\n"
-            if nilai_invoice is not None:
-                msg += f"Nilai invoice (Accurate): Rp {nilai_invoice:,.0f}\n"
-            msg += "\n"
+                head += f"• {r_['nama']}: Rp {r_['nominal']:,.0f}\n"
+            head += f"\nTotal nominal terbaca: Rp {total_nominal:,.0f}\n"
             if nilai_invoice is not None and total_nominal > 0:
                 selisih = total_nominal - nilai_invoice
                 if abs(selisih) < 1:
-                    msg += "✅ COCOK - total bukti sama dengan invoice."
+                    head += "✅ COCOK — total bukti sama dengan nilai invoice."
                 else:
-                    msg += f"⚠️ BERBEDA - selisih Rp {selisih:,.0f}.\n_Bisa karena bayar sebagian, ada bukti belum di-upload, biaya admin, atau foto terbaca kurang akurat._"
+                    head += f"⚠️ SELISIH Rp {selisih:,.0f}.\n_Bisa karena bayar sebagian, ada bukti belum di-upload, biaya admin, atau foto terbaca kurang akurat._"
             else:
-                msg += "_Tidak bisa membandingkan (nilai invoice atau nominal foto tidak terbaca)._"
-            send_message(chat_id, msg)
+                head += "_Nominal bukti tidak terbaca jelas, tidak bisa dibandingkan._"
+            send_message(chat_id, head)
         except Exception as e:
             send_message(chat_id, f"❌ Gagal cek bukti bayar: {str(e)[:150]}")
             print(f"[BUKTI BAYAR ERROR] {e}")
