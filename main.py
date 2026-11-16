@@ -3070,6 +3070,66 @@ def test_notif_bayar():
     return {"status": "notifikasi belum-bayar & bukti dikirim ke Telegram, cek chat kamu"}
 
 
+@app.route("/debug-bukti-borongan", methods=["GET"])
+def debug_bukti_borongan():
+    """Lihat file bukti borongan untuk 1 customer + bulan, beserta nominal yang dibaca.
+    Pakai: /debug-bukti-borongan?cust=PRINTIVA MULTIPACK&bulan=2026-10"""
+    try:
+        import re as _re
+        cust = (request.args.get("cust") or "").strip().upper()
+        bulan = (request.args.get("bulan") or "").strip()  # format YYYY-MM
+        if not cust or not bulan:
+            return {"error": "pakai ?cust=PRINTIVA MULTIPACK&bulan=2026-10"}, 400
+        token = get_drive_token()
+        hasil = []
+        def cari(folder_id):
+            pt = None
+            while True:
+                params = {"q": f"'{folder_id}' in parents and trashed=false",
+                          "fields": "nextPageToken,files(id,name,mimeType,createdTime)", "pageSize": 1000,
+                          "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}
+                if pt: params["pageToken"] = pt
+                rs = requests.get("https://www.googleapis.com/drive/v3/files",
+                    headers={"Authorization": f"Bearer {token}"}, params=params, timeout=30)
+                ds = rs.json()
+                for x in ds.get("files", []):
+                    if x.get("mimeType") == "application/vnd.google-apps.folder":
+                        cari(x["id"]); continue
+                    nama_f = x.get("name", ""); base = nama_f.rsplit(".", 1)[0]
+                    if _re.search(r"SI\.\d{4}\.\d{2}\.\d+", base, _re.IGNORECASE):
+                        continue
+                    if cust not in base.upper():
+                        continue
+                    mb = _re.search(r"(" + "|".join(_BULAN_ALIAS.keys()) + r")[ _\-]*(\d{4})", base, _re.IGNORECASE)
+                    if not mb: continue
+                    key = f"{mb.group(2)}-{_BULAN_ALIAS.get(mb.group(1).upper())}"
+                    if key != bulan: continue
+                    # baca nominal
+                    try:
+                        img = drive_download_file(x["id"])
+                        nom, penjelasan = baca_nominal_dari_gambar(img, "image/jpeg")
+                    except Exception as e:
+                        nom, penjelasan = 0, f"gagal baca: {e}"
+                    hasil.append({"nama": nama_f, "id": x["id"], "nominal_terbaca": nom,
+                                  "createdTime": x.get("createdTime", ""), "penjelasan": penjelasan[:80]})
+                pt = ds.get("nextPageToken")
+                if not pt: break
+        r = requests.get("https://www.googleapis.com/drive/v3/files",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"q": f"'{GDRIVE_FOLDER_ID}' in parents and trashed=false",
+                    "fields": "files(id,name,mimeType)", "pageSize": 1000,
+                    "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}, timeout=30)
+        cari(GDRIVE_FOLDER_ID)
+        for f in r.json().get("files", []):
+            if f.get("mimeType") == "application/vnd.google-apps.folder":
+                cari(f["id"])
+        total = sum(x["nominal_terbaca"] for x in hasil)
+        return {"customer": cust, "bulan": bulan, "jumlah_file": len(hasil),
+                "total_nominal": total, "files": hasil}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {str(e)[:200]}"}, 500
+
+
 @app.route("/debug-piutang-count", methods=["GET"])
 def debug_piutang_count():
     """Cek berapa invoice OPEN dalam 12 bulan terakhir (foreground, tampil di browser).
