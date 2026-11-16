@@ -2406,6 +2406,19 @@ TOOLS = [
         }
     },
     {
+        "name": "cek_perubahan_rentang",
+        "description": "Cek PERUBAHAN piutang & bukti bayar dalam RENTANG TANGGAL (mis. dari Jumat sampai hari ini): (1) invoice yang DIBAYAR LUNAS dalam rentang itu — customer, sales, nilai, tanggal bayar; (2) file bukti bayar yang DI-UPLOAD ke Drive dalam rentang itu. WAJIB pakai tool ini untuk 'perubahan piutang dari tanggal X sampai Y', 'siapa saja yang sudah bayar dari Jumat sampai hari ini', 'cek pembayaran dan bukti beberapa hari terakhir', 'apa yang berubah dari tanggal ... sampai ...'. Bisa untuk tanggal ke belakang (baca data aktual). Background beberapa menit, hasil ke Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD/MM/YYYY, tanggal awal rentang"},
+                "date_to": {"type": "string", "description": "DD/MM/YYYY, tanggal akhir rentang (biasanya hari ini)"},
+                "label": {"type": "string", "description": "Label, contoh '14-16 November 2026'"}
+            },
+            "required": ["date_from", "date_to"]
+        }
+    },
+    {
         "name": "omset_profit_per_customer",
         "description": "Hitung OMSET dan PROFIT per CUSTOMER dalam satu periode (1 bulan atau 1 tahun). Untuk tiap customer: total omset, modal (HPP), profit (omset−modal), margin %, jumlah invoice — diurutkan dari omset terbesar. WAJIB pakai tool ini untuk 'omset per customer', 'profit tiap pelanggan', 'customer mana yang paling untung', 'omset dan profit customer X'. Kalau user tanya SATU customer tertentu, isi nama_filter dengan nama itu. Background beberapa menit (buka detail tiap invoice + ambil modal item), hasil ke Telegram.",
         "input_schema": {
@@ -2818,6 +2831,7 @@ Tools background (hasilnya dikirim otomatis ke Telegram setelah selesai, beri ta
 - sales_tinggi_rendah_per_bulan: untuk TIAP sales, bulan penjualan TERTINGGI & TERENDAH-nya (mis. 'Febby tertinggi Juni, terendah Mei'). WAJIB pakai ini untuk 'penjualan tiap sales tertinggi berapa terendah berapa', 'bulan tertinggi & terendah masing-masing sales'. Beda dari get_sales_per_salesman (total) dan get_rata_sales_per_bulan (rata-rata).
 - penjualan_sales_per_bulan: untuk TIAP sales, RINCIAN penjualan TIAP BULAN (Jan berapa, Feb berapa, ... + total). WAJIB pakai ini untuk 'penjualan setiap sales per bulan', 'sales Caca tiap bulan berapa', 'rincian bulanan tiap sales', 'penjualan masing-masing sales Januari sampai Juni per bulan'. Kalau user sebut nama sales tertentu isi nama_sales, kalau tidak tampilkan semua. Beda dari sales_tinggi_rendah_per_bulan (cuma 2 bulan ekstrem) dan get_rata_sales_per_bulan (cuma rata-rata).
 - komisi_sales: hitung KOMISI per sales satu bulan (RINGKAS: tiap sales → omset dibayar → komisi → total). Dari invoice LUNAS PENUH berdasarkan tanggal bayar (uang masuk), termasuk invoice bulan lalu yang baru lunas. Komisi BERTINGKAT per lapisan: 0-50jt=0%, 50-100jt=0,25%, 100-200jt=0,5%, di atas 200jt=0,75%. Otomatis kecualikan tanpa sales / karyawan (…PTM) / Six Pratama. WAJIB pakai tool ini SENDIRI untuk SEMUA pertanyaan komisi ('hitung komisi sales', 'komisi sales Oktober', 'berapa komisi tiap sales'). DILARANG memanggil rekap_bayar_sales, get_sales_per_salesman, atau tool lain bersamaan untuk pertanyaan komisi — komisi_sales sudah cukup sendiri. Panggil HANYA SATU tool ini.
+- cek_perubahan_rentang: cek PERUBAHAN piutang & bukti dalam rentang tanggal — invoice yang DIBAYAR LUNAS + bukti yang DI-UPLOAD dalam rentang itu. WAJIB pakai untuk 'perubahan dari Jumat sampai hari ini', 'siapa saja yang sudah bayar dari tanggal X ke Y', 'apa yang berubah beberapa hari terakhir', 'pembayaran dan bukti antara tanggal ...'. Isi date_from & date_to sesuai rentang yang user sebut (mis. Jumat kemarin = tanggalnya, sampai hari ini). Bisa untuk tanggal ke belakang.
 - get_piutang_summary: total piutang (2-3 menit)
 - get_low_stock: produk yang stoknya menipis di bawah ambang batas (perlu sebut kategori produk)
 - get_overdue_customers: customer yang nunggak lewat jatuh tempo > sekian hari
@@ -2900,6 +2914,8 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_get_sales_per_salesman(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "komisi_sales":
                     result = tool_komisi_sales(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
+                elif tool_name == "cek_perubahan_rentang":
+                    result = tool_cek_perubahan_rentang(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "get_product_profit":
                     result = tool_get_product_profit(host, chat_id, tool_input["keyword"], tool_input["date_from"], tool_input["date_to"])
                 elif tool_name == "omset_profit_per_customer":
@@ -4132,6 +4148,150 @@ def tool_komisi_sales(host, chat_id, date_from, date_to, label=""):
         except Exception as e:
             send_message(chat_id, f"❌ Gagal hitung komisi sales: {str(e)[:150]}")
             print(f"[KOMISI SALES ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
+
+
+def tool_cek_perubahan_rentang(host, chat_id, date_from, date_to, label=""):
+    """Cek PERUBAHAN dalam rentang tanggal (mis. Jumat-hari ini): (1) invoice yang
+    DIBAYAR LUNAS dalam rentang (dari tanggal pembayaran di receiptHistory), (2) file
+    bukti yang DI-UPLOAD ke Drive dalam rentang (createdTime). Membaca data aktual,
+    jadi bisa untuk tanggal ke belakang."""
+    def run():
+        try:
+            import time as _t
+            from datetime import datetime as _dt
+            h = host if host.startswith("http") else f"https://{host}"
+
+            def parse_d(s):
+                for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                    try: return _dt.strptime((s or "").split(" ")[0], fmt)
+                    except: pass
+                return None
+            d_awal = parse_d(date_from); d_akhir = parse_d(date_to)
+            if not d_awal or not d_akhir:
+                send_message(chat_id, "❌ Tanggal tidak valid.")
+                return
+
+            send_message(chat_id, f"⏳ Mengecek perubahan {label or (date_from + ' - ' + date_to)}... (invoice dibayar + bukti di-upload)")
+
+            # ===== BAGIAN 1: invoice yang DIBAYAR LUNAS dalam rentang =====
+            # ambil invoice lunas dari rentang diperluas 4 bln ke belakang (invoice lama bisa
+            # baru dibayar dalam rentang target), lalu saring tanggal bayarnya.
+            y = d_awal.year; m = d_awal.month - 4
+            while m <= 0: m += 12; y -= 1
+            from_lebar = f"01/{m:02d}/{y}"
+            lunas_ids = []
+            page = 1
+            while True:
+                params = {"fields": "id,number,statusName", "sp.pageSize": 200, "sp.page": page,
+                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": from_lebar, "filter.transDate.val[1]": date_to}
+                data = None
+                for attempt in range(4):
+                    try:
+                        r = requests.get(f"{h}/accurate/api/sales-invoice/list.do",
+                            headers=accurate_headers(), params=params, timeout=45)
+                        data = r.json(); break
+                    except Exception: _t.sleep(2 * (attempt + 1))
+                if data is None or not data.get("s"): break
+                for inv in data.get("d", []):
+                    if not isinstance(inv, dict) or inv.get("id") is None: continue
+                    st = (inv.get("statusName") or "").upper()
+                    if "LUNAS" in st or "PAID" in st or "CLOSE" in st:
+                        lunas_ids.append({"id": inv.get("id"), "number": inv.get("number")})
+                sp = data.get("sp", {})
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+
+            lock = threading.Lock()
+            dibayar = []
+            def cek(item):
+                detail = None
+                for attempt in range(3):
+                    try:
+                        r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do",
+                            headers=accurate_headers(), params={"id": item["id"]}, timeout=25)
+                        d = r2.json()
+                        if d.get("s") and d.get("d"):
+                            detail = d["d"]; break
+                    except Exception: pass
+                    _t.sleep(0.5 * (attempt + 1))
+                if detail is None: return
+                tgl_bayar = _tanggal_lunas_dari_detail(detail)
+                if tgl_bayar is None or not (d_awal <= tgl_bayar <= d_akhir): return
+                with lock:
+                    dibayar.append({
+                        "number": detail.get("number") or item["number"],
+                        "cust": _resolve_customer_name(detail),
+                        "sales": _resolve_sales_name(detail),
+                        "nilai": _resolve_nilai_invoice(detail),
+                        "tgl": tgl_bayar.strftime("%d/%m/%Y"),
+                    })
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                list(ex.map(cek, lunas_ids))
+
+            # ===== BAGIAN 2: file bukti yang DI-UPLOAD ke Drive dalam rentang =====
+            upload_baru = []
+            try:
+                token = get_drive_token()
+                # format RFC3339 utk filter createdTime
+                dari_rfc = d_awal.strftime("%Y-%m-%dT00:00:00")
+                sampai_rfc = d_akhir.strftime("%Y-%m-%dT23:59:59")
+                def telusuri(folder_id):
+                    page_token = None
+                    while True:
+                        q = (f"'{folder_id}' in parents and trashed=false and "
+                             f"createdTime >= '{dari_rfc}' and createdTime <= '{sampai_rfc}'")
+                        params = {"q": q, "fields": "nextPageToken,files(id,name,mimeType,createdTime)",
+                                  "pageSize": 1000, "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}
+                        if page_token: params["pageToken"] = page_token
+                        rs = requests.get("https://www.googleapis.com/drive/v3/files",
+                            headers={"Authorization": f"Bearer {token}"}, params=params, timeout=30)
+                        ds = rs.json()
+                        for x in ds.get("files", []):
+                            if x.get("mimeType") != "application/vnd.google-apps.folder":
+                                ct = (x.get("createdTime") or "")[:10]
+                                upload_baru.append({"nama": x.get("name", "?"), "tgl": ct})
+                        page_token = ds.get("nextPageToken")
+                        if not page_token: break
+                # folder utama + subfolder
+                r = requests.get("https://www.googleapis.com/drive/v3/files",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={"q": f"'{GDRIVE_FOLDER_ID}' in parents and trashed=false",
+                            "fields": "files(id,name,mimeType)", "pageSize": 1000,
+                            "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}, timeout=30)
+                telusuri(GDRIVE_FOLDER_ID)
+                for f in r.json().get("files", []):
+                    if f.get("mimeType") == "application/vnd.google-apps.folder":
+                        telusuri(f["id"])
+            except Exception as e:
+                print(f"[PERUBAHAN DRIVE] {e}")
+
+            # ===== Susun pesan =====
+            judul = label or f"{date_from} - {date_to}"
+            dibayar.sort(key=lambda x: x["nilai"], reverse=True)
+            total_bayar = sum(x["nilai"] for x in dibayar)
+
+            msg = f"🔄 *Perubahan {judul}*\n\n"
+            msg += f"✅ *Invoice DIBAYAR LUNAS:* {len(dibayar)} | Rp {total_bayar:,.0f}\n"
+            for x in dibayar[:25]:
+                msg += f"• {x['number']} — {x['cust']} | Rp {x['nilai']:,.0f} ({x['tgl']}, {x['sales']})\n"
+            if len(dibayar) > 25:
+                msg += f"_...dan {len(dibayar)-25} lainnya_\n"
+            msg += f"\n📎 *Bukti bayar DI-UPLOAD:* {len(upload_baru)} file\n"
+            for u in upload_baru[:25]:
+                msg += f"• {u['nama']} ({u['tgl']})\n"
+            if len(upload_baru) > 25:
+                msg += f"_...dan {len(upload_baru)-25} lainnya_\n"
+            if not dibayar and not upload_baru:
+                msg += "\n_Tidak ada pembayaran atau upload bukti dalam rentang ini._"
+            send_message(chat_id, msg)
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal cek perubahan: {str(e)[:150]}")
+            print(f"[CEK PERUBAHAN ERROR] {e}")
 
     t = threading.Thread(target=run)
     t.daemon = True
