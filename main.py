@@ -4506,7 +4506,8 @@ def tool_rekap_customer_bulan(host, chat_id, nama_customer, date_from, date_to, 
                             bln_target = ddf.strftime("%Y-%m"); break
                         except: pass
                     # cari file yg namanya PRINTIVA... + bulan, ambil id
-                    total_bukti_nominal = 0.0; file_borongan = []
+                    total_bukti_nominal = 0.0
+                    file_borongan = {}  # dedup by id (hindari file sama terhitung 2x)
                     def cari_file(folder_id):
                         pt = None
                         while True:
@@ -4525,23 +4526,14 @@ def tool_rekap_customer_bulan(host, chat_id, nama_customer, date_from, date_to, 
                                 if _re.search(r"SI\.\d{4}\.\d{2}\.\d+", base, _re.IGNORECASE):
                                     continue  # bukti per-invoice, lewati
                                 if cust_up in base.upper():
-                                    # cek bulan cocok via _kumpulkan logic sederhana
-                                    file_borongan.append({"id": x["id"], "nama": nama_f})
+                                    file_borongan[x["id"]] = nama_f  # dedup: id sama ditimpa, tidak dobel
                             pt = ds.get("nextPageToken")
                             if not pt: break
-                    rr = requests.get("https://www.googleapis.com/drive/v3/files",
-                        headers={"Authorization": f"Bearer {token2}"},
-                        params={"q": f"'{GDRIVE_FOLDER_ID}' in parents and trashed=false",
-                                "fields": "files(id,name,mimeType)", "pageSize": 1000,
-                                "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}, timeout=30)
+                    # cari_file sudah REKURSIF ke subfolder, jadi cukup dipanggil 1x dari root
                     cari_file(GDRIVE_FOLDER_ID)
-                    for f in rr.json().get("files", []):
-                        if f.get("mimeType") == "application/vnd.google-apps.folder":
-                            cari_file(f["id"])
-                    # baca nominal tiap file borongan yang cocok customer+bulan
-                    for fb in file_borongan:
-                        base = fb["nama"].rsplit(".", 1)[0]
-                        # pastikan bulannya memang target (lewat _BULAN_ALIAS)
+                    # baca nominal tiap file borongan UNIK yang cocok customer+bulan
+                    for fid, nama_fb in file_borongan.items():
+                        base = nama_fb.rsplit(".", 1)[0]
                         mb = _re.search(r"(" + "|".join(_BULAN_ALIAS.keys()) + r")[ _\-]*(\d{4})", base, _re.IGNORECASE)
                         if not mb: continue
                         key_file = f"{_BULAN_ALIAS.get(mb.group(1).upper())}"
@@ -4549,7 +4541,7 @@ def tool_rekap_customer_bulan(host, chat_id, nama_customer, date_from, date_to, 
                         if bln_target and f"{thn_file}-{key_file}" != bln_target:
                             continue
                         try:
-                            img = drive_download_file(fb["id"])
+                            img = drive_download_file(fid)
                             nom, _ = baca_nominal_dari_gambar(img, "image/jpeg")
                             total_bukti_nominal += nom
                         except Exception: pass
