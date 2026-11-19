@@ -11,6 +11,17 @@ from flask import Flask, request
 
 app = Flask(__name__)
 
+# CORS: izinkan Print Master (cetaprint.vercel.app) memanggil endpoint sinkron dari browser.
+@app.after_request
+def _tambah_cors(resp):
+    try:
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Token"
+    except Exception:
+        pass
+    return resp
+
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 ACCURATE_API_TOKEN = os.environ.get("ACCURATE_API_TOKEN")
@@ -8001,11 +8012,13 @@ def _sinkron_tagihan_ke_printmaster():
         _PM_SINKRON_STATUS["running"] = False
 
 
-@app.route("/sinkron-tagihan", methods=["GET", "POST"])
+@app.route("/sinkron-tagihan", methods=["GET", "POST", "OPTIONS"])
 def route_sinkron_tagihan():
     """Endpoint refresh manual untuk tombol di Print Master. Jalankan di thread
     supaya respons cepat (tidak menunggu 2-8 menit). Lindungi dgn token sederhana."""
     import flask
+    if request.method == "OPTIONS":
+        return ("", 204)
     # token opsional: kalau PM_SINKRON_TOKEN diset di Railway, wajib cocok
     wajib = os.environ.get("PM_SINKRON_TOKEN", "")
     if wajib:
