@@ -22,6 +22,27 @@ GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID", "")
 # Bisa beberapa chat id dipisah koma. Kalau kosong, penjadwal tidak mengirim apa-apa.
 OWNER_CHAT_ID = os.environ.get("OWNER_CHAT_ID", "")
 
+# --- Integrasi Print Master (PTM Work Flow) via Supabase ---
+# Bot menulis piutang & bukti-belum-ada ke tabel Supabase, lalu Print Master membacanya
+# per sales. Diisi di Railway Variables. Kalau kosong, fitur sinkron tidak aktif.
+PM_SUPABASE_URL = os.environ.get("PM_SUPABASE_URL", "").rstrip("/")
+PM_SUPABASE_KEY = os.environ.get("PM_SUPABASE_KEY", "")
+
+# Pemetaan nama sales di Accurate -> akun di Print Master (tabel karyawan.nama).
+# Hanya 4 sales ini yang punya piutang/bukti & perlu tampil. Dicocokkan lowercase.
+PETA_SALES = {
+    "resti pauji": "Eci",
+    "febby anggini": "Febby",
+    "caca": "Caca",
+    "aisah": "Aisah",
+}
+
+def _map_sales_ke_pm(nama_accurate):
+    """Terjemahkan nama sales Accurate -> akun Print Master. None kalau tidak dipetakan."""
+    if not nama_accurate:
+        return None
+    return PETA_SALES.get(nama_accurate.strip().lower())
+
 def _load_google_creds_info():
     """Ambil isi kredensial JSON, dari base64 (diutamakan) atau JSON langsung."""
     if GOOGLE_CREDENTIALS_B64:
@@ -2708,6 +2729,14 @@ TOOLS = [
         }
     },
     {
+        "name": "sinkron_printmaster",
+        "description": "Hitung piutang & invoice lunas-belum-ada-bukti terkini lalu KIRIM/UPDATE ke Print Master (PTM Work Flow) supaya tiap sales (Eci, Febby, Caca, Aisah) melihat tugasnya di website workflow. WAJIB pakai tool ini untuk 'sinkron ke print master', 'update workflow', 'kirim piutang bukti ke workflow', 'update tagihan sales di workflow', 'refresh print master'. Background beberapa menit (buka detail tiap invoice). Setelah selesai lapor berapa baris dikirim.",
+        "input_schema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
         "name": "get_profit_periode",
         "description": "Hitung PROFIT/LABA (penjualan − modal HPP) untuk satu periode, ditampilkan rincian PER BULAN dan PER HARI sekaligus. WAJIB pakai tool ini untuk 'profit per hari', 'profit per bulan', 'laba harian dan bulanan', 'keuntungan tiap hari/bulan'. Beda dengan get_product_profit (itu profit per PRODUK tertentu, bukan per periode waktu). Background beberapa menit (buka detail tiap invoice + ambil modal item), hasil ke Telegram.",
         "input_schema": {
@@ -2971,6 +3000,8 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_bukti_belum_ada_per_sales(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""), tool_input.get("hanya_lunas", True))
                 elif tool_name == "kirim_excel_piutang_bukti":
                     result = tool_kirim_excel_piutang_bukti(host, chat_id, tool_input.get("label",""))
+                elif tool_name == "sinkron_printmaster":
+                    result = tool_sinkron_printmaster(host, chat_id)
                 elif tool_name == "hitung_lunas_metode":
                     result = tool_hitung_lunas_metode(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "rekap_bayar_sales":
@@ -7326,6 +7357,34 @@ def tool_kirim_excel_piutang_bukti(host, chat_id, label=""):
     return json.dumps({"status": "background_started"})
 
 
+def tool_sinkron_printmaster(host, chat_id):
+    """Tool CHAT: hitung piutang & bukti terkini lalu kirim ke Print Master (Supabase),
+    supaya tiap sales lihat tugasnya di website workflow. Jalan di background, lapor hasil."""
+    def run():
+        try:
+            if not (PM_SUPABASE_URL and PM_SUPABASE_KEY):
+                send_message(chat_id, "❌ Koneksi Print Master belum diset (PM_SUPABASE_URL / PM_SUPABASE_KEY di Railway).")
+                return
+            send_message(chat_id, "⏳ Menghitung piutang & bukti terkini lalu update ke Print Master... (beberapa menit, buka detail tiap invoice).")
+            hasil = _sinkron_tagihan_ke_printmaster()
+            if hasil.get("ok"):
+                send_message(chat_id,
+                    f"✅ Print Master ter-update.\n"
+                    f"   {hasil.get('count',0)} baris (piutang + belum ada bukti) dikirim ke workflow.\n"
+                    f"   Waktu: {hasil.get('waktu','-')}\n\n"
+                    f"Tiap sales (Eci, Febby, Caca, Aisah) sekarang bisa lihat tugasnya di website. "
+                    f"Pengawas (kamu, Fitri, Aura) lihat semua sales.")
+            else:
+                send_message(chat_id, f"❌ Gagal sinkron ke Print Master: {hasil.get('msg','?')}")
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal sinkron ke Print Master: {str(e)[:150]}")
+            print(f"[TOOL SINKRON PM ERROR] {e}")
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
+
+
 # Snapshot piutang & bukti untuk bandingkan perubahan harian. Disimpan ke file lokal
 # (bertahan antar-hari di Railway; ter-reset hanya saat redeploy — tidak fatal).
 _SNAPSHOT_PATH = "/tmp/piutang_bukti_snapshot.json"
@@ -7691,6 +7750,281 @@ def _buat_excel_bukti(rows, now):
     buf = io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf.read()
 
+
+# =========================================================================
+#  INTEGRASI PRINT MASTER (PTM Work Flow) — sinkron piutang & bukti ke Supabase
+# =========================================================================
+
+_PM_SINKRON_STATUS = {"running": False, "last": None, "last_error": None, "last_count": 0}
+
+def _hitung_piutang_bukti_rows():
+    """Hitung daftar piutang + daftar lunas-belum-bukti (sama sumber dgn notif harian),
+    tapi dikembalikan sebagai (piutang_rows, bukti_rows) tanpa kirim Telegram/Excel.
+    piutang_rows: {sales, number, cust, sisa, due, trans, umur}
+    bukti_rows:   {sales, number, cust, nilai, trans}
+    """
+    import time as _t
+    host = get_host()
+    if not host:
+        raise RuntimeError("host Accurate tidak tersedia")
+    h = host if host.startswith("http") else f"https://{host}"
+    now = _wib_now()
+    hari_ini = now.strftime("%d/%m/%Y")
+    awal_bulan = now.strftime("01/%m/%Y")
+
+    def parse_tgl(s):
+        for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+            try: return datetime.datetime.strptime((s or "").split(" ")[0], fmt)
+            except: pass
+        return None
+
+    # ---- 1. PIUTANG: invoice OPEN 12 bulan terakhir ----
+    y = now.year - 1; m = now.month
+    dari_12bln = f"01/{m:02d}/{y}"
+    open_inv = []
+    page = 1
+    while True:
+        params = {"fields": "id,number,dueDate,transDate", "sp.pageSize": 200, "sp.page": page,
+            "filter.status": "OPEN",
+            "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": dari_12bln, "filter.transDate.val[1]": hari_ini}
+        data = None
+        for attempt in range(4):
+            try:
+                r = requests.get(f"{h}/accurate/api/sales-invoice/list.do",
+                    headers=accurate_headers(), params=params, timeout=45)
+                data = r.json(); break
+            except Exception as e:
+                print(f"[PM SINKRON PIUTANG] list page {page} attempt {attempt+1}: {e}")
+                _t.sleep(2 * (attempt + 1))
+        if data is None or not data.get("s"): break
+        open_inv.extend(data.get("d", []))
+        sp = data.get("sp", {})
+        if page >= sp.get("pageCount", 1): break
+        page += 1
+
+    piutang_rows = []
+    lock = threading.Lock()
+
+    def cek_piutang(inv):
+        detail = None
+        for attempt in range(4):
+            try:
+                r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do",
+                    headers=accurate_headers(), params={"id": inv["id"]}, timeout=20)
+                d = r2.json()
+                if d.get("s") and d.get("d"):
+                    detail = d["d"]; break
+            except Exception: pass
+            _t.sleep(0.4 * (attempt + 1))
+        if detail is None: return
+        owing = float(detail.get("primeOwing") or 0)
+        if owing <= 0: return
+        sales = _resolve_sales_name(detail)
+        cust = _resolve_customer_name(detail)
+        due = parse_tgl(detail.get("dueDate") or inv.get("dueDate"))
+        umur = None
+        if due:
+            umur = (now.replace(hour=0, minute=0, second=0, microsecond=0) - due).days
+        with lock:
+            piutang_rows.append({
+                "sales": sales, "number": detail.get("number") or inv.get("number"),
+                "cust": cust, "sisa": owing,
+                "due": detail.get("dueDate") or inv.get("dueDate") or "",
+                "trans": detail.get("transDate") or inv.get("transDate") or "",
+                "umur": umur if umur is not None else "",
+            })
+
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        list(ex.map(cek_piutang, open_inv))
+
+    # ---- 2. LUNAS bulan ini tapi belum ada bukti ----
+    bukti_rows = []
+    try:
+        lunas_list = []
+        page = 1
+        while True:
+            params = {"fields": "id,number,statusName", "sp.pageSize": 200, "sp.page": page,
+                "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": awal_bulan, "filter.transDate.val[1]": hari_ini}
+            data = None
+            for attempt in range(4):
+                try:
+                    r = requests.get(f"{h}/accurate/api/sales-invoice/list.do",
+                        headers=accurate_headers(), params=params, timeout=45)
+                    data = r.json(); break
+                except Exception as e:
+                    print(f"[PM SINKRON BUKTI] list page {page} attempt {attempt+1}: {e}")
+                    _t.sleep(2 * (attempt + 1))
+            if data is None or not data.get("s"): break
+            for inv in data.get("d", []):
+                if not isinstance(inv, dict): continue
+                status = (inv.get("statusName") or "").upper()
+                if "LUNAS" in status or "PAID" in status or "CLOSE" in status:
+                    nomor = (inv.get("number") or "").strip()
+                    if nomor: lunas_list.append({"id": inv.get("id"), "number": nomor})
+            sp = data.get("sp", {})
+            if page >= sp.get("pageCount", 1): break
+            page += 1
+        token = get_drive_token()
+        nama_file_drive = _kumpulkan_nomor_bukti_drive(token)
+        bukti_cust_bulan = _kumpulkan_bukti_customer_bulan(token)
+        lock2 = threading.Lock()
+
+        def cek_bukti_detail(item):
+            detail = None
+            for attempt in range(3):
+                try:
+                    r2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do",
+                        headers=accurate_headers(), params={"id": item["id"]}, timeout=20)
+                    d = r2.json()
+                    if d.get("s") and d.get("d"):
+                        detail = d["d"]; break
+                except Exception: pass
+                _t.sleep(0.4 * (attempt + 1))
+            if detail is None: return
+            nomor = (detail.get("number") or item["number"]).strip()
+            cust = _resolve_customer_name(detail)
+            tgl = detail.get("transDate") or ""
+            bln_key = None
+            for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                try:
+                    dd = datetime.datetime.strptime(tgl.split(" ")[0], fmt)
+                    bln_key = f"{cust.upper()}|{dd.strftime('%Y-%m')}"
+                    break
+                except: pass
+            ada_bukti = (nomor.upper() in nama_file_drive) or (bln_key and bln_key in bukti_cust_bulan)
+            if not ada_bukti:
+                with lock2:
+                    bukti_rows.append({
+                        "sales": _resolve_sales_name(detail),
+                        "number": nomor, "cust": cust,
+                        "nilai": _resolve_nilai_invoice(detail),
+                        "trans": tgl,
+                    })
+        with ThreadPoolExecutor(max_workers=12) as ex:
+            list(ex.map(cek_bukti_detail, lunas_list))
+    except Exception as e:
+        print(f"[PM SINKRON BUKTI] gagal cek Drive: {e}")
+
+    return piutang_rows, bukti_rows
+
+
+def _supabase_headers():
+    return {
+        "apikey": PM_SUPABASE_KEY,
+        "Authorization": f"Bearer {PM_SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+def _tgl_iso(s):
+    """Ubah tanggal Accurate ('dd/mm/YYYY' atau 'YYYY-mm-dd') -> 'YYYY-mm-dd' atau None."""
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.datetime.strptime((s or "").split(" ")[0], fmt).strftime("%Y-%m-%d")
+        except: pass
+    return None
+
+def _tulis_tagihan_ke_supabase(piutang_rows, bukti_rows):
+    """Hapus isi tabel tagihan_bukti lalu isi ulang dgn kondisi terkini.
+    Hanya sales yang terpetakan ke Print Master yang ditulis. Kembalikan jumlah baris."""
+    if not (PM_SUPABASE_URL and PM_SUPABASE_KEY):
+        raise RuntimeError("PM_SUPABASE_URL / PM_SUPABASE_KEY belum diset")
+    base = f"{PM_SUPABASE_URL}/rest/v1"
+    rows = []
+    for r_ in bukti_rows:
+        pm = _map_sales_ke_pm(r_.get("sales"))
+        if not pm: continue
+        rows.append({
+            "sales": pm, "nomor_invoice": r_.get("number") or "",
+            "customer": r_.get("cust") or "", "nilai": round(float(r_.get("nilai") or 0)),
+            "jenis": "belum_bukti", "umur_hari": 0, "tgl_invoice": _tgl_iso(r_.get("trans")),
+        })
+    for r_ in piutang_rows:
+        pm = _map_sales_ke_pm(r_.get("sales"))
+        if not pm: continue
+        umur = r_.get("umur")
+        umur = int(umur) if isinstance(umur, int) else 0
+        rows.append({
+            "sales": pm, "nomor_invoice": r_.get("number") or "",
+            "customer": r_.get("cust") or "", "nilai": round(float(r_.get("sisa") or 0)),
+            "jenis": "piutang", "umur_hari": umur, "tgl_invoice": _tgl_iso(r_.get("trans")),
+        })
+
+    # 1) hapus semua baris lama (delete where id >= 0 -> kosongkan tabel)
+    rdel = requests.delete(f"{base}/tagihan_bukti?id=gte.0",
+        headers=_supabase_headers(), timeout=30)
+    if rdel.status_code not in (200, 204):
+        raise RuntimeError(f"gagal hapus tabel ({rdel.status_code}): {rdel.text[:200]}")
+
+    # 2) insert baru (batch 500 biar aman)
+    for i in range(0, len(rows), 500):
+        batch = rows[i:i+500]
+        rins = requests.post(f"{base}/tagihan_bukti",
+            headers={**_supabase_headers(), "Prefer": "return=minimal"},
+            data=json.dumps(batch), timeout=45)
+        if rins.status_code not in (200, 201, 204):
+            raise RuntimeError(f"gagal insert ({rins.status_code}): {rins.text[:200]}")
+
+    # 3) update penanda waktu
+    now_iso = _wib_now().strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        requests.patch(f"{base}/tagihan_bukti_meta?id=eq.1",
+            headers={**_supabase_headers(), "Prefer": "return=minimal"},
+            data=json.dumps({"updated_at": now_iso, "status": "ok"}), timeout=20)
+    except Exception as e:
+        print(f"[PM SINKRON META] {e}")
+    return len(rows)
+
+
+def _sinkron_tagihan_ke_printmaster():
+    """Jalankan perhitungan piutang & bukti lalu tulis ke Supabase Print Master.
+    Dipakai scheduler (berkala) dan endpoint refresh manual. Anti-tumpang-tindih."""
+    if _PM_SINKRON_STATUS["running"]:
+        print("[PM SINKRON] sudah berjalan, lewati.")
+        return {"ok": False, "msg": "sedang berjalan"}
+    if not (PM_SUPABASE_URL and PM_SUPABASE_KEY):
+        print("[PM SINKRON] kredensial Supabase belum diset.")
+        return {"ok": False, "msg": "Supabase belum diset"}
+    _PM_SINKRON_STATUS["running"] = True
+    _PM_SINKRON_STATUS["last_error"] = None
+    try:
+        piutang_rows, bukti_rows = _hitung_piutang_bukti_rows()
+        n = _tulis_tagihan_ke_supabase(piutang_rows, bukti_rows)
+        _PM_SINKRON_STATUS["last"] = _wib_now().strftime("%Y-%m-%d %H:%M")
+        _PM_SINKRON_STATUS["last_count"] = n
+        print(f"[PM SINKRON] selesai, {n} baris ke Supabase.")
+        return {"ok": True, "count": n, "waktu": _PM_SINKRON_STATUS["last"]}
+    except Exception as e:
+        _PM_SINKRON_STATUS["last_error"] = str(e)[:300]
+        print(f"[PM SINKRON ERROR] {e}")
+        return {"ok": False, "msg": str(e)[:300]}
+    finally:
+        _PM_SINKRON_STATUS["running"] = False
+
+
+@app.route("/sinkron-tagihan", methods=["GET", "POST"])
+def route_sinkron_tagihan():
+    """Endpoint refresh manual untuk tombol di Print Master. Jalankan di thread
+    supaya respons cepat (tidak menunggu 2-8 menit). Lindungi dgn token sederhana."""
+    import flask
+    # token opsional: kalau PM_SINKRON_TOKEN diset di Railway, wajib cocok
+    wajib = os.environ.get("PM_SINKRON_TOKEN", "")
+    if wajib:
+        dikirim = request.args.get("token") or request.headers.get("X-Token") or ""
+        if dikirim != wajib:
+            return flask.jsonify({"ok": False, "msg": "token salah"}), 403
+    if _PM_SINKRON_STATUS["running"]:
+        return flask.jsonify({"ok": True, "msg": "sinkron sedang berjalan", "running": True})
+    threading.Thread(target=_sinkron_tagihan_ke_printmaster, daemon=True).start()
+    return flask.jsonify({"ok": True, "msg": "sinkron dimulai", "running": True})
+
+
+@app.route("/status-tagihan", methods=["GET"])
+def route_status_tagihan():
+    """Lihat status sinkron terakhir (untuk Print Master / debug)."""
+    import flask
+    return flask.jsonify(_PM_SINKRON_STATUS)
+
+
 def _mulai_penjadwal_notifikasi():
     """Thread background: cek tiap menit, jalankan notifikasi saat waktunya tiba.
     Anti-dobel: simpan penanda 'sudah jalan' per slot per hari."""
@@ -7701,6 +8035,7 @@ def _mulai_penjadwal_notifikasi():
     sudah_jalan = set()  # berisi string penanda unik (tanggal+slot) yang sudah dikirim
 
     JAM_OMSET = {9, 12, 15, 18}  # WIB, Senin-Sabtu
+    JAM_SINKRON_PM = {8, 10, 12, 14, 16, 18}  # sinkron piutang/bukti ke Print Master
 
     def loop():
         import time as _t
@@ -7736,6 +8071,14 @@ def _mulai_penjadwal_notifikasi():
                     if key not in sudah_jalan:
                         sudah_jalan.add(key)
                         _notif_belum_bayar_bukti()
+
+                # --- Sinkron ke Print Master: tiap 2 jam jam kerja, Senin-Sabtu ---
+                #     08,10,12,14,16,18 WIB (menit 20-24, dipisah dari slot lain).
+                if dow <= 5 and jam in JAM_SINKRON_PM and 20 <= menit < 25:
+                    key = f"sinkronpm-{tgl}-{jam}"
+                    if key not in sudah_jalan:
+                        sudah_jalan.add(key)
+                        _sinkron_tagihan_ke_printmaster()
             except Exception as e:
                 print(f"[NOTIF LOOP ERROR] {e}")
             _t.sleep(60)  # cek tiap menit
