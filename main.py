@@ -7983,7 +7983,89 @@ def _tulis_tagihan_ke_supabase(piutang_rows, bukti_rows):
             data=json.dumps({"updated_at": now_iso, "status": "ok"}), timeout=20)
     except Exception as e:
         print(f"[PM SINKRON META] {e}")
+
+    # 4) hitung progres harian per sales (target tracking)
+    try:
+        _hitung_progres_harian(rows)
+    except Exception as e:
+        print(f"[PM PROGRES] gagal: {e}")
+
     return len(rows)
+
+
+def _hitung_progres_harian(rows_sekarang):
+    """Bandingkan snapshot awal hari dgn kondisi sekarang, catat berapa yg sudah
+    diselesaikan tiap sales hari ini (bukti jadi-ada / piutang jadi-lunas).
+    rows_sekarang: list dict {sales, nomor_invoice, jenis, ...} yg BELUM selesai sekarang."""
+    if not (PM_SUPABASE_URL and PM_SUPABASE_KEY):
+        return
+    base = f"{PM_SUPABASE_URL}/rest/v1"
+    tgl = _wib_now().strftime("%Y-%m-%d")
+
+    # set (sales,jenis,nomor) yang masih belum selesai SEKARANG
+    skrg = set()
+    for r_ in rows_sekarang:
+        skrg.add((r_.get("sales"), r_.get("jenis"), r_.get("nomor_invoice")))
+
+    # ambil snapshot awal hari ini
+    try:
+        rsnap = requests.get(f"{base}/snapshot_awal_hari?tanggal=eq.{tgl}&select=sales,jenis,nomor_invoice",
+            headers=_supabase_headers(), timeout=30)
+        snap = rsnap.json() if rsnap.status_code == 200 else []
+    except Exception as e:
+        print(f"[PM PROGRES] gagal baca snapshot: {e}"); snap = []
+
+    # kalau snapshot hari ini BELUM ada -> buat sekarang (titik awal hari), progres = 0
+    if not snap:
+        batch = [{"tanggal": tgl, "sales": s, "jenis": j, "nomor_invoice": n}
+                 for (s, j, n) in skrg]
+        for i in range(0, len(batch), 500):
+            try:
+                requests.post(f"{base}/snapshot_awal_hari",
+                    headers={**_supabase_headers(), "Prefer": "return=minimal"},
+                    data=json.dumps(batch[i:i+500]), timeout=45)
+            except Exception as e:
+                print(f"[PM PROGRES] gagal tulis snapshot: {e}")
+        print(f"[PM PROGRES] snapshot awal hari {tgl} dibuat ({len(batch)} item).")
+        # progres awal hari = 0 untuk semua sales yg punya item
+        snap_set = skrg
+    else:
+        snap_set = set((x["sales"], x["jenis"], x["nomor_invoice"]) for x in snap)
+
+    # yang SELESAI hari ini = ada di snapshot awal, tapi hilang dari daftar sekarang
+    selesai = snap_set - skrg
+    # hitung per sales per jenis
+    from collections import defaultdict
+    hit = defaultdict(lambda: {"belum_bukti": 0, "piutang": 0})
+    for (s, j, n) in selesai:
+        if j in ("belum_bukti", "piutang"):
+            hit[s][j] += 1
+    # pastikan semua sales yg ada di snapshot muncul (biar progres 0 juga tercatat)
+    sales_semua = set(s for (s, j, n) in snap_set)
+    for s in sales_semua:
+        if s not in hit:
+            hit[s] = {"belum_bukti": 0, "piutang": 0}
+
+    # upsert progres_harian
+    for s, v in hit.items():
+        payload = {"tanggal": tgl, "sales": s,
+                   "bukti_selesai": v["belum_bukti"], "piutang_selesai": v["piutang"],
+                   "updated_at": _wib_now().strftime("%Y-%m-%dT%H:%M:%S")}
+        try:
+            requests.post(f"{base}/progres_harian?on_conflict=tanggal,sales",
+                headers={**_supabase_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"},
+                data=json.dumps(payload), timeout=20)
+        except Exception as e:
+            print(f"[PM PROGRES] gagal upsert {s}: {e}")
+    print(f"[PM PROGRES] {tgl}: {len(hit)} sales dicatat.")
+
+    # bersihkan snapshot lama (>7 hari) biar tabel tidak membengkak
+    try:
+        batas = (_wib_now() - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+        requests.delete(f"{base}/snapshot_awal_hari?tanggal=lt.{batas}",
+            headers=_supabase_headers(), timeout=20)
+    except Exception:
+        pass
 
 
 def _sinkron_tagihan_ke_printmaster():
