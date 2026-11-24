@@ -48,6 +48,34 @@ PETA_SALES = {
     "aisah": "Aisah",
 }
 
+def _metode_non_tunai_lainnya(detail):
+    """True kalau invoice (detail) punya penerimaan pembayaran APPROVED dgn metode
+    yang mengandung 'non tunai' (mis. 'Non Tunai Lainnya') di receiptHistory.
+    Dipakai untuk menganggap invoice tsb SUDAH ada bukti (lunas non-tunai)."""
+    import ast as _ast
+    raw = detail.get("receiptHistory") if isinstance(detail, dict) else None
+    if not raw:
+        return False
+    histori = raw
+    if isinstance(raw, str):
+        try:
+            histori = _ast.literal_eval(raw)
+        except (ValueError, SyntaxError):
+            return "non tunai" in raw.lower().replace("-", " ")
+    if not isinstance(histori, list):
+        return False
+    for hh_ in histori:
+        if not isinstance(hh_, dict):
+            continue
+        if hh_.get("historyIsVoidReceipt"):
+            continue
+        if hh_.get("approvalStatus") not in (None, "APPROVED"):
+            continue
+        nm = " ".join((hh_.get("historyPaymentName") or "").lower().replace("-", " ").split())
+        if "non tunai" in nm:
+            return True
+    return False
+
 def _map_sales_ke_pm(nama_accurate):
     """Terjemahkan nama sales Accurate -> akun Print Master. None kalau tidak dipetakan."""
     if not nama_accurate:
@@ -2664,7 +2692,7 @@ TOOLS = [
     },
     {
         "name": "daftar_transfer",
-        "description": "Daftar LENGKAP invoice LUNAS yang dibayar TRANSFER / NON-TUNAI dalam satu periode, dikelompokkan PER SALES, tiap baris berisi NOMOR INVOICE + NAMA CUSTOMER + NILAI. WAJIB pakai tool ini untuk 'invoice yang bayarnya transfer/non tunai', 'daftar transfer sekalian nama sales no invoice dan customer', 'siapa saja yang bayar non tunai bulan X dan invoice apa'. Beda dari hitung_lunas_metode (itu cuma total per metode); tool ini fokus TRANSFER saja dengan rincian per sales + customer. Invoice campuran (tunai+transfer) ikut ditandai 🔀. Background beberapa menit (buka detail tiap invoice), hasil bertahap ke Telegram. PENTING: kalau user tidak menyebut bulan dengan jelas, TANYA dulu bulan apa.",
+        "description": "Daftar LENGKAP invoice LUNAS yang metode penerimaan pembayarannya 'NON TUNAI LAINNYA' di Accurate (bukan semua transfer, tapi khusus metode bernama 'Non Tunai Lainnya'), dalam satu periode, dikelompokkan PER SALES, tiap baris: NOMOR INVOICE + NAMA CUSTOMER + NILAI. WAJIB pakai tool ini untuk 'invoice non tunai lainnya', 'daftar non tunai sekalian sales no invoice customer', 'siapa yang bayar non tunai bulan X'. Metode dicocokkan dari historyPaymentName yang mengandung 'non tunai'. Kalau tidak ada yang cocok, bot menampilkan semua nama metode yg terbaca supaya bisa dicek. Background beberapa menit, hasil bertahap ke Telegram. PENTING: kalau user tidak sebut bulan jelas, TANYA dulu.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -7760,6 +7788,9 @@ def _notif_belum_bayar_bukti(target_ids=None):
                         break
                     except: pass
                 ada_bukti = (nomor.upper() in nama_file_drive) or (bln_key and bln_key in bukti_cust_bulan)
+                # metode "Non Tunai Lainnya" di Accurate = dianggap SUDAH ada bukti (lunas non-tunai)
+                if not ada_bukti and _metode_non_tunai_lainnya(detail):
+                    ada_bukti = True
                 if not ada_bukti:
                     with lock2:
                         bukti_rows.append({
