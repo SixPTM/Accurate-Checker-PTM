@@ -8364,11 +8364,14 @@ def _mulai_penjadwal_notifikasi():
                         _notif_omset()
 
                 # --- Piutang & bukti: SETIAP HARI, jam 09, menit 5-9 ---
-                if jam == 9 and 5 <= menit < 10:
-                    key = f"bayar-{tgl}"
-                    if key not in sudah_jalan:
-                        sudah_jalan.add(key)
-                        _notif_belum_bayar_bukti()
+                # DIMATIKAN 24 Nov 2026 atas permintaan owner: data piutang & bukti
+                # sudah ada di workflow (Print Master), jadi pengingat pagi tidak perlu lagi.
+                # Untuk mengaktifkan lagi, hapus tanda komentar di bawah.
+                # if jam == 9 and 5 <= menit < 10:
+                #     key = f"bayar-{tgl}"
+                #     if key not in sudah_jalan:
+                #         sudah_jalan.add(key)
+                #         _notif_belum_bayar_bukti()
 
                 # --- Sinkron ke Print Master: tiap 2 jam jam kerja, Senin-Sabtu ---
                 #     08,10,12,14,16,18 WIB (menit 20-24, dipisah dari slot lain).
