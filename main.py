@@ -2663,6 +2663,19 @@ TOOLS = [
         }
     },
     {
+        "name": "daftar_transfer",
+        "description": "Daftar LENGKAP invoice LUNAS yang dibayar TRANSFER / NON-TUNAI dalam satu periode, dikelompokkan PER SALES, tiap baris berisi NOMOR INVOICE + NAMA CUSTOMER + NILAI. WAJIB pakai tool ini untuk 'invoice yang bayarnya transfer/non tunai', 'daftar transfer sekalian nama sales no invoice dan customer', 'siapa saja yang bayar non tunai bulan X dan invoice apa'. Beda dari hitung_lunas_metode (itu cuma total per metode); tool ini fokus TRANSFER saja dengan rincian per sales + customer. Invoice campuran (tunai+transfer) ikut ditandai 🔀. Background beberapa menit (buka detail tiap invoice), hasil bertahap ke Telegram. PENTING: kalau user tidak menyebut bulan dengan jelas, TANYA dulu bulan apa.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "DD/MM/YYYY"},
+                "date_to": {"type": "string", "description": "DD/MM/YYYY"},
+                "label": {"type": "string", "description": "Label periode, contoh 'November 2026'"}
+            },
+            "required": ["date_from", "date_to"]
+        }
+    },
+    {
         "name": "rekap_bayar_sales",
         "description": "Laporan/rekap pembayaran invoice LUNAS dikelompokkan PER BULAN lalu PER NAMA SALES, dipisah metode bayar (Tunai vs Transfer), LENGKAP dengan daftar nomor invoice tiap sales. WAJIB pakai tool ini untuk 'rekap pembayaran tiap sales', 'laporan pembayaran per bulan masing-masing sales', 'invoice tunai dan transfer per nama sales', 'kelompokkan invoice lunas per sales dan metode'. JANGAN pakai tool ini untuk pertanyaan KOMISI — untuk komisi pakai komisi_sales (itu ringkas, tanpa daftar invoice panjang). Bisa satu bulan atau beberapa bulan sekaligus (otomatis dipisah per bulan). Beda dengan hitung_lunas_metode (itu total tanpa per sales). Background beberapa menit (buka detail tiap invoice), hasil dikirim bertahap ke Telegram.",
         "input_schema": {
@@ -2880,6 +2893,7 @@ Tools background (hasilnya dikirim otomatis ke Telegram setelah selesai, beri ta
 - bukti_belum_ada_per_sales: invoice yang BELUM ADA bukti bayarnya di Drive, dikelompokkan PER SALES. DEFAULT hanya invoice LUNAS (hanya_lunas=true). WAJIB pakai ini untuk 'sales mana yang customernya sudah lunas tapi belum ada bukti', 'invoice lunas belum ada bukti per sales', 'bukti bayar belum ada per sales'. Kalau user minta semua (termasuk belum lunas), set hanya_lunas=false. Beda dari cek_bukti_bayar_massal (tidak per sales).
 - kirim_excel_piutang_bukti: kirim 2 FILE EXCEL (bukan teks) ke chat — (1) detail PIUTANG: sales, nomor invoice, customer, sisa, jatuh tempo, UMUR hari; (2) LUNAS belum ada bukti: sales, nomor, customer, nilai, tanggal. Untuk diteruskan ke finance. WAJIB pakai tool ini (dan HANYA tool ini, jangan panggil tool piutang/bukti lain) untuk SEMUA permintaan laporan piutang+bukti harian/untuk finance, contoh: 'kirim excel piutang dan bukti', 'pengingat harian piutang', 'cek pengingat harian piutang dll', 'laporan piutang dan bukti', 'detail piutang dan belum ada bukti untuk finance', 'piutang dan bukti dalam excel', 'laporan harian piutang'. Tidak perlu tanggal. JANGAN pakai get_piutang_summary + get_overdue_customers untuk permintaan seperti ini — tool excel ini sudah lengkap (ringkasan + file).
 - hitung_lunas_metode: invoice LUNAS satu periode DIPISAH per metode bayar Tunai/Cash vs Transfer (jumlah invoice + total nilai masing-masing). WAJIB pakai ini untuk 'cek pembayaran cash', 'berapa yang bayar tunai', 'invoice lunas via cash berapa dan totalnya', 'pisahkan pembayaran tunai dan transfer'. Metode dibaca dari sales-receipt tiap invoice.
+- daftar_transfer: DAFTAR invoice lunas yang bayarnya TRANSFER/NON-TUNAI satu periode, per sales + nomor invoice + customer + nilai. WAJIB pakai ini untuk 'invoice yang bayarnya transfer/non tunai', 'daftar non tunai sekalian sales/no invoice/customer'. Beda dari hitung_lunas_metode (itu cuma total). Kalau bulan tidak jelas, TANYA dulu.
 - get_profit_periode: PROFIT/LABA (penjualan − modal HPP) satu periode, rincian PER BULAN dan PER HARI sekaligus. WAJIB pakai ini untuk 'profit per hari', 'profit per bulan', 'laba harian bulanan'. Beda dari get_product_profit (itu per produk, bukan per periode).
 - rekap_bulanan: rekap PENJUALAN + LABA per bulan dalam SATU pesan (tabel tiap bulan + sorotan bulan tertinggi penjualan & laba). WAJIB pakai ini (SATU KALI, rentang penuh) untuk 'penjualan dan laba tertinggi bulan apa', 'bulan mana omset/laba paling tinggi', 'rekap penjualan per bulan'. DILARANG memanggil get_omset_summary berkali-kali per bulan untuk pertanyaan seperti ini — itu boros dan hasilnya berserakan. Cukup rekap_bulanan sekali, mis. date_from=01/01/2026 date_to=30/06/2026.
 - sales_tinggi_rendah_per_bulan: untuk TIAP sales, bulan penjualan TERTINGGI & TERENDAH-nya (mis. 'Febby tertinggi Juni, terendah Mei'). WAJIB pakai ini untuk 'penjualan tiap sales tertinggi berapa terendah berapa', 'bulan tertinggi & terendah masing-masing sales'. Beda dari get_sales_per_salesman (total) dan get_rata_sales_per_bulan (rata-rata).
@@ -3015,6 +3029,8 @@ def handle_with_claude(chat_id, user_text, host):
                     result = tool_sinkron_printmaster(host, chat_id)
                 elif tool_name == "hitung_lunas_metode":
                     result = tool_hitung_lunas_metode(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
+                elif tool_name == "daftar_transfer":
+                    result = tool_daftar_transfer(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "rekap_bayar_sales":
                     result = tool_rekap_bayar_sales(host, chat_id, tool_input["date_from"], tool_input["date_to"], tool_input.get("label",""))
                 elif tool_name == "rekap_cash":
@@ -6070,6 +6086,158 @@ def tool_hitung_lunas_metode(host, chat_id, date_from, date_to, label=""):
         except Exception as e:
             send_message(chat_id, f"❌ Gagal hitung lunas per metode: {str(e)[:150]}")
             print(f"[LUNAS METODE ERROR] {e}")
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return json.dumps({"status": "background_started"})
+
+
+def tool_daftar_transfer(host, chat_id, date_from, date_to, label=""):
+    """Daftar invoice LUNAS metode TRANSFER (non-tunai) satu periode, dikelompokkan
+    PER SALES, tiap baris: nomor invoice + nama customer + nilai. Metode dibaca dari
+    receiptHistory (historyPaymentName) tiap invoice. Campuran (tunai+transfer) ikut
+    masuk karena ada unsur transfer. Lambat (1 detail call per invoice)."""
+    def run():
+        try:
+            import time as _t, ast as _ast
+            h = host if host.startswith("http") else f"https://{host}"
+
+            # 1. Ambil semua invoice periode
+            all_inv = []
+            page = 1
+            while True:
+                params = {"fields": "id,number,totalAmount,salesAmount,subTotal,statusName",
+                    "sp.pageSize": 200, "sp.page": page,
+                    "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": date_from, "filter.transDate.val[1]": date_to}
+                rr = requests.get(f"{h}/accurate/api/sales-invoice/list.do", headers=accurate_headers(), params=params, timeout=30)
+                dd = rr.json()
+                if not dd.get("s"): break
+                all_inv.extend(dd.get("d", []))
+                sp = dd.get("sp", {})
+                if page >= sp.get("pageCount", 1): break
+                page += 1
+
+            def nilai_dari_list(inv):
+                for k in ("totalAmount", "salesAmount", "subTotal"):
+                    try:
+                        fv = float(inv.get(k))
+                        if fv != 0: return fv
+                    except: pass
+                return 0.0
+
+            lunas = []
+            for inv in all_inv:
+                if not isinstance(inv, dict): continue
+                status = (inv.get("statusName") or "").upper()
+                if "LUNAS" in status or "PAID" in status or "CLOSE" in status:
+                    lunas.append({"id": inv.get("id"), "number": inv.get("number"), "nilai": nilai_dari_list(inv)})
+
+            if not lunas:
+                send_message(chat_id, f"Tidak ada invoice LUNAS di {label or (date_from + ' - ' + date_to)}.")
+                return
+
+            lock = threading.Lock()
+            def _parse_rh(raw):
+                if not raw: return []
+                if isinstance(raw, list): return raw
+                if isinstance(raw, str):
+                    try:
+                        v = _ast.literal_eval(raw); return v if isinstance(v, list) else []
+                    except (ValueError, SyntaxError): return raw
+                return []
+            def _metode(nama):
+                n = (nama or "").lower()
+                if any(k in n for k in ("tunai", "cash", "kas")): return "tunai"
+                if "transfer" in n or "bank" in n: return "transfer"
+                return None
+
+            def klasifikasi(item):
+                detail = None
+                for attempt in range(5):
+                    try:
+                        rr = requests.get(f"{h}/accurate/api/sales-invoice/detail.do",
+                            headers=accurate_headers(), params={"id": item["id"]}, timeout=30)
+                        dj = rr.json()
+                        if dj.get("s") and dj.get("d"): detail = dj["d"]; break
+                    except Exception: pass
+                    _t.sleep(0.6 * (attempt + 1))
+                if detail is None:
+                    item["gagal_baca"] = True; return "tidak_diketahui"
+                item["customer"] = _resolve_customer_name(detail)
+                item["sales"] = _resolve_sales_name(detail)
+                histori = _parse_rh(detail.get("receiptHistory"))
+                if isinstance(histori, str):
+                    m = _metode(histori); return m if m else "tidak_diketahui"
+                metode = set()
+                for hh_ in histori:
+                    if not isinstance(hh_, dict): continue
+                    if hh_.get("historyIsVoidReceipt"): continue
+                    if hh_.get("approvalStatus") not in (None, "APPROVED"): continue
+                    m = _metode(hh_.get("historyPaymentName"))
+                    if m: metode.add(m)
+                if not metode: return "tidak_diketahui"
+                if metode == {"tunai"}: return "tunai"
+                if metode == {"transfer"}: return "transfer"
+                return "campuran"
+
+            gagal_retry = []
+            def proses_safe(item):
+                try:
+                    item["metode"] = klasifikasi(item)
+                    if item.get("metode") == "tidak_diketahui" and item.get("gagal_baca"):
+                        with lock: gagal_retry.append(item)
+                    _t.sleep(0.05)
+                except Exception:
+                    with lock: gagal_retry.append(item)
+
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                list(ex.map(proses_safe, lunas))
+            if gagal_retry:
+                ulang = list(gagal_retry); gagal_retry.clear()
+                for it in ulang: it.pop("gagal_baca", None)
+                with ThreadPoolExecutor(max_workers=2) as ex:
+                    list(ex.map(proses_safe, ulang))
+
+            # Ambil hanya yang ada unsur TRANSFER (transfer murni + campuran)
+            transfer_items = [x for x in lunas if x.get("metode") in ("transfer", "campuran")]
+            if not transfer_items:
+                send_message(chat_id, f"Tidak ada invoice TRANSFER (non-tunai) di {label or (date_from + ' - ' + date_to)}.")
+                return
+
+            # Kelompokkan per sales
+            per_sales = {}
+            for it in transfer_items:
+                s = it.get("sales") or "Tanpa Sales"
+                per_sales.setdefault(s, []).append(it)
+
+            judul = label or f"{date_from} - {date_to}"
+            total_nilai = sum(x.get("nilai", 0) for x in transfer_items)
+            n_cmp = sum(1 for x in transfer_items if x.get("metode") == "campuran")
+            ringkas = f"🏦 *Invoice TRANSFER (non-tunai) - {judul}*\n"
+            ringkas += f"Total: {len(transfer_items)} invoice | Rp {total_nilai:,.0f}\n"
+            if n_cmp: ringkas += f"(termasuk {n_cmp} invoice campuran tunai+transfer)\n"
+            ringkas += f"Jumlah sales: {len(per_sales)}\n\n*Rincian per sales di bawah:*"
+            send_message(chat_id, ringkas)
+
+            # Kirim daftar per sales (bertahap, hindari batas panjang Telegram)
+            for s in sorted(per_sales.keys(), key=lambda x: sum(i.get("nilai",0) for i in per_sales[x]), reverse=True):
+                items = sorted(per_sales[s], key=lambda x: x.get("nilai", 0), reverse=True)
+                subtotal = sum(x.get("nilai", 0) for x in items)
+                baris = [f"👤 *{s}* — {len(items)} invoice | Rp {subtotal:,.0f}"]
+                for it in items:
+                    tag = " 🔀" if it.get("metode") == "campuran" else ""
+                    baris.append(f"• {it.get('number','?')} | {it.get('customer','?')} | Rp {it.get('nilai',0):,.0f}{tag}")
+                buff = []
+                for b in baris:
+                    buff.append(b)
+                    if len(buff) >= 41:
+                        send_message(chat_id, "\n".join(buff)); buff = [f"👤 *{s}* (lanjutan)"]
+                if len(buff) > 1 or (len(buff) == 1 and len(items) == 0):
+                    send_message(chat_id, "\n".join(buff))
+        except Exception as e:
+            send_message(chat_id, f"❌ Gagal ambil daftar transfer: {str(e)[:150]}")
+            print(f"[DAFTAR TRANSFER ERROR] {e}")
 
     t = threading.Thread(target=run)
     t.daemon = True
