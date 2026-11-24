@@ -6138,6 +6138,7 @@ def tool_daftar_transfer(host, chat_id, date_from, date_to, label=""):
                 return
 
             lock = threading.Lock()
+            nama_metode_terlihat = {}  # kumpulkan nama metode mentah utk verifikasi
             def _parse_rh(raw):
                 if not raw: return []
                 if isinstance(raw, list): return raw
@@ -6146,11 +6147,12 @@ def tool_daftar_transfer(host, chat_id, date_from, date_to, label=""):
                         v = _ast.literal_eval(raw); return v if isinstance(v, list) else []
                     except (ValueError, SyntaxError): return raw
                 return []
-            def _metode(nama):
-                n = (nama or "").lower()
-                if any(k in n for k in ("tunai", "cash", "kas")): return "tunai"
-                if "transfer" in n or "bank" in n: return "transfer"
-                return None
+            def _norm(nama):
+                # normalisasi: lowercase, hilangkan strip & spasi ganda
+                return " ".join((nama or "").lower().replace("-", " ").split())
+            def _is_nontunai_lainnya(nama):
+                n = _norm(nama)
+                return ("non tunai" in n)  # tangkap 'non tunai lainnya' & variasinya
 
             def klasifikasi(item):
                 detail = None
@@ -6163,29 +6165,31 @@ def tool_daftar_transfer(host, chat_id, date_from, date_to, label=""):
                     except Exception: pass
                     _t.sleep(0.6 * (attempt + 1))
                 if detail is None:
-                    item["gagal_baca"] = True; return "tidak_diketahui"
+                    item["gagal_baca"] = True; return False
                 item["customer"] = _resolve_customer_name(detail)
                 item["sales"] = _resolve_sales_name(detail)
                 histori = _parse_rh(detail.get("receiptHistory"))
                 if isinstance(histori, str):
-                    m = _metode(histori); return m if m else "tidak_diketahui"
-                metode = set()
+                    # fallback: parse gagal, cek substring di string mentah
+                    return _is_nontunai_lainnya(histori)
+                cocok = False
                 for hh_ in histori:
                     if not isinstance(hh_, dict): continue
                     if hh_.get("historyIsVoidReceipt"): continue
                     if hh_.get("approvalStatus") not in (None, "APPROVED"): continue
-                    m = _metode(hh_.get("historyPaymentName"))
-                    if m: metode.add(m)
-                if not metode: return "tidak_diketahui"
-                if metode == {"tunai"}: return "tunai"
-                if metode == {"transfer"}: return "transfer"
-                return "campuran"
+                    nm = hh_.get("historyPaymentName") or ""
+                    with lock:
+                        nama_metode_terlihat[nm] = nama_metode_terlihat.get(nm, 0) + 1
+                    if _is_nontunai_lainnya(nm):
+                        cocok = True
+                        item["metode_nama"] = nm
+                return cocok
 
             gagal_retry = []
             def proses_safe(item):
                 try:
-                    item["metode"] = klasifikasi(item)
-                    if item.get("metode") == "tidak_diketahui" and item.get("gagal_baca"):
+                    item["cocok"] = klasifikasi(item)
+                    if (not item.get("cocok")) and item.get("gagal_baca"):
                         with lock: gagal_retry.append(item)
                     _t.sleep(0.05)
                 except Exception:
@@ -6199,10 +6203,13 @@ def tool_daftar_transfer(host, chat_id, date_from, date_to, label=""):
                 with ThreadPoolExecutor(max_workers=2) as ex:
                     list(ex.map(proses_safe, ulang))
 
-            # Ambil hanya yang ada unsur TRANSFER (transfer murni + campuran)
-            transfer_items = [x for x in lunas if x.get("metode") in ("transfer", "campuran")]
+            # Ambil hanya yang metodenya "Non Tunai Lainnya"
+            transfer_items = [x for x in lunas if x.get("cocok")]
             if not transfer_items:
-                send_message(chat_id, f"Tidak ada invoice TRANSFER (non-tunai) di {label or (date_from + ' - ' + date_to)}.")
+                # tampilkan nama-nama metode yang terlihat biar bisa dicek
+                top = sorted(nama_metode_terlihat.items(), key=lambda kv: -kv[1])[:15]
+                daftar = "\n".join(f"• '{k}' ({v}x)" for k, v in top) if top else "(tidak ada nama metode terbaca)"
+                send_message(chat_id, f"Tidak ada invoice dengan metode 'Non Tunai Lainnya' di {label or (date_from + ' - ' + date_to)}.\n\nNama metode yang terbaca di Accurate:\n{daftar}\n\nKalau metode yang kamu maksud ada di daftar ini tapi namanya beda, kasih tahu aku nama persisnya.")
                 return
 
             # Kelompokkan per sales
@@ -6213,10 +6220,8 @@ def tool_daftar_transfer(host, chat_id, date_from, date_to, label=""):
 
             judul = label or f"{date_from} - {date_to}"
             total_nilai = sum(x.get("nilai", 0) for x in transfer_items)
-            n_cmp = sum(1 for x in transfer_items if x.get("metode") == "campuran")
-            ringkas = f"🏦 *Invoice TRANSFER (non-tunai) - {judul}*\n"
+            ringkas = f"🏦 *Invoice NON TUNAI LAINNYA - {judul}*\n"
             ringkas += f"Total: {len(transfer_items)} invoice | Rp {total_nilai:,.0f}\n"
-            if n_cmp: ringkas += f"(termasuk {n_cmp} invoice campuran tunai+transfer)\n"
             ringkas += f"Jumlah sales: {len(per_sales)}\n\n*Rincian per sales di bawah:*"
             send_message(chat_id, ringkas)
 
@@ -6226,8 +6231,7 @@ def tool_daftar_transfer(host, chat_id, date_from, date_to, label=""):
                 subtotal = sum(x.get("nilai", 0) for x in items)
                 baris = [f"👤 *{s}* — {len(items)} invoice | Rp {subtotal:,.0f}"]
                 for it in items:
-                    tag = " 🔀" if it.get("metode") == "campuran" else ""
-                    baris.append(f"• {it.get('number','?')} | {it.get('customer','?')} | Rp {it.get('nilai',0):,.0f}{tag}")
+                    baris.append(f"• {it.get('number','?')} | {it.get('customer','?')} | Rp {it.get('nilai',0):,.0f}")
                 buff = []
                 for b in baris:
                     buff.append(b)
