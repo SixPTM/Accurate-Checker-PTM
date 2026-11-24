@@ -8323,6 +8323,57 @@ def route_status_tagihan():
     return flask.jsonify(_PM_SINKRON_STATUS)
 
 
+@app.route("/debug-metode", methods=["GET"])
+def route_debug_metode():
+    """Debug: lihat receiptHistory & metode pembayaran satu invoice (by number).
+    Pakai: /debug-metode?number=SI.2026.11.01131"""
+    import flask
+    number = request.args.get("number", "").strip()
+    if not number:
+        return flask.jsonify({"error": "kasih ?number=SI...."}), 400
+    host = get_host()
+    h = host if host.startswith("http") else f"https://{host}"
+    try:
+        # cari id invoice dari number
+        rr = requests.get(f"{h}/accurate/api/sales-invoice/list.do",
+            headers=accurate_headers(),
+            params={"fields": "id,number,statusName", "filter.number.op": "EQUAL", "filter.number.val": number},
+            timeout=30)
+        d = rr.json()
+        if not d.get("s") or not d.get("d"):
+            return flask.jsonify({"error": f"invoice {number} tidak ketemu", "resp": d}), 404
+        iid = d["d"][0]["id"]
+        rr2 = requests.get(f"{h}/accurate/api/sales-invoice/detail.do",
+            headers=accurate_headers(), params={"id": iid}, timeout=30)
+        detail = rr2.json().get("d", {})
+        rh = detail.get("receiptHistory")
+        # parse nama metode
+        import ast as _ast
+        nama_metode = []
+        hist = rh
+        if isinstance(rh, str):
+            try: hist = _ast.literal_eval(rh)
+            except Exception: hist = None
+        if isinstance(hist, list):
+            for x in hist:
+                if isinstance(x, dict):
+                    nama_metode.append({
+                        "historyPaymentName": x.get("historyPaymentName"),
+                        "void": x.get("historyIsVoidReceipt"),
+                        "approval": x.get("approvalStatus"),
+                    })
+        return flask.jsonify({
+            "number": number, "id": iid,
+            "statusName": detail.get("statusName"),
+            "primeOwing": detail.get("primeOwing"),
+            "terdeteksi_non_tunai_lainnya": _metode_non_tunai_lainnya(detail),
+            "nama_metode": nama_metode,
+            "receiptHistory_mentah": (rh[:1500] if isinstance(rh, str) else rh),
+        })
+    except Exception as e:
+        return flask.jsonify({"error": str(e)[:300]}), 500
+
+
 def _mulai_penjadwal_notifikasi():
     """Thread background: cek tiap menit, jalankan notifikasi saat waktunya tiba.
     Anti-dobel: simpan penanda 'sudah jalan' per slot per hari."""
