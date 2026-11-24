@@ -8106,6 +8106,9 @@ def _hitung_piutang_bukti_rows():
                     break
                 except: pass
             ada_bukti = (nomor.upper() in nama_file_drive) or (bln_key and bln_key in bukti_cust_bulan)
+            # metode "Non Tunai Lainnya" di Accurate = dianggap SUDAH ada bukti (lunas non-tunai)
+            if not ada_bukti and _metode_non_tunai_lainnya(detail):
+                ada_bukti = True
             if not ada_bukti:
                 with lock2:
                     bukti_rows.append({
